@@ -1,0 +1,32 @@
+---
+description: Generated PDF byte size must stay in the original bank-receipt band
+alwaysApply: true
+---
+
+# PDF size like original
+
+## Rule
+
+For every bank/channel, the **shipped PDF file size** must land in the same band as real originals for that channel (not a fat unlocked shell and not a thinned blanked font).
+
+| Channel (examples) | Original band |
+|--------------------|---------------|
+| Sber SBP | **100–104 KB** (~102–103 KB corpus) |
+| T-Bank SBP | ~59–61 KB (donor shell ± small drift) |
+| T-Bank phone / card / nocomm | match that channel’s `T_*_original.pdf` |
+| Alfa SBP / card | **~58–60 KB** Oracle corpus (not unlocked ~63 KB) |
+| Alfa phone | **~69.7–71.6 KB** Quartz iOS corpus — never crush to Oracle ~58 KB (OnlyPDF virtual printer) |
+
+## Typical failure
+
+Blanking unused glyf → FontFile2 **compresses much smaller** (e.g. 23KB → 14KB) → whole PDF drops ~9KB under the original band (e.g. Sber **93KB** instead of **102KB**).
+
+## Required behavior
+
+1. Keep FontFile2 **compressed `/Length`** equal to the donor shell (pad decoded TTF with high-entropy tail if needed — do **not** use content-stream `compress_to_size` space pads on fonts).
+2. Prefer generation shells already in the original size band; fat `*_unlocked` / `*_runtime` only when charset cannot fit a lean original.
+3. Do not treat “any size that Proton still accepts” as OK if it is far from originals — size is part of looking like the bank.
+
+## When fixing
+
+Check `len(pdf)` vs `templates/*_original.pdf` / corpus for that method before shipping or deploying.

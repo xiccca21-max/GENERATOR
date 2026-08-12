@@ -1,0 +1,612 @@
+{
+  "version": 1,
+  "anchors": {
+    "total_label": {
+      "pix_hashes": [
+        "684646b8d257",
+        "9a06a956aab2"
+      ],
+      "text_hint": "Итого"
+    },
+    "commission_zero": {
+      "pix_hashes": [
+        "a1b1fa9c3a75",
+        "d3a40c53c5cf"
+      ],
+      "text_hint": "0"
+    }
+  },
+  "glyphs": {
+    "F1": {
+      "+": {
+        "glyf_md5": [
+          "b6506ff3a28d"
+        ]
+      },
+      "б": {
+        "glyf_md5": [
+          "9b0c0b252590"
+        ]
+      },
+      "в": {
+        "glyf_md5": [
+          "650e26be8f87"
+        ]
+      },
+      "д": {
+        "glyf_md5": [
+          "09f8db90749c"
+        ]
+      },
+      "е": {
+        "glyf_md5": [
+          "d12f3c97d116"
+        ]
+      },
+      "ж": {
+        "glyf_md5": [
+          "5983ca752a13"
+        ]
+      },
+      "з": {
+        "glyf_md5": [
+          "b4abc649ea43"
+        ]
+      },
+      "и": {
+        "glyf_md5": [
+          "e96cdd9835e8"
+        ]
+      },
+      "й": {
+        "glyf_md5": [
+          "0453cb8df6b0"
+        ]
+      },
+      "к": {
+        "glyf_md5": [
+          "c5f7a6fe2e57"
+        ]
+      },
+      "л": {
+        "glyf_md5": [
+          "eab107d6c001"
+        ]
+      },
+      "м": {
+        "glyf_md5": [
+          "7a97f20e9fb5"
+        ]
+      },
+      "н": {
+        "glyf_md5": [
+          "b5a1ed37c214"
+        ]
+      },
+      "о": {
+        "glyf_md5": [
+          "65ae1dcb5d57"
+        ]
+      },
+      "п": {
+        "glyf_md5": [
+          "eafb9659a3b9"
+        ]
+      },
+      "р": {
+        "glyf_md5": [
+          "96166e9db343"
+        ]
+      },
+      "с": {
+        "glyf_md5": [
+          "9045ff536215"
+        ]
+      },
+      "т": {
+        "glyf_md5": [
+          "81eeb1fb4bcf"
+        ]
+      },
+      "у": {
+        "glyf_md5": [
+          "40f13666b77d"
+        ]
+      },
+      "ф": {
+        "glyf_md5": [
+          "cc400910bb3e"
+        ]
+      },
+      "@": {
+        "glyf_md5": [
+          "da4448df5e45"
+        ]
+      },
+      "ч": {
+        "glyf_md5": [
+          "cc15435e15a6"
+        ]
+      },
+      "ц": {
+        "glyf_md5": [
+          "3f9e05dffd77"
+        ]
+      },
+      "ш": {
+        "glyf_md5": [
+          "fa19c13c58a5"
+        ]
+      },
+      "ь": {
+        "glyf_md5": [
+          "d58aa94e31ec"
+        ]
+      },
+      "щ": {
+        "glyf_md5": [
+          "ae0ad4b76d39"
+        ]
+      },
+      "ю": {
+        "glyf_md5": [
+          "74a49d6f69bd"
+        ]
+      },
+      "я": {
+        "glyf_md5": [
+          "bef5bac3c862"
+        ]
+      },
+      "№": {
+        "glyf_md5": [
+          "a35c1792dbe8"
+        ]
+      },
+      "0": {
+        "glyf_md5": [
+          "8d7a901cd319"
+        ]
+      },
+      "1": {
+        "glyf_md5": [
+          "f1f1b787b420"
+        ]
+      },
+      "2": {
+        "glyf_md5": [
+          "b75525ea68d9"
+        ]
+      },
+      "3": {
+        "glyf_md5": [
+          "ff5abcb6a9ff"
+        ]
+      },
+      "4": {
+        "glyf_md5": [
+          "d29f728c45e9"
+        ]
+      },
+      "5": {
+        "glyf_md5": [
+          "0722bb59df1b"
+        ]
+      },
+      "6": {
+        "glyf_md5": [
+          "ee8d4a198105"
+        ]
+      },
+      "7": {
+        "glyf_md5": [
+          "060c8027da6b"
+        ]
+      },
+      "8": {
+        "glyf_md5": [
+          "20b53a3466cd"
+        ]
+      },
+      "9": {
+        "glyf_md5": [
+          "30d0a144efc9"
+        ]
+      },
+      ".": {
+        "glyf_md5": [
+          "2d3fe00c3785"
+        ]
+      },
+      "(": {
+        "glyf_md5": [
+          "f606c0ca644f"
+        ]
+      },
+      ")": {
+        "glyf_md5": [
+          "3164856d7e3f"
+        ]
+      },
+      "-": {
+        "glyf_md5": [
+          "33ef1d783514"
+        ]
+      },
+      "Б": {
+        "glyf_md5": [
+          "213f2a75337d"
+        ]
+      },
+      "Г": {
+        "glyf_md5": [
+          "8c5e7f3ea720"
+        ]
+      },
+      "И": {
+        "glyf_md5": [
+          "64787cbeb232"
+        ]
+      },
+      "К": {
+        "glyf_md5": [
+          "8bb1ba63bc45"
+        ]
+      },
+      "М": {
+        "glyf_md5": [
+          "fa4c99be0e41"
+        ]
+      },
+      "Н": {
+        "glyf_md5": [
+          "71dd2a9a73b1"
+        ]
+      },
+      "О": {
+        "glyf_md5": [
+          "bd542ce55d01"
+        ]
+      },
+      "П": {
+        "glyf_md5": [
+          "a05e59daa823"
+        ]
+      },
+      "С": {
+        "glyf_md5": [
+          "e6b31429d3ce"
+        ]
+      },
+      "Т": {
+        "glyf_md5": [
+          "bc740eb6120c"
+        ]
+      },
+      "У": {
+        "glyf_md5": [
+          "4dde203f18e0"
+        ]
+      },
+      "г": {
+        "glyf_md5": [
+          "64f23d5ce4c5"
+        ]
+      },
+      "А": {
+        "glyf_md5": [
+          "2be2b5e3b11b"
+        ]
+      },
+      "В": {
+        "glyf_md5": [
+          "84988777b781"
+        ]
+      },
+      "Я": {
+        "glyf_md5": [
+          "2752906910b2",
+          "e017e3b7926a"
+        ]
+      },
+      "Д": {
+        "glyf_md5": [
+          "82a0d234e297"
+        ]
+      },
+      "Ж": {
+        "glyf_md5": [
+          "3953602e4da7",
+          "66fe13cfc5d6"
+        ]
+      },
+      "Ю": {
+        "glyf_md5": [
+          "4aef545b5fce",
+          "aa6bbe28260f"
+        ]
+      },
+      "Ч": {
+        "glyf_md5": [
+          "b04c435dbe29"
+        ]
+      },
+      "ы": {
+        "glyf_md5": [
+          "0567e3c87708"
+        ]
+      },
+      ",": {
+        "glyf_md5": [
+          "239a158f3595"
+        ]
+      },
+      "Е": {
+        "glyf_md5": [
+          "03fa21b06d0e"
+        ]
+      },
+      "ё": {
+        "glyf_md5": [
+          "de225a9fd328"
+        ]
+      },
+      "х": {
+        "glyf_md5": [
+          "e0d87247d0a1"
+        ]
+      },
+      "Р": {
+        "glyf_md5": [
+          "23830d7df426"
+        ]
+      },
+      "Л": {
+        "glyf_md5": [
+          "280f2da5e78e"
+        ]
+      },
+      "Х": {
+        "glyf_md5": [
+          "7044e243aa5b"
+        ]
+      },
+      "Ф": {
+        "glyf_md5": [
+          "2793909a40b2"
+        ]
+      },
+      "Щ": {
+        "glyf_md5": [
+          "101d29f73bf2"
+        ]
+      },
+      "Ш": {
+        "glyf_md5": [
+          "800e9016ea96"
+        ]
+      },
+      "Ц": {
+        "glyf_md5": [
+          "376bd9564348"
+        ]
+      },
+      "З": {
+        "glyf_md5": [
+          "e999fe3bea05"
+        ]
+      },
+      "Э": {
+        "glyf_md5": [
+          "b838d26dcac6"
+        ]
+      },
+      "э": {
+        "glyf_md5": [
+          "c711825157d2"
+        ]
+      }
+    },
+    "F2": {
+      "г": {
+        "glyf_md5": [
+          "f3ab32f34b52"
+        ]
+      },
+      "0": {
+        "glyf_md5": [
+          "551434c9978f"
+        ]
+      },
+      "И": {
+        "glyf_md5": [
+          "5763da05f2c3"
+        ]
+      },
+      "4": {
+        "glyf_md5": [
+          "170fa4b68d7d"
+        ]
+      },
+      "6": {
+        "glyf_md5": [
+          "d0281ea5efdf"
+        ]
+      },
+      "о": {
+        "glyf_md5": [
+          "3a4c07d0d7a4"
+        ]
+      },
+      "т": {
+        "glyf_md5": [
+          "5c1f7ae6051a"
+        ]
+      },
+      "5": {
+        "glyf_md5": [
+          "644abf16294a"
+        ]
+      },
+      "1": {
+        "glyf_md5": [
+          "0ecfe46bb27b"
+        ]
+      },
+      "3": {
+        "glyf_md5": [
+          "abeb149c0151"
+        ]
+      },
+      "8": {
+        "glyf_md5": [
+          "6a0cb4e22703"
+        ]
+      },
+      "2": {
+        "glyf_md5": [
+          "c9d63c7cd84d"
+        ]
+      },
+      "9": {
+        "glyf_md5": [
+          "1725693dbbe0"
+        ]
+      },
+      "7": {
+        "glyf_md5": [
+          "a8cc19fe2940"
+        ]
+      }
+    },
+    "F3": {}
+  },
+  "source_files": [
+    "receipt_03.07.2026.pdf",
+    "receipt_29.06.2026 (2).pdf",
+    "receipt_29.06.2026 (3).pdf",
+    "receipt_29.06.2026 (4).pdf",
+    "receipt_29.06.2026 (5).pdf",
+    "$R0TNJBG.pdf",
+    "$R1YCVEZ.pdf",
+    "$R2XX916.pdf",
+    "$R3IN8JO.pdf",
+    "$R3Q4FWR.pdf",
+    "$R4L3XYX.pdf",
+    "$R4STQ1J.pdf",
+    "$R4UG9ND.pdf",
+    "$R63GYR3.pdf",
+    "$R64IN0O.pdf",
+    "$R79QRFU.pdf",
+    "$R887D5E.pdf",
+    "$R8ALH0O.pdf",
+    "$R9RP24C.pdf",
+    "$R9SEQVG.pdf",
+    "$RAW6XRF.pdf",
+    "$RB4UIPR.pdf",
+    "$RB9BM33.pdf",
+    "$RBH5Z4V.pdf",
+    "$RBIMWJ2.pdf",
+    "$RBNZNUE.pdf",
+    "$RCHI6HM.pdf",
+    "$RCQL37U.pdf",
+    "$RDBBYJF.pdf",
+    "$RE8GET5.pdf",
+    "$REHI4QZ.pdf",
+    "$RERIWJI.pdf",
+    "$RFS8KNF.pdf",
+    "$RG2L52G.pdf",
+    "$RGJPTNZ.pdf",
+    "$RH6OM0Q.pdf",
+    "$RHBR0BK.pdf",
+    "$RHGE8D6.pdf",
+    "$RHL880Q.pdf",
+    "$RHOA1HA.pdf",
+    "$RHS9Q52.pdf",
+    "$RJHJLN6.pdf",
+    "$RK4101J.pdf",
+    "$RL6U847.pdf",
+    "$RLYHP7N.pdf",
+    "$RM4RP9P.pdf",
+    "$RN1UQX3.pdf",
+    "$RN89Y26.pdf",
+    "$RNXE35S.pdf",
+    "$RNZEDIX.pdf",
+    "$RO29T1V.pdf",
+    "$ROC41BI.pdf",
+    "$ROW3HJM.pdf",
+    "$RPT82YX.pdf",
+    "$RPWY57W.pdf",
+    "$RRNSXMS.pdf",
+    "$RS080CW.pdf",
+    "$RS6C4VT.pdf",
+    "$RSJGH60.pdf",
+    "$RTSX13Y.pdf",
+    "$RU1RFU3.pdf",
+    "$RU7VOGW.pdf",
+    "$RUNB9J7.pdf",
+    "$RUU302M.pdf",
+    "$RV94AYF.pdf",
+    "$RVMNUW7.pdf",
+    "2 Т банк на карту другого банка.pdf",
+    "Receipt (1).pdf",
+    "Receipt (10).pdf",
+    "Receipt (11).pdf",
+    "Receipt (12).pdf",
+    "Receipt (13).pdf",
+    "Receipt (14).pdf",
+    "Receipt (15).pdf",
+    "Receipt (16).pdf",
+    "Receipt (17).pdf",
+    "Receipt (18).pdf",
+    "Receipt (19).pdf",
+    "Receipt (2).pdf",
+    "Receipt (20).pdf",
+    "Receipt (21).pdf",
+    "Receipt (23).pdf",
+    "Receipt (24).pdf",
+    "Receipt (25).pdf",
+    "Receipt (26).pdf",
+    "Receipt (27).pdf",
+    "Receipt (28).pdf",
+    "Receipt (29).pdf",
+    "Receipt (3).pdf",
+    "Receipt (30).pdf",
+    "Receipt (31).pdf",
+    "Receipt (32).pdf",
+    "Receipt (33).pdf",
+    "Receipt (34).pdf",
+    "Receipt (35).pdf",
+    "Receipt (36).pdf",
+    "Receipt (37).pdf",
+    "Receipt (38).pdf",
+    "Receipt (4).pdf",
+    "Receipt (5).pdf",
+    "Receipt (6).pdf",
+    "Receipt (7).pdf",
+    "Receipt (8).pdf",
+    "Receipt (9).pdf",
+    "Receipt.pdf",
+    "receipt_03.07.2026 (3) (2).pdf",
+    "коммса.pdf",
+    "по карте в другой банк (без к-и).pdf",
+    "по карте в тбанк.pdf",
+    "по номеру телефона с т банка на т банк.pdf",
+    "Т банк на карту другого банка.pdf",
+    "т банк по карте в другой банк.pdf",
+    "т банк по карте на т банк.pdf",
+    "т банк по карте на т банк3.pdf",
+    "т банк по номееру на т баннк1.pdf",
+    "т банк по номееру на т баннк2.pdf",
+    "т банк по номеру карты в другой банк.pdf",
+    "т банк сбп 2.pdf",
+    "т банк сбп 3.pdf",
+    "т банк сбп1.pdf",
+    "т банк сбп11.pdf",
+    "т банк сбп5.pdf",
+    "т банк сбп7.pdf",
+    "т т.pdf"
+  ],
+  "source_count": 124,
+  "skipped": 0
+}

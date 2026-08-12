@@ -1,0 +1,30 @@
+---
+description: One OnlyPDF-canonical PDF generator per bank channel — no ungated demos
+alwaysApply: true
+---
+
+# Canonical receipt generation
+
+## Rule
+
+For every bank channel there is **exactly one** live generator:
+
+- T-Bank / Alfa / Sber (SBP, phone, …): `create_*_stealth` used by `bot.py`
+- QA / examples: **only** `tools/gen_onlypdf30_*.py` → `tools/onlypdf_gate.py` (PASS×2 + recheck)
+
+## Forbidden
+
+- Do **not** add parallel “demo / all15 / all25 / quick test” scripts that call `create_*` **without** the OnlyPDF gate
+- Do **not** ship example PDFs that were not accepted by `@onlypdf_robot`
+- Do **not** invent a second generator path for the same channel
+
+## Blocked channels
+
+If `tools/ONLYPDF_METHODS.md` marks a channel **blocked** (no 30/30), do not expose it in the bot and do not generate “examples” for it until a clean donor + 30/30 gate exist.
+
+## Examples
+
+```text
+python tools/gen_onlypdf30_sber_sbp.py -n 5 --out output/sber_test_5x3
+python tools/gen_onlypdf30_sber_phone.py -n 5 --out output/sber_test_5x3
+```

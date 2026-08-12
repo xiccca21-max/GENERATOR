@@ -1,0 +1,70 @@
+__pycache__/
+*.py[cod]
+*.db
+.env
+.env.*
+!.env.example
+deploy/.deploy.env
+tools/tg_check.env
+tools/.tg_checker_session*
+*.session
+*.session-journal
+payments.json
+desktop.ini
+
+# runtime логи бота
+bot_err.txt
+bot_stdout.log
+bot_log.txt
+
+# временные / экспериментальные скрипты
+_*.py
+_*.txt
+_*.pdf
+_*.png
+test_otp_valid/
+test_otp/
+test_v2/
+test_v3/
+test_cards/
+test_receipts/
+_tmp_test_ozon/
+
+# временные шрифты-эксперименты в корне (актуальные шрифты живут в fonts/)
+gteestiprodisplay_*.otf
+itogo.ttf
+osnova.ttf
+tinkoff_f*.ttf
+
+# таблицы kerning для отладки
+_kern_table.json
+
+# локальные тестовые PDF-пакеты (не коммитить)
+output/
+_test_batch/
+_test_gen/
+_test_gid57/
+_test_isolation/
+_test_letters/
+_test_times/
+_verify_fix/
+_bank_test/
+_diverse5/
+_fix_test/
+_fix_test4/
+_jasper_test/
+_pretest10/
+_pre_inline_test/
+_retest4/
+_test15/
+
+# бэкапы и логи разработки
+*.broken_backup
+*.umbral_backup
+*.bak
+bot.log
+bot_stderr.log
+openpdf-1.3.30.jar
+
+tools/.tg_*session*
+*.session.bak*

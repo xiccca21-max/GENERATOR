@@ -1,0 +1,20 @@
+[Unit]
+Description=Telegram receipt bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/receipt-bot
+EnvironmentFile=/opt/receipt-bot/.env
+ExecStart=/opt/receipt-bot/.venv/bin/python -u bot.py
+Restart=always
+RestartSec=5
+User=root
+
+# Logs
+StandardOutput=append:/var/log/receipt-bot.log
+StandardError=append:/var/log/receipt-bot.err.log
+
+[Install]
+WantedBy=multi-user.target

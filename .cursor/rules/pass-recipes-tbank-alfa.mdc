@@ -1,0 +1,38 @@
+---
+description: Golden PASS recipes — T-Bank SBP + Alfa SBP (competitors + Proton). Full doc in docs/.
+alwaysApply: true
+---
+
+# PASS recipes (golden specimens) — do not regress
+
+**Full from-zero playbook:** `docs/PASS_RECIPES_TBANK_SBP_AND_ALFA_SBP.md`
+
+Specimens (passed Proton + external / competitor validators):
+
+| Channel | File | Size | SHA-256 prefix |
+|---------|------|------|----------------|
+| T‑Bank SBP | `docs/specimen_tbank_sbp_seq_1785589390_01.pdf` | 60473 | `393ffa084886c2a7…` |
+| Alfa SBP | `docs/specimen_alfa_sbp_155113.pdf` | 58873 | `c80160c30964b9f4…` |
+
+Face of T‑Bank specimen: `21.04.2026  20:54:15` / `93934` / `Харитон Хромов` → `Цвета Ц.` / `+7 (315) 697-20-48` / Сбербанк / Keywords `… \| 991`.
+
+## T‑Bank SBP — invariants
+
+- Generator: **only** `create_tbank_sbp_stealth`
+- Page **270×519**, PDF **~59–61 KB**, Producer OpenPDF Jasper 1.3.30 / Creator JasperReports 6.20.3
+- Keywords 3rd token by face date: before 10.07.2026 → `991`, else `DOCS-2035`
+- F1 CSA **force** `0x337C7D3F` (never math-valid recalc)
+- F1 head epoch pin **last**: created=`3717379206`, modified=`3722743619`
+- Ideal V3: `17120 < F1.dec ≤ 17198`, raw > 9205, glyf > 12783; specimen F1.dec=**17180**, glyf=**13014**
+- Proton FONTFILE2 HARD (h=519): F1 **16244–18196**, F2 **5000–5824**; F2.glyf **< 1550** (specimen F2.dec=**5444**, glyf=**1254**)
+- Dual HI / ship ceiling ≤ **18196** — **no soft-ship** over HARD; **no BAKE_SHELL** on font/FONTFILE2 FAKE
+- Raw hydrate from `glyph_library/raw_glyphs.pkl` with **shell-scale** advances only
+- Value column RIGHT **`x1 = 250`**; labels/date LEFT `x0 ≈ 20`; no lead-pad; no donor FIO
+
+## Alfa SBP — invariants
+
+- Generator: **only** `create_alfa_sbp_stealth`
+- Lean Oracle shell ~58–59 KB (≤59087); Producer `Oracle BI Publisher 12.2.1.4.0`
+- LEFT anchors **`35.45` / `304.75`**; trailing pad only; no soft-remap face glyphs
+
+When fixing FAKE on these channels: match the doc + specimen metrics first — do not invent a third layout or soft-ship over HARD.

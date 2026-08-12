@@ -1,0 +1,70 @@
+---
+description: Mandatory fixed left/right field edge anchors — every bank, every method
+alwaysApply: true
+---
+
+# Field edge anchors (immutable)
+
+## Law
+
+Each bank×method has **fixed edge anchors** from real originals. When rewriting a field you MUST keep that edge. Never invent a third layout. Numbers below are PDF user-space from live templates — do not “approximate away”.
+
+| Edge | Keep | Forbidden |
+|------|------|-----------|
+| **RIGHT** | Visible end X = donor right (Tm realign / right_edge) | Lead-pad; spill past right; leave Tm when width changes |
+| **LEFT** | Visible start X = donor left | Lead-pad that shifts text right; recenter |
+
+## T-Bank (page 270×…) — ALL methods
+
+**Labels** LEFT `x0 ≈ 20`. **Value column** RIGHT `x1 = 250` (₽/F3 `i` lands on 250).
+
+| Method | Field | Edge | Fixed coord |
+|--------|-------|------|-------------|
+| all | date | LEFT | `x0 = 20` |
+| all | labels (Перевод/Статус/…) | LEFT | `x0 = 20` |
+| all | status / transfer type / FIO / phone / card / bank / account / SBP id | **RIGHT** | `x1 = 250` |
+| all | amount digits (Сумма / Итого) | **RIGHT before ₽** | digits `x1 ≈ 243.68`; F3 `i` → `250` |
+| all | Итого big amount | **RIGHT before ₽** | digits `x1 ≈ 237.77`; F3 → `249–250` |
+| all | receipt / footer | LEFT | `x0 = 20` |
+| phone | `_PHONE_COL_RIGHT` | **RIGHT** | **`250.0`** |
+| sbp/card/nocomm | value margins | **RIGHT** | **`250.0`** (code: `_sbp_column_right` / margins) |
+
+Code: Tm `new_x = right_edge - width`; never soft-replace user FIO with donor names (`Дамир С.` / `Марина Ч.`).
+
+## Alfa (A4 595×842) — SBP / phone / card
+
+Two columns, both **LEFT-anchored**:
+
+| Column | Anchor | Fields |
+|--------|--------|--------|
+| Left | **LEFT `x0 = 35.45`** | amount, commission, date, op number, receiver (SBP), sender card… |
+| Right | **LEFT `x0 = 304.75`** | phone, bank, account, SBP id, message, receiver card… |
+| Header date | **RIGHT** | `x1 ≈ 559.69` |
+
+Pad only with **trailing** NBSP/hex in the slot. Do not lead-pad.
+
+## Sber (page 300×795) — SBP / phone
+
+Face values and labels share one column — **LEFT `x0 ≈ 21`**.
+
+| Field | Edge | Note |
+|-------|------|------|
+| FIO / phone / bank / account / amount / commission / SBP id | **LEFT** | `x0 ≈ 21`; trail-pad / grow slot only |
+| Date line | center-ish | keep donor layout; no trailing space after `(МСК)` |
+| Title | center | do not shift into value column |
+
+Never lead-pad FIO on Sber phone/SBP.
+
+## Checklist (every generator change)
+
+1. Open that method’s original → measure value `x0`/`x1` → match edge in code.
+2. LEFT → trailing pad / wider donor — never `" "*n + name` / lead CID pad.
+3. RIGHT → equal CID **or** unequal TJ + Tm so `x1` stays (T-Bank `250`).
+4. Visual gate: fail lead-padded FIO and right overflow past method right edge.
+5. HARD flags on another method do **not** flip pad side for this method.
+
+## Forbidden
+
+- One global pad side for all banks
+- Emitting template donor FIO (`Дамир Сеничев` / `Марина Ч.`) as user face
+- Shipping PDFs where value edge drifts vs the table above

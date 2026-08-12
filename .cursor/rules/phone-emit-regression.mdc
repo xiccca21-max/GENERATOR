@@ -1,0 +1,24 @@
+# Phone emit must not silently die (K-PHONE-EMIT-001)
+
+## Rule
+
+`create_tbank_phone_stealth` returning `None` → bot shows «не собралось» / «не удалось». That is a **hard emit bug**, not a Proton soft miss.
+
+After any phone change that touches exact-flate, pads, layout gate, FIO replace, or amount Tm:
+
+1. Run: `python -m unittest tools.test_tbank_exact_payload.ExactPayloadTests.test_phone_emits_short_receiver_and_donor_name_payload`
+2. Only then say the emit path is fixed
+3. Deploy
+
+## Forbidden
+
+- Claiming «исправил» after fixing only a Proton HARD flag while local emit of short FIO / edge cases still returns `None`
+- Layout-gate rejecting user-requested donor face names (`Дамир Сеничев` / `Марина Ч.` when they are in the payload)
+- CID-padding F3 amount/commission slots (walking right edge past 250)
+
+## Covered regressions
+
+- Short receiver (`Тимур М.`, `Ян К.`) — decoded CS shrinks → need dual/triple operator pads for exact flate 878
+- Long sender (`Мухаммад Абдулвахитович Алиев`, …) — CS grows → nat 879–881; remix auto-receipt until flate==878
+- User sender equal to template donor name — must still emit
+- Broader: `python -m unittest tools.test_emit_length_stress -v`

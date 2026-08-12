@@ -1,0 +1,27 @@
+---
+description: T-Bank /Keywords third token must match receipt date generation
+alwaysApply: true
+---
+
+# T-Bank Keywords generation (K-TBANK-KEYWORDS-GENERATION-001)
+
+## Rule
+
+Third token of PDF `/Keywords` (`date | hash | TOKEN`) must match the bank generation for the **receipt face date**:
+
+| Receipt date | Token |
+|--------------|--------|
+| **before** 10.07.2026 | `991` |
+| **on/after** 10.07.2026 | `DOCS-2035` |
+
+Implemented by `tbank_sbp_stealth._keywords_third_token` → `_patch_pdf_metadata` (all T-Bank channels via `tbank_channel_common`).
+
+## Forbidden
+
+- Always forcing `DOCS-2035` (or always `991`) regardless of date
+- Putting `DOCS-2035` on a PDF dated before 10.07.2026 → Proton HARD FAKE
+- Putting `991` on a PDF dated on/after 10.07.2026 → Proton HARD FAKE
+
+## When Proton reports this
+
+Fix the token vs date — do not spam regenerations with the same mismatch.

@@ -1,0 +1,14 @@
+---
+description: Always deploy bot changes to VPS and restart receipt-bot
+alwaysApply: true
+---
+
+# Always deploy + restart
+
+After any change that affects the live Telegram bot (`bot.py`, generators used by it, `config_bot.py`, etc.):
+
+1. Deploy yourself — do **not** ask the user to restart
+2. Run: `python deploy/deploy.py` (or pass changed files / `--full`)
+3. Confirm `receipt-bot` is **active** on the VPS (`/opt/receipt-bot`)
+
+Credentials live in `deploy/.deploy.env` (not committed). Never print passwords or bot tokens.
