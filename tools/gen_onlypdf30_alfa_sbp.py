@@ -100,14 +100,18 @@ def _safe_receiver(i: int, attempt: int) -> str:
     if rare and attempt == 0:
         name = f"{rare[0]} {rare[1]}"
         if _text_ok(name):
-            return name
+            from alfa_sbp_stealth import _fmt_alfa_sbp_receiver
+
+            return _fmt_alfa_sbp_receiver(name)
     # Чередуем длину: short / med / long / full pair.
     mode = (i + attempt) % 4
     pools = (_FIO_SHORT, _FIO_MED, _FIO_LONG)
     if mode < 3:
         pool = [n for n in pools[mode] if _text_ok(n)]
         if pool:
-            return pool[(i * 7 + attempt) % len(pool)]
+            from alfa_sbp_stealth import _fmt_alfa_sbp_receiver
+
+            return _fmt_alfa_sbp_receiver(pool[(i * 7 + attempt) % len(pool)])
     for a in range(0, 80):
         fn, ln = pick_sender_pair(i + a, attempt + a)
         # Иногда удлиняем отчеством-инициалом.
@@ -116,11 +120,15 @@ def _safe_receiver(i: int, attempt: int) -> str:
         else:
             name = f"{fn} {ln}"
         if _text_ok(name):
-            return name
+            from alfa_sbp_stealth import _fmt_alfa_sbp_receiver
+
+            return _fmt_alfa_sbp_receiver(name)
     fallbacks = [n for n in (_FIO_LONG + _FIO_MED + _FIO_SHORT) if _text_ok(n)]
     if not fallbacks:
         fallbacks = ["Алина Крылова"]
-    return fallbacks[(i + attempt) % len(fallbacks)]
+    from alfa_sbp_stealth import _fmt_alfa_sbp_receiver
+
+    return _fmt_alfa_sbp_receiver(fallbacks[(i + attempt) % len(fallbacks)])
 
 
 def _safe_bank(i: int, attempt: int) -> str:

@@ -37,6 +37,7 @@ if _CHECKER.is_dir() and sys.path[0] != str(_CHECKER):
 
 from onlypdf_safe_names import (  # noqa: E402
     CYR_NO_YO_TVERD,
+    pick_alfa_sbp_receiver,
     pick_receiver_short,
     pick_sender_pair,
 )
@@ -135,6 +136,8 @@ def _stress_payload(method: str, i: int, attempt: int = 0) -> dict:
             # Keep short bank-style FIO — long stress tails break Alfa slot fit.
             first, last = pick_sender_pair(i, attempt)
     receiver = pick_receiver_short(i, attempt)
+    if method == "alfa_sbp":
+        receiver = pick_alfa_sbp_receiver(i, attempt)
     if method == "tbank_phone":
         receiver = ["Марина Ч.", "Ольга М.", "Анна С.", "Дарья Б."][(i) % 4]
     # Sber exact-profile: dotted initial «Имя X.» → SBER_RECIPIENT_INITIAL_PUNCTUATION
@@ -169,6 +172,13 @@ def _stress_payload(method: str, i: int, attempt: int = 0) -> dict:
     }
     if method.startswith("alfa"):
         base["recipient_bank"] = rng.choice(("Сбербанк", "Т-Банк", "ВТБ"))
+        if method == "alfa_card":
+            base["sender_card"] = (
+                f"220{rng.randint(0, 499):03d}******{rng.randint(0, 9999):04d}"
+            )
+            base["receiver_card"] = (
+                f"220{rng.randint(0, 499):03d}******{rng.randint(0, 9999):04d}"
+            )
     elif method == "tbank_card_sber":
         base["recipient_bank"] = "Сбербанк"
     elif method == "tbank_card_tbank":
@@ -282,11 +292,19 @@ async def run_round_async(
                     _log(f"{method} GEN_NONE {payload.get('sender')}")
                     continue
                 stats["gen_ok"] += 1
-                expect = [payload.get("sender", "").split()[0]]
+                if method == "alfa_card":
+                    sc = str(payload.get("sender_card") or "")
+                    rc = str(payload.get("receiver_card") or "")
+                    expect = [sc[-4:], rc[-4:]]
+                elif method == "alfa_sbp":
+                    expect = [str(payload.get("receiver") or "").split()[0]]
+                else:
+                    expect = [payload.get("sender", "").split()[0]]
                 vok, vdetail = _visual_ok(pdf, expect)
                 if not vok:
                     stats["visual_fail"] += 1
                     _log(f"{method} VISUAL_FAIL {vdetail}")
+                    continue
                 path = mdir / f"tg_{status['round']}_{i:02d}.pdf"
                 path.write_bytes(pdf)
                 local_v, local_flags = _local_side(pdf)

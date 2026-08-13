@@ -85,7 +85,7 @@ def count_odd_tj(pdf: bytes) -> Tuple[int, int]:
                 if unesc == b"i":
                     pre = s[max(0, m.start() - 120) : m.start()]
                     if b"/F3" in pre:
-                    continue
+                        continue
                 total += 1
                 if len(unesc) % 2:
                     odd += 1
@@ -1186,6 +1186,12 @@ def visual_integrity(
         skip_sender = hint.startswith("alfa_")
         skip_recv = hint.startswith("alfa_card")
 
+        if hint.startswith("alfa_card"):
+            compact_cards = re.sub(r"[\s\u00a0]", "", text)
+            pans = re.findall(r"\d{6}\*{4,8}\d{4}", compact_cards)
+            if len(pans) < 2:
+                return False, f"visual-empty-cards:{len(pans)}"
+
         sender = str(expect.get("sender") or expect.get("sender_name") or "").strip()
         if sender and not skip_sender:
             parts = [p for p in sender.split() if len(p) >= 2]
@@ -1220,12 +1226,18 @@ def visual_integrity(
                     pass
                 else:
                     return False, f"visual-missing-recv:{r0}"
-            if strict_fio and len(rparts) >= 2:
+            if strict_fio and len(rparts) >= 2 and not hint.startswith("alfa_sbp"):
                 rlast = rparts[-1]
                 if len(rlast) > 3 and rlast not in text:
                     if f"{rlast[0]}." in text:
                         return False, f"visual-mangled-recv:{rlast}"
                     return False, f"visual-missing-recv-last:{rlast}"
+            if hint.startswith("alfa_sbp"):
+                if not re.search(
+                    r"(?:ович|евич|овна|евна|ична)\s+[А-ЯЁ](?:\.|\s|$)",
+                    text.replace("\xa0", " "),
+                ):
+                    return False, "visual-alfa-sbp-fio-shape"
 
         amt_raw = str(expect.get("amount") or expect.get("new_amount") or "").strip()
         digs = re.sub(r"\D", "", amt_raw)

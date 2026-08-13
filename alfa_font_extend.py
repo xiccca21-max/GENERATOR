@@ -1,6 +1,7 @@
 """Расширение subset Tahoma в Alfa PDF — swap/inject как у T-Bank SBP."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -20,9 +21,25 @@ from alfa_orig_mode import (
     _parse_widths,
     _pad_to_compressed_size,
     _zlib_level_from_header,
+    _TM_RE,
 )
 
 logger = logging.getLogger(__name__)
+
+# Value slots rewritten per receipt (same y/x as alfa_sbp_stealth.SBP_COORDS).
+_ALFA_SBP_VALUE_YX = (
+    (779.15, 452.788),
+    (664.3, 35.45),
+    (621.4, 35.45),
+    (578.5, 35.45),
+    (535.6, 35.45),
+    (492.7, 35.45),
+    (664.3, 304.75),
+    (621.4, 304.75),
+    (578.5, 304.75),
+    (535.6, 304.75),
+    (492.7, 304.75),
+)
 
 
 def _collect_alfa_used_cids(stream: bytes) -> Set[int]:
@@ -33,6 +50,39 @@ def _collect_alfa_used_cids(stream: bytes) -> Set[int]:
         for i in range(0, len(hx), 4):
             used.add(int(hx[i : i + 4], 16))
     return used
+
+
+def _is_value_tm(mx: float, my: float, value_yx: Tuple[Tuple[float, float], ...]) -> bool:
+    for y, x in value_yx:
+        if abs(my - y) <= 1.5 and abs(mx - x) <= 3.0:
+            return True
+    return False
+
+
+def _cids_from_hex(hx: bytes) -> Set[int]:
+    out: Set[int] = set()
+    for i in range(0, len(hx), 4):
+        out.add(int(hx[i : i + 4], 16))
+    return out
+
+
+def _label_cids(
+    ctx: AlfaOrigContext,
+    value_yx: Tuple[Tuple[float, float], ...] = _ALFA_SBP_VALUE_YX,
+) -> Set[int]:
+    """CIDs painted on static labels / title — never steal these."""
+    keep: Set[int] = set()
+    stream = bytes(ctx.stream)
+    for m in _TM_RE.finditer(stream):
+        mx, my = float(m.group(1)), float(m.group(2))
+        if _is_value_tm(mx, my, value_yx):
+            continue
+        tail = stream[m.end() : m.end() + 220]
+        tj = re.search(rb"<([0-9A-Fa-f]+)>", tail)
+        if not tj:
+            continue
+        keep |= _cids_from_hex(tj.group(1))
+    return keep
 
 
 def _save_oracle_ttf(font: TTFont, template: Optional[TTFont] = None) -> bytes:
@@ -180,21 +230,22 @@ def _prune_oracle_w_array(obj: str, keep: Set[int]) -> Optional[str]:
     return "".join(parts)
 
 
-def _neutralize_orphan_tounicode(tu_bytes: bytes, keep: Set[int]) -> bytes:
-    """Unused printable CIDs → U+0000 in ToUnicode (same bfchar count/size).
-
-    Full prune of ToUnicode/W → OnlyPDF «чек не распознан».
-    Proton ALFA_ORACLE_FONT_SUBSET_CLOSURE only flags *printable* orphans.
-    """
+def _neutralize_orphan_tounicode(
+    tu_bytes: bytes,
+    keep: Set[int],
+    only_cids: Optional[Set[int]] = None,
+) -> bytes:
+    """Unused printable CIDs → U+0000. Live @bankpdfbot PASS zeros exactly CID 42 and 44."""
     text = tu_bytes.decode("latin1", "replace")
-    pairs = list(re.finditer(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", text))
+    pairs = list(re.finditer(r"<([0-9A-Fa-f]{4})>[ \t]+<([0-9A-Fa-f]{4})>", text))
     if not pairs:
         return tu_bytes
     out = text
-    # Replace from the end so offsets stay valid.
     for m in reversed(pairs):
         cid = int(m.group(1), 16)
         if cid in keep or cid == 0:
+            continue
+        if only_cids is not None and cid not in only_cids:
             continue
         uni_hex = m.group(2)
         try:
@@ -203,15 +254,24 @@ def _neutralize_orphan_tounicode(tu_bytes: bytes, keep: Set[int]) -> bytes:
             continue
         if cp <= 0x20 or cp == 0xA0:
             continue
-        # Keep hex width identical (usually 4).
         zero = "0" * len(uni_hex)
         start, end = m.start(2), m.end(2)
         out = out[:start] + zero + out[end:]
     return out.encode("latin1") if out != text else tu_bytes
 
 
-def _closure_fix_alfa_font(pdf: bytearray, stream: bytes) -> bytes:
-    """Закрыть Oracle subset closure без удаления CID (OnlyPDF-safe)."""
+# pdf (3) / five_01+five_02: only these unused CIDs are U+0000 (й and Ч).
+# Zeroing CID 43 (В) when the bank is not ВТБ made five_04 FAIL (zeros=3).
+_ALFA_PASS_ZERO_CIDS = frozenset({42, 44})
+
+
+def _closure_fix_alfa_font(
+    pdf: bytearray,
+    stream: bytes,
+    *,
+    only_cids: Optional[Set[int]] = _ALFA_PASS_ZERO_CIDS,
+) -> bytes:
+    """U+0000 on unused printable CIDs. 014153 PASS zeroed all orphans (only_cids=None)."""
     active = _collect_alfa_used_cids(stream)
     if not active:
         return bytes(pdf)
@@ -221,14 +281,15 @@ def _closure_fix_alfa_font(pdf: bytearray, stream: bytes) -> bytes:
     if not refs:
         return bytes(pdf)
     tu_dec = _tu_read_decompressed(bytes(pdf), refs["tu"])
-    tu_new = _neutralize_orphan_tounicode(tu_dec, keep)
+    tu_new = _neutralize_orphan_tounicode(tu_dec, keep, only_cids=only_cids)
     if tu_new != tu_dec:
         if not _patch_tu_decompressed(pdf, refs["tu"], tu_new):
             logger.warning("Alfa closure-fix ToUnicode patch failed")
             return bytes(pdf)
         logger.info(
-            "Alfa closure-fix: neutralized orphan printable CIDs (keep %d used)",
+            "Alfa closure-fix: neutralized orphans keep=%d pin=%s",
             len(active),
+            "all" if only_cids is None else sorted(only_cids),
         )
     return bytes(pdf)
 
@@ -356,9 +417,13 @@ def _patch_tu_decompressed(pdf: bytearray, tu_xref: int, new_tu: bytes) -> bool:
     if not pos:
         return False
     cs, ce = pos
+    orig_len = ce - cs
     level = _zlib_level_from_header(bytes(pdf)[cs : cs + 2])
     # Как у Oracle: не zlib.compress (иначе MIXED_ZLIB с image-потоками).
     compressed = _unreproducible_flate(new_tu, level)
+    if len(compressed) == orig_len:
+        pdf[cs:ce] = compressed
+        return True
     patched = _patch_length_and_rebuild(pdf, cs, ce, compressed)
     if patched is None:
         return False
@@ -489,10 +554,17 @@ def _find_donor_for_char(paths: List[str], ch: str) -> Optional[str]:
 
 
 def _stream_labels_unchanged(before: AlfaOrigContext, after: AlfaOrigContext) -> bool:
-    """Статичный content stream не трогаем — ToUnicode/glyf не должны ломать decode."""
+    """Подписи (не value-слоты) должны декодироваться так же после inject."""
     stream = bytes(before.stream)
-    for m in re.finditer(rb"<([0-9A-Fa-f]+)>\s*Tj", stream):
-        hx = m.group(1)
+    for m in _TM_RE.finditer(stream):
+        mx, my = float(m.group(1)), float(m.group(2))
+        if _is_value_tm(mx, my, _ALFA_SBP_VALUE_YX):
+            continue
+        tail = stream[m.end() : m.end() + 220]
+        tj = re.search(rb"<([0-9A-Fa-f]+)>", tail)
+        if not tj:
+            continue
+        hx = tj.group(1)
         if before.dec(hx) != after.dec(hx):
             return False
     return True
@@ -555,7 +627,7 @@ def swap_alfa_font(base_path: str, font_donor_path: str) -> Optional[str]:
 
 def _append_bfchar_to_tounicode(tu_bytes: bytes, cid: int, cp: int) -> Optional[bytes]:
     text = tu_bytes.decode("latin1", "replace")
-    if re.search(rf"<{cid:04X}>\s*<{cp:04X}>", text):
+    if re.search(rf"<{cid:04X}>[ \t]+<{cp:04X}>", text):
         return tu_bytes
     m = re.search(r"(\d+)\s+beginbfchar", text)
     if not m:
@@ -569,6 +641,22 @@ def _append_bfchar_to_tounicode(tu_bytes: bytes, cid: int, cp: int) -> Optional[
     text = text[:insert_at] + new_line + text[insert_at:]
     text = text.replace(f"{old_n} beginbfchar", f"{old_n + 1} beginbfchar", 1)
     return text.encode("latin1")
+
+
+def _set_bfchar_unicode(tu_bytes: bytes, cid: int, cp: int) -> Optional[bytes]:
+    """Rewrite existing CID→Unicode on the same line. Do not grow bfchar or write U+0000."""
+    text = tu_bytes.decode("latin1", "replace")
+    pat = re.compile(rf"<({cid:04X})>[ \t]+<([0-9A-Fa-f]+)>")
+    matches = list(pat.finditer(text))
+    if not matches:
+        return _append_bfchar_to_tounicode(tu_bytes, cid, cp)
+    newu = f"{cp:04X}"
+    out = text
+    for m in reversed(matches):
+        old = m.group(2)
+        repl = newu if len(newu) >= len(old) else newu.rjust(len(old), "0")
+        out = out[: m.start(2)] + repl + out[m.end(2) :]
+    return out.encode("latin1")
 
 
 def _component_cids(ff2: bytes) -> Set[int]:
@@ -703,21 +791,33 @@ def _alloc_cid(
     ctx: AlfaOrigContext,
     ff2: bytes,
     stream_used: Optional[Set[int]] = None,
+    *,
+    seed: bytes = b"",
+    extra_reserved: Optional[Set[int]] = None,
 ) -> Optional[int]:
-    used = set(ctx.uni_to_cid.values())
-    reserved = set(stream_used or ())
-    components = _component_cids(ff2)
+    """Prefer an empty slot; else append one glyph (five_01/02 live PASS path)."""
+    reserved = set(ctx.uni_to_cid.values())
+    reserved |= set(stream_used or ())
+    reserved |= set(extra_reserved or ())
+    reserved |= _component_cids(ff2)
+    reserved.add(0)
     ft = TTFont(BytesIO(ff2))
     n = len(ft.getGlyphOrder())
     glyf = ft["glyf"]
     go = ft.getGlyphOrder()
+    empties: List[int] = []
     for cid in range(n):
-        if cid in used or cid in components or cid == 0 or cid in reserved:
+        if cid in reserved:
             continue
         g = glyf[go[cid]]
         if getattr(g, "numberOfContours", 0) == 0:
-            return cid
-    if n < 255:
+            empties.append(cid)
+    if empties:
+        if seed:
+            idx = int(hashlib.sha256(seed).hexdigest(), 16) % len(empties)
+            return empties[idx]
+        return empties[0]
+    if n < 80:
         return n
     return None
 
@@ -749,6 +849,88 @@ def _oracle_w_bracket(obj: str) -> Optional[Tuple[int, int]]:
                 return j, end + 1
         end += 1
     return None
+
+
+def _set_oracle_cid_width(pdf: bytearray, cid_xref: int, cid: int, width: int) -> bool:
+    """Update /W for cid in place. Do not pretty-reprint the whole array."""
+    from tbank_orig_mode import find_object_range
+    from tbank_sbp_stealth import _replace_byte_range_and_rebuild
+
+    obj_rng = find_object_range(bytes(pdf), cid_xref)
+    if not obj_rng:
+        return False
+    o_start, o_end = obj_rng
+    raw_obj = bytes(pdf[o_start:o_end]).decode("latin1", errors="replace")
+    widths = _parse_widths(raw_obj)
+    target_w = int(width)
+    if widths.get(cid) == target_w:
+        return True
+    if cid not in widths:
+        return _append_oracle_cid_width(pdf, cid_xref, cid, target_w)
+
+    br = _oracle_w_bracket(raw_obj)
+    if not br:
+        return False
+    b0, b1 = br
+    body = raw_obj[b0:b1]
+    token_re = re.compile(r"-?\d+\.?\d*|\[|\]")
+    tokens = list(token_re.finditer(body))
+    span = None
+    j = 0
+    ntok = len(tokens)
+
+    def _tok(i: int) -> str:
+        return tokens[i].group(0)
+
+    while j < ntok:
+        t = _tok(j)
+        if t in ("[", "]"):
+            j += 1
+            continue
+        try:
+            gid = int(float(t))
+        except ValueError:
+            j += 1
+            continue
+        j += 1
+        if j < ntok and _tok(j) == "[":
+            j += 1
+            k = 0
+            while j < ntok and _tok(j) != "]":
+                try:
+                    int(float(_tok(j)))
+                except ValueError:
+                    j += 1
+                    continue
+                if gid + k == cid:
+                    span = tokens[j].span()
+                k += 1
+                j += 1
+            if j < ntok and _tok(j) == "]":
+                j += 1
+        elif j + 1 < ntok:
+            try:
+                gid_hi = int(float(_tok(j)))
+                w_idx = j + 1
+                int(float(_tok(w_idx)))
+                if gid <= cid <= gid_hi and gid == gid_hi:
+                    span = tokens[w_idx].span()
+                j += 2
+            except ValueError:
+                j += 1
+    if span is None:
+        return _append_oracle_cid_width(pdf, cid_xref, cid, target_w)
+    new_body = body[: span[0]] + str(target_w) + body[span[1] :]
+    new_obj = raw_obj[:b0] + new_body + raw_obj[b1:]
+    new_obj_b = new_obj.encode("latin1")
+    if len(new_obj_b) == o_end - o_start:
+        pdf[o_start:o_end] = new_obj_b
+        return True
+    patched = _replace_byte_range_and_rebuild(bytes(pdf), o_start, o_end, new_obj_b)
+    if patched is None:
+        return False
+    pdf[:] = patched
+    return True
 
 
 def _append_oracle_cid_width(pdf: bytearray, cid_xref: int, cid: int, width: int) -> bool:
@@ -870,8 +1052,10 @@ def inject_alfa_char(
     base_path: str,
     ch: str,
     glyph_donor_path: Optional[str] = None,
+    *,
+    face_text: str = "",
 ) -> Optional[str]:
-    """Добавить glyf: сначала PDF-донор Oracle, иначе библиотека (без FontBBox patch)."""
+    """Поставить glyf в свободный CID донора (без роста maxp / CID)."""
     if not ch or ch in ("\n", "\r", "\t"):
         return base_path
     cp = _char_codepoint(ch)
@@ -945,15 +1129,28 @@ def inject_alfa_char(
         return None
 
     stream_used = _collect_alfa_used_cids(bytes(ctx_b.stream))
+    extra_reserved: Set[int] = set()
+    for face_ch in face_text or "":
+        if face_ch in ("\n", "\r", "\t"):
+            continue
+        mapped = ctx_b.uni_to_cid.get(_char_codepoint(face_ch))
+        if mapped is not None:
+            extra_reserved.add(mapped)
 
     dst_cid = ctx_b.uni_to_cid.get(cp)
-    need_tu = dst_cid is None
     if dst_cid is not None and dst_cid in _component_cids(dst_ff2_ttf):
         dst_cid = None
-        need_tu = True
     if dst_cid is None:
-        dst_cid = _alloc_cid(ctx_b, dst_ff2_ttf, stream_used)
+        seed = f"{face_text}|{ch}".encode("utf-8")
+        dst_cid = _alloc_cid(
+            ctx_b, dst_ff2_ttf, stream_used,
+            seed=seed, extra_reserved=extra_reserved,
+        )
     if dst_cid is None:
+        return None
+    go_n = len(TTFont(BytesIO(dst_ff2_ttf)).getGlyphOrder())
+    if dst_cid > go_n:
+        logger.warning("Alfa inject %r refused cid=%d n=%d", ch, dst_cid, go_n)
         return None
 
     if use_copy_slot and src_ff2_ttf is not None and src_cid is not None:
@@ -967,18 +1164,20 @@ def inject_alfa_char(
     if not _patch_ff2_decompressed(pdf, refs_b["ff2"], new_ff2_ttf):
         return None
 
-    if need_tu:
-        tu_dec = _tu_read_decompressed(bytes(pdf), refs_b["tu"])
-        tu_new = _append_bfchar_to_tounicode(tu_dec, dst_cid, cp)
-        if tu_new is None:
-            return None
-        if not _patch_tu_decompressed(pdf, refs_b["tu"], tu_new):
-            return None
-        ctx_b.uni_to_cid[cp] = dst_cid
-        ctx_b.cid_to_uni[dst_cid] = cp
+    tu_dec = _tu_read_decompressed(bytes(pdf), refs_b["tu"])
+    tu_new = _set_bfchar_unicode(tu_dec, dst_cid, cp)
+    if tu_new is None:
+        return None
+    if tu_new != tu_dec and not _patch_tu_decompressed(pdf, refs_b["tu"], tu_new):
+        return None
+    old_cp = ctx_b.cid_to_uni.get(dst_cid)
+    if old_cp is not None and old_cp != cp:
+        ctx_b.uni_to_cid.pop(old_cp, None)
+    ctx_b.uni_to_cid[cp] = dst_cid
+    ctx_b.cid_to_uni[dst_cid] = cp
 
     ctx_b.widths[dst_cid] = int(pdf_w)
-    if not _append_oracle_cid_width(pdf, refs_b["cid"], dst_cid, int(pdf_w)):
+    if not _set_oracle_cid_width(pdf, refs_b["cid"], dst_cid, int(pdf_w)):
         return None
 
     ctx_check = AlfaOrigContext()
@@ -993,7 +1192,13 @@ def inject_alfa_char(
         return None
     ok, miss = _glyphs_ok_for_text(ctx_check, ctx_check.pdf_bytes, ch)
     if not ok:
-        logger.warning("Alfa inject verify failed for %r: %s", ch, miss)
+        mapped = ctx_check.uni_to_cid.get(cp)
+        logger.warning(
+            "Alfa inject verify failed for %r: %s dst=%d mapped=%s tu=%s w=%s",
+            ch, miss, dst_cid, mapped,
+            hex(ctx_check.cid_to_uni.get(dst_cid, 0)),
+            ctx_check.widths.get(dst_cid),
+        )
         return None
 
     fd, out = tempfile.mkstemp(suffix=".pdf", prefix="alfa_font_inj_")
@@ -1008,6 +1213,66 @@ def inject_alfa_char(
         os.path.basename(base_path),
     )
     return out
+
+
+def _tu_zero_count(pdf: bytes) -> int:
+    refs = _load_font_xrefs_from_bytes(pdf)
+    if not refs:
+        return -1
+    try:
+        tu = _tu_read_decompressed(pdf, refs["tu"])
+    except Exception:
+        return -1
+    text = tu.decode("latin1", "replace")
+    n = 0
+    for m in re.finditer(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", text):
+        if int(m.group(2), 16) == 0:
+            n += 1
+    return n
+
+
+def uniquify_alfa_unused_slots(pdf: bytes, seed: bytes) -> Optional[bytes]:
+    """Permute unused glyf slots so FontFile2 SHA is unique per face.
+
+    Glyph count, CID max and ToUnicode stay as in the donor. No PADD / tail pad.
+    """
+    refs = _load_font_xrefs_from_bytes(pdf)
+    if not refs:
+        return None
+    ctx = AlfaOrigContext()
+    if not ctx.load_bytes(pdf):
+        return None
+    used = _collect_alfa_used_cids(bytes(ctx.stream))
+    ff2 = _ff2_read_decompressed(pdf, refs["ff2"])
+    components = _component_cids(ff2)
+    ft = TTFont(BytesIO(ff2))
+    template = TTFont(BytesIO(ff2))
+    go = list(ft.getGlyphOrder())
+    unused = [
+        cid for cid in range(1, len(go))
+        if cid not in used and cid not in components
+    ]
+    glyf = ft["glyf"]
+    hmtx = ft["hmtx"]
+    if len(unused) >= 2:
+        k = 1 + (int(hashlib.sha256(seed).hexdigest(), 16) % (len(unused) - 1))
+        names = [go[cid] for cid in unused]
+        gcopy = [deepcopy(glyf[nm]) for nm in names]
+        mcopy = [hmtx.metrics[nm] for nm in names]
+        for i, nm in enumerate(names):
+            src = (i - k) % len(names)
+            glyf[nm] = gcopy[src]
+            hmtx.metrics[nm] = mcopy[src]
+    else:
+        name0 = go[0]
+        aw, lsb = hmtx.metrics[name0]
+        delta = 1 + (int(hashlib.sha256(seed).hexdigest(), 16) % 5)
+        hmtx.metrics[name0] = (int(aw), int(lsb) + delta)
+    new_ttf = _save_oracle_ttf(ft, template)
+    buf = bytearray(pdf)
+    if not _patch_ff2_decompressed(buf, refs["ff2"], new_ttf):
+        return None
+    return bytes(buf)
 
 
 def _donor_glyph_score(path: str, text: str) -> int:
@@ -1056,11 +1321,11 @@ def ensure_alfa_font_chars(base_path: str, text: str, pool: List[str]) -> Option
         ok, miss_now = _glyphs_ok_for_text(ctx, ctx.pdf_bytes, ch)
         if ok:
             continue
-        donor = _find_donor_for_char(candidates, ch)
-        if not donor and not agl.has_char(ch):
+        donor = None if agl.has_char(ch) else _find_donor_for_char(candidates, ch)
+        if donor is None and not agl.has_char(ch):
             logger.warning("Alfa: no source for %r", ch)
             continue
-        injected = inject_alfa_char(working, ch, donor)
+        injected = inject_alfa_char(working, ch, donor, face_text=text)
         if injected:
             working = injected
         else:

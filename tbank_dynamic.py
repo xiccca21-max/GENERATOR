@@ -847,11 +847,11 @@ def build_dynamic_tbank(
             is_medium=True, trim_subset=True, trim_only=True, **f1_kw)
         font_r = TTFont(_BIO(ff2_r))
     else:
-        ff2_r, uni_gid_r, font_r = _resolve_receipt_font_layer(
-            ff2_r, uni_gid_r_work, trim_r, reg_gids, uni_gid_r_plan,
+    ff2_r, uni_gid_r, font_r = _resolve_receipt_font_layer(
+        ff2_r, uni_gid_r_work, trim_r, reg_gids, uni_gid_r_plan,
             is_medium=False, trim_subset=True, trim_only=True, **f1_kw)
-        ff2_m, uni_gid_m, font_m = _resolve_receipt_font_layer(
-            ff2_m, uni_gid_m_work, trim_m, med_gids, uni_gid_m_plan,
+    ff2_m, uni_gid_m, font_m = _resolve_receipt_font_layer(
+        ff2_m, uni_gid_m_work, trim_m, med_gids, uni_gid_m_plan,
             is_medium=True, trim_subset=True, trim_only=True, **f1_kw)
         if f1_hi is not None and len(ff2_r) > f1_hi:
             # Never revert template F1 — that desyncs CMap/W vs used CIDs after hydrate.
@@ -880,21 +880,21 @@ def build_dynamic_tbank(
         # Keep F1 FontFile2 CSA/mosaic-safe. Card/nocomm blank-trim: collapse
         # orphans in-place (PUA bind bumps ToUnicode → glyf↔cmap under-band FAKE).
         # SBP-style soft path still binds orphans to off-page PUA markers.
-        seed_f1 = set(reg_gids) | set(uni_gid_r.values())
+    seed_f1 = set(reg_gids) | set(uni_gid_r.values())
         if f1_blank_on_trim:
             seed_f1 |= set(_CARD_OPENPDF_F1_COMPOSITE_GIDS)
-            orphans = _f1_orphan_simple_gids(ff2_r, seed_f1)
-            if orphans:
+    orphans = _f1_orphan_simple_gids(ff2_r, seed_f1)
+    if orphans:
                 cleaned = _blank_f1_orphan_simple_glyphs(ff2_r, seed_f1)
                 cleaned = _ff2_restore_shell_tables(ff2_r, cleaned)
                 cleaned = _force_tbank_f1_head_epoch(cleaned)
                 left = _f1_orphan_simple_gids(cleaned, seed_f1)
                 if left:
-                    logger.error(
+        logger.error(
                         "%s F1 orphans remain after blank: %s — reject",
                         log_label, left[:24],
-                    )
-                    return None
+        )
+        return None
                 ff2_r = cleaned
                 font_r = TTFont(_BIO(ff2_r))
                 logger.info(
@@ -903,8 +903,8 @@ def build_dynamic_tbank(
         else:
             # Never PUA+off-page (Td -500 / Tr=3 → Proton HARD). Blank orphans
             # like card/nocomm; if blank fails → reject (retry other twin/face).
-            orphans = _f1_orphan_simple_gids(ff2_r, seed_f1)
-            if orphans:
+    orphans = _f1_orphan_simple_gids(ff2_r, seed_f1)
+    if orphans:
                 cleaned = _blank_f1_orphan_simple_glyphs(ff2_r, seed_f1)
                 cleaned = _ff2_restore_shell_tables(ff2_r, cleaned)
                 cleaned = _force_tbank_f1_head_epoch(cleaned)
@@ -914,7 +914,7 @@ def build_dynamic_tbank(
                         "%s F1 orphans remain after blank (no off-page): %s — reject",
                         log_label, left[:24],
                     )
-                    return None
+        return None
                 ff2_r = cleaned
                 font_r = TTFont(_BIO(ff2_r))
                 logger.info(
@@ -942,13 +942,13 @@ def build_dynamic_tbank(
         ff2_r = _restore_head_csa(ff2_r, _TBANK_F1_OPENPDF_CSA)
         _f1_csa = _get_head_csa(ff2_r)
         if _f1_csa != _TBANK_F1_OPENPDF_CSA:
-            logger.error(
+        logger.error(
                 "%s F1 CSA restore failed got=%s want=0x%08X — reject",
                 log_label,
                 f"0x{_f1_csa:08X}" if _f1_csa is not None else "missing",
                 _TBANK_F1_OPENPDF_CSA,
-            )
-            return None
+        )
+        return None
         logger.info(
             "%s F1 OpenPDF CSA fingerprint forced: 0x%08X ng=%d",
             log_label, _TBANK_F1_OPENPDF_CSA, _f1_ng,
@@ -4218,12 +4218,12 @@ def create_tbank_pipeline(
     _ensure_glyph_library()
     result: Optional[bytes] = None
     for builder in builders:
-        name = getattr(builder, "__name__", repr(builder))
-        try:
+            name = getattr(builder, "__name__", repr(builder))
+            try:
             candidate = builder(dict(prepared))
-        except Exception as e:
-            logger.warning("T-Bank %s %s error: %s", channel, name, e)
-            candidate = None
+            except Exception as e:
+                logger.warning("T-Bank %s %s error: %s", channel, name, e)
+                candidate = None
         if candidate is None:
             continue
         if verify_receipt_fn and expected_receipt and not verify_receipt_fn(

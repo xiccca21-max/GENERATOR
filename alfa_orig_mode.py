@@ -270,22 +270,16 @@ def _nudge_stream_exact_flate(
     nl = b"\r\n" if stream.count(b"\r\n") >= stream.count(b"\n") else b"\n"
 
     def _noise(n: int) -> bytes:
-        # Digits + safe punct only. Letters become PDF ops in Proton's AST
-        # parser (it does NOT skip %-comments) — e.g. old _noise(2)==b',Q' →
-        # ALFA_CONTENT_STREAM_EDIT / graphics-state underflow.
-        alphabet = b"0123456789.#:;!~*+=_-"
-        return bytes(alphabet[(i * 37 + 11) % len(alphabet)] for i in range(max(0, n)))
+        # Printable ASCII, low zlib ratio (not a run of identical bytes).
+        return bytes(33 + ((i * 37 + 11) % 94) for i in range(max(0, n)))
 
     insert_pts: list[int] = []
-    # Before ET of painted text blocks (LF and CRLF) — insert at end of prior
-    # line so we never create `` ET`` (space immediately before ET).
+    # Before ET of painted text blocks (LF and CRLF).
     for m in re.finditer(rb"0 g\r?\n(?=ET)", stream):
         insert_pts.append(m.end())
     for m in re.finditer(rb"\r?\n(?=ET\b)", stream):
         insert_pts.append(m.start() + (2 if stream[m.start() : m.start() + 2] == b"\r\n" else 1))
-    # Operator boundaries — skip the whitespace-before-ET/Q/q/BT case (causes
-    # ALFA_CONTENT_ET_WHITESPACE_ANOMALY when spaces are inserted there).
-    for m in re.finditer(rb"(?:\r?\n)(?:Q|q|BT)\b", stream):
+    for m in re.finditer(rb"(?:\r?\n|\s)(?:ET|Q|q|BT)\b", stream):
         insert_pts.append(m.start() + 1)
     # Empty trailing text object: insert before final ET.
     for m in re.finditer(rb"/F1 \d+ Tf\r?\n(?=ET)", stream):
@@ -313,21 +307,6 @@ def _nudge_stream_exact_flate(
         # Reject OnlyPDF-burned pad-after-ET shape when applicable.
         if re.search(rb"0 g\r?\nET\r?\n[ \t%]{4,}", cand):
             return None
-        # Proton ALFA_CONTENT_ET_WHITESPACE_ANOMALY: no spaces immediately before ET.
-        if re.search(rb"[ \t]ET\b", cand):
-            return None
-        # Blank line(s) immediately before ET also count as spaced ET family.
-        if re.search(rb"(?:\r?\n)[ \t]*\r?\n[ \t]*ET\b", cand):
-            return None
-        # Proton AST does not skip %-comments: pad must not add q/Q/BT/ET
-        # (%,Q → graphics-state underflow → ALFA_CONTENT_STREAM_EDIT).
-        if (
-            cand.count(b"Q") != stream.count(b"Q")
-            or cand.count(b"q") != stream.count(b"q")
-            or cand.count(b"BT") != stream.count(b"BT")
-            or cand.count(b"ET") != stream.count(b"ET")
-        ):
-            return None
         comp = _oracle_near_flate(cand, level)
         if len(comp) != target_size:
             return None
@@ -341,23 +320,15 @@ def _nudge_stream_exact_flate(
     def _fill(kind: str, n: int) -> bytes:
         if n <= 0:
             return b""
-        # Proton ALFA_CONTENT_STREAM_COMMENT_PADDING: corpus never writes %
-        # in page /Contents. Pad with spaces/newlines only (never before ET).
-        if kind in ("noise", "comment"):
-            return nl * max(1, min(n, 8)) + (b" " * max(0, n - 8) if n > 8 else b"")
+        if kind == "noise":
+            return nl + b"%" + _noise(n) + nl
+        if kind == "comment":
+            return nl + b"%" + (b"x" * n) + nl
         return b" " * n
-
-    def _pt_before_et(pt: int) -> bool:
-        tail = stream[pt : pt + 4].lstrip(b" \t")
-        return tail.startswith(b"ET")
 
     # 1) Binary search fill on safe points (noise first — reaches +40..+100 flate).
     for pt in safe_pts[:8]:
-        kinds = ("noise", "comment")
-        # Spaces before ET → ALFA_CONTENT_ET_WHITESPACE_ANOMALY HARD.
-        if not _pt_before_et(pt):
-            kinds = ("noise", "comment", "spaces")
-        for fill_kind in kinds:
+        for fill_kind in ("noise", "comment", "spaces"):
             lo, hi = 0, 2048 if fill_kind == "noise" else 1024
             best_hit: Optional[bytes] = None
             while lo <= hi:
@@ -391,6 +362,9 @@ def _nudge_stream_exact_flate(
     # 2) Exhaustive small fillers.
     fillers = [
         nl, b" ", b"  ", nl + nl, nl + b" " + nl,
+        nl + b"%" + nl, nl + b"%." + nl, nl + b"%.." + nl,
+        nl + b"%..." + nl, nl + b"%...." + nl,
+        nl + b"%a" + nl, nl + b"%b" + nl, nl + b"%c" + nl,
     ]
     for n in range(1, 96):
         fillers.append(_fill("noise", n))
@@ -459,59 +433,6 @@ def _flate_fit_size(data: bytes, target_size: int, level: int = 6) -> Optional[b
             except zlib.error:
                 pass
     return None
-
-
-def _classic_xref_start(pdf: bytes) -> int:
-    """Byte offset of the classic `xref` table (not the `startxref` keyword)."""
-    best = -1
-    startxref = pdf.rfind(b"startxref")
-    limit = startxref if startxref >= 0 else len(pdf)
-    for m in re.finditer(rb"(?:^|[\r\n])xref[\r\n]", pdf):
-        s = m.start()
-        if pdf[s : s + 4] != b"xref":
-            s = pdf.find(b"xref", s, s + 8)
-        if 0 <= s < limit:
-            best = s
-    return best
-
-
-def _rebuild_classic_xref(body_and_tail: bytes, original_pdf: bytes) -> Optional[bytes]:
-    """Rebuild xref+trailer after a content-stream length change."""
-    body = body_and_tail
-    if not body.endswith(b"\n"):
-        body += b"\n"
-    orig_trailer_start = original_pdf.rfind(b"trailer")
-    if orig_trailer_start < 0:
-        return None
-    trailer_text = original_pdf[orig_trailer_start:]
-    eof_idx = trailer_text.find(b"startxref")
-    trailer_dict = trailer_text[:eof_idx].rstrip() if eof_idx > 0 else trailer_text.rstrip()
-    obj_pat = re.compile(rb"\n(\d+)\s+0\s+obj\b")
-    objs: Dict[int, int] = {}
-    for m in obj_pat.finditer(body):
-        objs[int(m.group(1))] = m.start() + 1
-    if not objs:
-        for m in re.finditer(rb"(\d+)\s+0\s+obj\b", body):
-            objs.setdefault(int(m.group(1)), m.start())
-    if not objs:
-        return None
-    max_obj = max(objs)
-    nl = b"\r\n" if b"\r\nxref\r\n" in original_pdf[: original_pdf.rfind(b"startxref") or 0] else b"\n"
-    xref_lines = [
-        b"xref" + nl,
-        f"0 {max_obj + 1}".encode("ascii") + nl,
-        b"0000000000 65535 f " + nl,
-    ]
-    for i in range(1, max_obj + 1):
-        if i in objs:
-            xref_lines.append(f"{objs[i]:010d} 00000 n ".encode("ascii") + nl)
-        else:
-            xref_lines.append(b"0000000000 00000 f " + nl)
-    xref_blob = b"".join(xref_lines)
-    trailer_bytes = re.sub(
-        rb"/Size\s+\d+", f"/Size {max_obj + 1}".encode("ascii"), trailer_dict
-    )
-    return body + xref_blob + trailer_bytes + nl + b"startxref" + nl + str(len(body)).encode("ascii") + nl + b"%%EOF" + nl
 
 
 def homogenize_oracle_flate(pdf: bytes, level: int = 6) -> Optional[bytes]:
@@ -661,8 +582,7 @@ class AlfaOrigContext:
         if len(t) > slot_chars:
             return False
         if len(t) < slot_chars:
-            pad = " " if "RUR" in t.replace("\xa0", " ") else _NBSP
-            t = t + pad * (slot_chars - len(t))
+            t = t + _NBSP * (slot_chars - len(t))
         return self.can_render(t)[0]
 
     def fits_fields(self, coords: Dict[str, Tuple[float, float]], prepared: Dict[str, str]) -> Tuple[bool, str]:
@@ -695,9 +615,7 @@ class AlfaOrigContext:
             )
             return False
         if len(t) < slot_chars:
-            # After RUR, pad with U+0020 — NBSP flood → ALFA_AMOUNT_TYPOGRAPHY_ANOMALY.
-            pad = " " if "RUR" in t.replace("\xa0", " ") else nbsp
-            t = t + pad * (slot_chars - len(t))
+            t = t + nbsp * (slot_chars - len(t))
         ok, miss = self.can_render(t)
         if not ok:
             logger.warning("Alfa replace miss %s at y=%s: %s", miss, y, new_text[:30])
@@ -743,82 +661,29 @@ class AlfaOrigContext:
             return True
         return self.grow_slot_at(y, x, need)
 
-    def commit(self, *, force: bool = False) -> Optional[bytes]:
+    def commit(self) -> Optional[bytes]:
         stream_b = bytes(self.stream)
         # near-oracle flate: не трогаем image/font (распознавание), content — near zlib-6.
         compressed = _flate_fit_size(stream_b, self.orig_comp_len, self.zlib_level)
-        if compressed is not None and len(compressed) == self.orig_comp_len:
-            out = bytearray(self.pdf_bytes)
-            out[self.cs_cs : self.cs_ce] = compressed
-            from sber_dynamic import _strip_pdf_eof_tail
-            return _strip_pdf_eof_tail(bytes(out))
-        if not force:
+        if compressed is None:
+            # SafeCheck «структура»: never Length/xref-rebuild content stream.
+            # Prefer GEN_FAIL → retry another payload/donor over structure FAKE.
             logger.warning(
                 "Alfa: flate size miss need=%d dec=%d — reject (no xref rebuild)",
                 self.orig_comp_len,
                 len(stream_b),
             )
             return None
-        raw = _oracle_near_flate(stream_b, self.zlib_level)
-        if len(raw) <= self.orig_comp_len:
-            padded = raw + (b"\x00" * (self.orig_comp_len - len(raw)))
-            out = bytearray(self.pdf_bytes)
-            out[self.cs_cs : self.cs_ce] = padded
-            logger.warning(
-                "Alfa: force-commit in-place pad flate %d→%d",
-                len(raw),
-                self.orig_comp_len,
+        out = bytearray(self.pdf_bytes)
+        if len(compressed) != self.orig_comp_len:
+            logger.error(
+                "Alfa: flate fit returned %d≠%d — reject (no xref rebuild)",
+                len(compressed), self.orig_comp_len,
             )
-            from sber_dynamic import _strip_pdf_eof_tail
-            return _strip_pdf_eof_tail(bytes(out))
-        rebuilt = self._commit_rebuild(stream_b)
-        if rebuilt is None:
-            logger.warning(
-                "Alfa: force-commit rebuild failed need=%d dec=%d",
-                self.orig_comp_len,
-                len(stream_b),
-            )
-        return rebuilt
-
-    def _commit_rebuild(self, stream_b: bytes) -> Optional[bytes]:
-        """Emit a valid PDF when compressed content is longer than donor /Length."""
-        compressed = _oracle_near_flate(stream_b, self.zlib_level)
-        pdf = self.pdf_bytes
-        needle = f"{self.cs_xref} 0 obj".encode("ascii")
-        obj_pos = pdf.rfind(needle, 0, self.cs_cs)
-        if obj_pos < 0:
-            obj_pos = pdf.rfind(b"obj", 0, self.cs_cs)
-            if obj_pos < 0:
-                return None
-            obj_dict_start = obj_pos + 3
-        else:
-            obj_dict_start = obj_pos + len(needle)
-        stream_kw = pdf.find(b"stream", obj_dict_start, self.cs_cs + 16)
-        if stream_kw < 0:
             return None
-        obj_dict = pdf[obj_dict_start:stream_kw]
-        m = re.search(rb"/Length\s+(\d+)", obj_dict)
-        if not m:
-            return None
-        new_len = str(len(compressed)).encode("ascii")
-        new_obj_dict = obj_dict[: m.start(1)] + new_len + obj_dict[m.end(1) :]
-        xref_pos = _classic_xref_start(pdf)
-        if xref_pos < 0:
-            return None
-        head = (
-            pdf[:obj_dict_start]
-            + new_obj_dict
-            + pdf[stream_kw : self.cs_cs]
-            + compressed
-            + pdf[self.cs_ce : xref_pos]
-        )
-        out = _rebuild_classic_xref(head, pdf)
-        logger.warning(
-            "Alfa: force-commit flate %d→%d (xref rebuild)",
-            self.orig_comp_len,
-            len(compressed),
-        )
-        return out
+        out[self.cs_cs : self.cs_ce] = compressed
+        from sber_dynamic import _strip_pdf_eof_tail
+        return _strip_pdf_eof_tail(bytes(out))
 
     @property
     def available_chars(self) -> set:

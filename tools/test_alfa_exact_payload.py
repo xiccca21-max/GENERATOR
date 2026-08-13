@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import unittest
 
@@ -47,6 +48,29 @@ class AlfaExactPayloadTests(unittest.TestCase):
         self.assertEqual(card.CARD_COORDS["date_formed"], expected)
         self.assertEqual(phone.PHONE_COORDS["date_formed"], expected)
 
+    def test_sbp_fio_is_name_patronymic_initial(self) -> None:
+        self.assertEqual(
+            sbp._fmt_alfa_sbp_receiver("Алина Александровна А"),
+            "Алина Александровна А",
+        )
+        self.assertEqual(
+            sbp._fmt_alfa_sbp_receiver("Диана Камильевна П."),
+            "Диана Камильевна П",
+        )
+        self.assertEqual(sbp._fmt_alfa_sbp_receiver(""), "Алина Александровна А")
+        two = sbp._fmt_alfa_sbp_receiver("Павел Соколов")
+        self.assertRegex(two, r"^Павел \S+(ович|евич) С$")
+        short = sbp._fmt_alfa_sbp_receiver("Анна А.")
+        self.assertRegex(short, r"^Анна \S+(овна|евна) А$")
+
+    def test_card_never_emits_blank_pan(self) -> None:
+        blank = card._prepare_card({"amount": "1000", "date_time": "сейчас"})
+        for key in ("sender_card", "receiver_card"):
+            compact = re.sub(r"[\s\u00a0]", "", blank[key])
+            self.assertRegex(compact, r"^220\d{3}\*{6}\d{4}$", key)
+        kept = card._fmt_card("2200151234568946")
+        self.assertEqual(kept, "220015******8946")
+
     def test_sbp_manual_text_and_ids_are_exact(self) -> None:
         data = {
             "date_time": "01.08.2026 05:00:00",
@@ -57,9 +81,10 @@ class AlfaExactPayloadTests(unittest.TestCase):
             "operation_num": "C16-MANUAL-Э09",
         }
         prepared = sbp._prepare_sbp(data)
-        self.assertEqual(prepared["receiver"], data["receiver"])
+        self.assertEqual(prepared["receiver"], sbp._fmt_alfa_sbp_receiver("Элкин Подьем"))
+        self.assertRegex(prepared["receiver"], r"^Элкин \S+(ович|евич) П$")
         self.assertEqual(prepared["recipient_bank"], data["recipient_bank"])
-        self.assertEqual(prepared["account"], data["account"])
+        self.assertRegex(prepared["account"], r"^40817\d{15}$")
         self.assertEqual(prepared["sbp_id"], data["sbp_id"])
         self.assertEqual(
             prepared["operation_num"].rstrip("\u00a0"),
@@ -142,7 +167,7 @@ class AlfaExactPayloadTests(unittest.TestCase):
                 sbp.create_alfa_sbp_stealth,
                 {
                     "amount": "7000",
-                    "receiver": "Элкин Подьем",
+                    "receiver": "Элкин Петрович П",
                     "recipient_bank": "Банк Обьем-Э",
                     "phone": "+79001234567",
                     "account": "40817810000000000009",

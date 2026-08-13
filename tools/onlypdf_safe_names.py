@@ -277,6 +277,27 @@ def pick_receiver_short(i: int, attempt: int = 0) -> str:
     return RECV_SHORT[(i + attempt) % len(RECV_SHORT)]
 
 
+ALFA_SBP_FIO = [
+    "Алина Александровна А",
+    "Павел Иванович С",
+    "Жанна Евгеньевна Ж",
+    "Харитон Петрович Х",
+    "Элина Сергеевна Э",
+    "Федор Николаевич Ф",
+    "Цветана Юрьевна Ц",
+    "Инна Михайловна Щ",
+    "Роман Владимирович Щ",
+    "Оксана Андреевна Ч",
+    "Юрий Алексеевич Ц",
+    "Алена Дмитриевна Ы",
+]
+
+
+def pick_alfa_sbp_receiver(i: int, attempt: int = 0) -> str:
+    """Alfa SBP face: full first + full patronymic + surname initial, no period."""
+    return ALFA_SBP_FIO[(i + attempt) % len(ALFA_SBP_FIO)]
+
+
 def pick_sber_fio(i: int, attempt: int = 0, *, role: str = "recv") -> str:
     """Mix long unusual and short FIO for Sber fields; force rare letters.
 

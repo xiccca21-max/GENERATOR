@@ -175,6 +175,8 @@ def _attempt(path: str, data: Dict, *, tag: str, max_trials: int = 5) -> Optiona
             if key not in prepared:
                 continue
             need = len(prepared[key].rstrip(_NBSP))
+            if "RUR" in prepared[key].replace(_NBSP, " "):
+                need += 1
             have = ctx.slot_size_at(y, x)
             if have <= 0 or need <= have:
                 continue
@@ -200,6 +202,18 @@ def _attempt(path: str, data: Dict, *, tag: str, max_trials: int = 5) -> Optiona
         ok, why = ctx.fits_fields(CARD_COORDS, prepared)
         if not ok:
             logger.info("[%s %s] skip fit: %s", tag, os.path.basename(path), why)
+            continue
+        blank_card = False
+        for key in ("sender_card", "receiver_card"):
+            compact = re.sub(r"[\s\u00a0]", "", prepared.get(key, ""))
+            if not re.fullmatch(r"\d{6}\*{4,8}\d{4}", compact):
+                logger.error(
+                    "[%s %s] refuse blank card %s=%r",
+                    tag, os.path.basename(path), key, prepared.get(key),
+                )
+                blank_card = True
+                break
+        if blank_card:
             continue
         bad_replace = False
         for key, (y, x) in CARD_COORDS.items():
@@ -227,17 +241,23 @@ def _attempt(path: str, data: Dict, *, tag: str, max_trials: int = 5) -> Optiona
                 # Стойкий overshoot — сумма/слот, op не поможет.
                 if overshoot_streak >= 3:
                     logger.warning(
-                        "[%s %s] persistent flate> — ship anyway",
+                        "[%s %s] persistent flate> — Java rebuild (no zlib pad)",
                         tag, os.path.basename(path),
                     )
                     result = ctx.commit(force=True)
                     if result is not None:
                         result = _randomize_trailer_id(result)
-                        logger.info(
-                            "🔴 ALFA CARD %s: %d bytes (flate-miss ship)",
-                            tag, len(result),
+                        from alfa_sbp_stealth import _finish_oracle_pdf
+
+                        finished = _finish_oracle_pdf(
+                            result, bytes(ctx.stream), prepared, _verify_committed, tag=tag,
                         )
-                        return result
+                        if finished is not None:
+                            logger.info(
+                                "🔴 ALFA CARD %s: %d bytes (flate-rebuild ship)",
+                                tag, len(finished),
+                            )
+                            return finished
                     continue
                 continue
             overshoot_streak = 0
@@ -288,24 +308,16 @@ def _attempt(path: str, data: Dict, *, tag: str, max_trials: int = 5) -> Optiona
         if not _verify_committed(result, prepared):
             logger.info("[%s %s] post-commit verify failed", tag, os.path.basename(path))
             continue
-        # Proton ALFA_ORACLE_FONT_SUBSET_CLOSURE: neutralize unused printable CIDs.
-        try:
-            from alfa_font_extend import _closure_fix_alfa_font
+        from alfa_sbp_stealth import _finish_oracle_pdf
 
-            fixed = _closure_fix_alfa_font(bytearray(result), bytes(ctx.stream))
-            if fixed and len(fixed) >= len(result) - 64 and _verify_committed(fixed, prepared):
-                result = fixed
-        except Exception as exc:
-            logger.warning("[%s] closure_fix skip: %s", tag, exc)
-        from alfa_sbp_stealth import _fit_alfa_fontfile_size
-
-        sized = _fit_alfa_fontfile_size(result, bytes(ctx.stream), lean=True)
-        if sized is None or not _verify_committed(sized, prepared):
-            logger.info("[%s %s] FontFile2 size fit failed", tag, os.path.basename(path))
+        finished = _finish_oracle_pdf(
+            result, bytes(ctx.stream), prepared, _verify_committed, tag=tag,
+        )
+        if finished is None:
+            logger.info("[%s %s] oracle finish failed", tag, os.path.basename(path))
             continue
-        result = sized
-        logger.info("🔴 ALFA CARD %s: %d bytes (trial %d, exact flate)", tag, len(result), trial)
-        return result
+        logger.info("🔴 ALFA CARD %s: %d bytes (trial %d, exact flate)", tag, len(finished), trial)
+        return finished
 
     logger.warning("[%s %s] no exact flate after retries — force last", tag, os.path.basename(path))
     ctx = AlfaOrigContext()
@@ -325,8 +337,17 @@ def _attempt(path: str, data: Dict, *, tag: str, max_trials: int = 5) -> Optiona
             result = ctx.commit(force=True)
             if result is not None:
                 result = _randomize_trailer_id(result)
-                logger.info("🔴 ALFA CARD %s: %d bytes (final force ship)", tag, len(result))
-                return result
+                from alfa_sbp_stealth import _finish_oracle_pdf
+
+                finished = _finish_oracle_pdf(
+                    result, bytes(ctx.stream), prepared, _verify_committed, tag=tag,
+                )
+                if finished is not None:
+                    logger.info(
+                        "🔴 ALFA CARD %s: %d bytes (final force ship)",
+                        tag, len(finished),
+                    )
+                    return finished
     return None
 
 
@@ -348,11 +369,30 @@ def _fmt_commission(raw: str = "0") -> str:
     return f"{grouped}{_NBSP}RUR{_NBSP}"
 
 
+def _gen_mir_pan(*, last4: Optional[str] = None, bin6: Optional[str] = None) -> str:
+    """Корпус card: MIR 2200xx******xxxx. Никогда не оставляем слот пустым."""
+    import secrets
+
+    if not (bin6 and bin6.isdigit() and len(bin6) == 6 and 220_000 <= int(bin6) <= 220_499):
+        bin6 = f"220{secrets.randbelow(500):03d}"
+    if not (last4 and last4.isdigit() and len(last4) == 4):
+        last4 = f"{secrets.randbelow(10_000):04d}"
+    return f"{bin6}******{last4}"
+
+
 def _fmt_card(card: str) -> str:
-    d = re.sub(r"\D", "", card or "")
+    raw = (card or "").strip()
+    if not raw or raw.lower() in ("авто", "auto", "-"):
+        return _gen_mir_pan()
+    compact = re.sub(r"[\s\u00a0]", "", raw)
+    masked = re.fullmatch(r"(\d{6})\*{4,8}(\d{4})", compact)
+    if masked:
+        return f"{masked.group(1)}******{masked.group(2)}"
+    d = re.sub(r"\D", "", raw)
     if len(d) >= 16:
         return f"{d[:6]}******{d[-4:]}"
-    return card.strip()
+    last4 = d[-4:].zfill(4) if d else None
+    return _gen_mir_pan(last4=last4)
 
 
 def _parse_dt(date_in: str) -> datetime:
@@ -404,7 +444,7 @@ def _prepare_card(data: Dict, *, ctx: Optional[AlfaOrigContext] = None) -> Dict[
     op = str(data.get("operation_num") or data.get("operation_number") or "")
     if not op or op.lower() in ("авто", "auto", "-"):
         op = _gen_card_op_num(op_dt)
-    return {
+    out = {
         "date_formed": _fmt_datetime(op_dt, with_seconds=False),
         "amount": _fmt_amount(str(data.get("amount", "0"))),
         "commission": _fmt_commission(),
@@ -413,6 +453,11 @@ def _prepare_card(data: Dict, *, ctx: Optional[AlfaOrigContext] = None) -> Dict[
         "date_time": _fmt_datetime(op_dt, with_seconds=True),
         "operation_num": op + _NBSP,
     }
+    for key in ("sender_card", "receiver_card"):
+        compact = re.sub(r"[\s\u00a0]", "", out[key])
+        if not re.fullmatch(r"\d{6}\*{4,8}\d{4}", compact):
+            out[key] = _gen_mir_pan() + (_NBSP if key == "sender_card" else "")
+    return out
 
 
 def create_alfa_card_stealth(data: Dict) -> Optional[bytes]:

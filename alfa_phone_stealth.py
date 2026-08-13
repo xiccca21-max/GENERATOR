@@ -204,6 +204,8 @@ def _attempt(path: str, data: Dict, *, tag: str, max_trials: int = 6) -> Optiona
             if key not in prepared:
                 continue
             need = len(prepared[key].rstrip(_NBSP))
+            if "RUR" in prepared[key].replace(_NBSP, " "):
+                need += 1
             have = ctx.slot_size_at(y, x)
             if need <= have:
                 continue

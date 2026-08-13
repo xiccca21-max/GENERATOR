@@ -80,7 +80,7 @@ def _payload(i: int, attempt: int = 0) -> dict:
     if not pool:
         pool = [{
             "day": "15.06.2026", "hh": 14, "mm": 30, "ss": 0, "digs": "3500",
-            "sender_card": "220015******1234", "receiver_card": "427601******5678",
+            "sender_card": "220015******1234", "receiver_card": "220220******8275",
         }]
 
     d = pool[(i + attempt) % len(pool)]
