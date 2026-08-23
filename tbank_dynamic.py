@@ -4237,8 +4237,8 @@ def create_tbank_pipeline(
         if _content_has_pad_after_et(candidate):
             logger.warning("T-Bank %s: reject pad-after-ET", channel)
             continue
-        result = candidate
-        break
+                result = candidate
+                break
 
     if result is not None:
         if post_validate:
@@ -4685,7 +4685,7 @@ def create_tbank_pipeline(
                                                     )
                                                     break
                                         if _ship1 is None:
-                                            logger.warning(
+            logger.warning(
                                                 "T-Bank sbp: orphan-cap shape miss %s→%s @%d",
                                                 _f1_glyph_shape(_ff1),
                                                 _have_sh,
@@ -4720,6 +4720,11 @@ def create_tbank_pipeline(
                                     )
             except Exception as exc:
                 logger.warning("T-Bank sbp: F1 orphan-cap: %s", exc)
+            try:
+                from tbank_sbp_stealth import apply_sbp_font_hard_fixes as _hard
+                result = _hard(result)
+            except Exception as _exc_hf:
+                logger.warning("T-Bank sbp font hard-fix: %s", _exc_hf)
             return _finalize_tbank_f2_epoch(result)
 
         # card: F2 HARD (height=431/471 atlas) — lean best-effort, still ship.
@@ -4734,7 +4739,7 @@ def create_tbank_pipeline(
                 )
             f2c = _lean_card_f2_to_hard(result, amt, lo=5056, hi=5868)
             if f2c is None:
-                logger.warning(
+            logger.warning(
                     "T-Bank %s: F2 lean failed — ship", channel,
                 )
             else:

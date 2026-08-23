@@ -21,7 +21,17 @@ from tg_check_pdf import _load_env
 from tg_client import connect_client, ensure_login, make_client
 
 DEFAULT_ONLYPDF = "@onlypdf_robot"
-DEFAULT_PROTON = "@proton_pdf_bot"  # unused; kept for env compat
+DEFAULT_PROTON = "@proton_pdf_bot"
+
+
+def _gate_is_proton() -> bool:
+    import os
+
+    return (os.environ.get("TG_GATE") or "").strip().lower() in (
+        "proton",
+        "proton_pdf",
+        "proton_pdf_bot",
+    )
 
 
 def _norm_bot(name: str, default: str) -> str:
@@ -169,6 +179,12 @@ async def _wait_verdict(
                 continue
             v = parser(body)
             if v in _FINAL_VERDICTS:
+                if v != "PASS":
+                    snippet = " | ".join(
+                        ln.strip() for ln in body.splitlines() if ln.strip()
+                    )[:400]
+                    tag = "proton_raw" if parser is _parse_proton else "onlypdf_raw"
+                    print(f"  {tag}={snippet}", flush=True)
                 return v
         if not client.is_connected():
             try:
@@ -220,8 +236,12 @@ async def proton_verdict(
                 await connect_client(client, cfg)
             msgs = await client.get_messages(bot, limit=1)
             after = msgs[0].id if msgs else 0
+            await _pace_onlypdf_send()
             await client.send_file(bot, str(path))
-            return await _wait_verdict(client, bot, after, cfg, parser=_parse_proton)
+            wait = float(cfg.get("TG_WAIT_SECONDS", "90"))
+            return await _wait_verdict(
+                client, bot, after, cfg, parser=_parse_proton, timeout=max(wait, 90.0),
+            )
         except (ConnectionError, OSError, sqlite3.OperationalError) as exc:
             print(f"tg reconnect proton after {type(exc).__name__}: {exc}", flush=True)
             try:
@@ -252,20 +272,27 @@ async def dual_accept_verdict(
     onlypdf_double: bool = False,
     reject_dir: Optional[Path] = None,
 ) -> str:
-    """OnlyPDF PASS×1; FAKE/UNKNOWN — до 5 попыток (flake). Saves reject + Proton note."""
+    """OnlyPDF PASS×1. TIMEOUT flake-retry; FAKE/UNKNOWN are final."""
     _ = pause
     v1 = "TIMEOUT"
     tries = 5
+    use_proton = _gate_is_proton()
+    checker = "proton" if use_proton else "onlypdf"
     for try_i in range(1, tries + 1):
-        v1 = await onlypdf_verdict(client, path, cfg)
+        if use_proton:
+            v1 = await proton_verdict(client, path, cfg)
+        else:
+            v1 = await onlypdf_verdict(client, path, cfg)
         print(
-            f"  onlypdf={v1}"
+            f"  {checker}={v1}"
             + (f" (try {try_i}/{tries})" if try_i > 1 and v1 != "PASS" else ""),
             flush=True,
         )
         if v1 == "PASS":
             break
-        if v1 in ("FAKE", "UNKNOWN") and try_i < tries:
+        if v1 in ("FAKE", "UNKNOWN"):
+            break
+        if v1 == "TIMEOUT" and try_i < tries:
             await asyncio.sleep(2.0 + try_i)
             continue
         if v1 == "SERVICE_ERROR":
@@ -345,9 +372,16 @@ async def onlypdf_accept_double(
 
 async def open_onlypdf_client(cfg: Optional[Dict[str, str]] = None):
     cfg = cfg or _load_env()
-    # Fast OnlyPDF waits (~25s hard cap).
-    cfg.setdefault("TG_WAIT_SECONDS", "25")
-    cfg.setdefault("TG_POLL_SECONDS", "0.5")
+    if _gate_is_proton():
+        try:
+            wait = float(cfg.get("TG_WAIT_SECONDS") or 90)
+        except (TypeError, ValueError):
+            wait = 90.0
+        cfg["TG_WAIT_SECONDS"] = str(max(wait, 90.0))
+        cfg.setdefault("TG_POLL_SECONDS", "0.7")
+    else:
+        cfg.setdefault("TG_WAIT_SECONDS", "25")
+        cfg.setdefault("TG_POLL_SECONDS", "0.5")
     client = make_client(cfg)
     await ensure_login(client, cfg)
     return client, cfg
@@ -419,10 +453,16 @@ async def generate_onlypdf_batch(
     reject_root.mkdir(parents=True, exist_ok=True)
 
     client, cfg = await open_onlypdf_client()
-    only_bot = cfg.get("TG_ONLYPDF_BOT", DEFAULT_ONLYPDF)
+    use_proton = _gate_is_proton()
+    gate_bot = (
+        _norm_bot(cfg.get("TG_PROTON_BOT", DEFAULT_PROTON), DEFAULT_PROTON)
+        if use_proton
+        else cfg.get("TG_ONLYPDF_BOT", DEFAULT_ONLYPDF)
+    )
+    gate_name = "Proton" if use_proton else "OnlyPDF"
     mode = "STRICT_STREAK_WIPE" if strict_streak else "soft-fill"
     print(
-        f"OnlyPDF gate → {only_bot} | {mode} target {n} (from {start_at}) → {out_dir}",
+        f"{gate_name} gate → {gate_bot} | {mode} target {n} (from {start_at}) → {out_dir}",
         flush=True,
     )
 
@@ -472,7 +512,7 @@ async def generate_onlypdf_batch(
                 if verdict == "PASS":
                     dt = time.monotonic() - t_item
                     print(
-                        f"{i:02d} PASS onlypdf streak={i}/{n} ({dt:.1f}s)",
+                        f"{i:02d} PASS {gate_name.lower()} streak={i}/{n} ({dt:.1f}s)",
                         flush=True,
                     )
                     if on_accept:
@@ -482,19 +522,44 @@ async def generate_onlypdf_batch(
 
                 print(f"{i:02d} a{attempt}+{bias} rejected ({verdict})", flush=True)
                 try:
+                    dump = reject_root / f"{prefix}_{i:02d}_a{attempt}_payload.json"
+                    dump.write_text(
+                        __import__("json").dumps(data, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    print(f"  saved payload → {dump}", flush=True)
+                except Exception as _pe:
+                    print(f"  payload-save err: {_pe}", flush=True)
+                try:
                     path.unlink(missing_ok=True)
                 except Exception:
                     pass
 
                 if strict_streak and verdict in ("FAKE", "UNKNOWN"):
-                    # Не wipe-and-continue: FAKE = стоп, чинить генератор.
-                    # Иначе сыплются одинаковые reject'ы, а серия «идёт дальше».
+                    if (os.environ.get("PROTON_HOLD_FAIL") or "").strip() == "1":
+                        print(
+                            "HOLD_FAIL same payload — fix generator, "
+                            f"then retry this data. verdict={verdict}",
+                            flush=True,
+                        )
+                        return 4
+                    streak_resets += 1
+                    if streak_resets > max_streak_breaks:
+                        print(
+                            f"FATAL too many STREAK_BREAK ({streak_resets})",
+                            flush=True,
+                        )
+                        return 5
                     print(
-                        f"HALT_ON_FAKE at {i}/{n} verdict={verdict} "
-                        f"reject→{reject_root} — fix generator, do not wipe-continue",
+                        f"STREAK_BREAK at {i}/{n} verdict={verdict} "
+                        f"reset→0 (resets={streak_resets}) wipe accepted",
                         flush=True,
                     )
-                    return 4
+                    _wipe_accepted()
+                    i = start_at
+                    wiped = True
+                    await asyncio.sleep(2)
+                    break
 
                 if strict_streak and verdict in ("TIMEOUT", "SERVICE_ERROR", "?"):
                     await asyncio.sleep(2)
@@ -531,7 +596,7 @@ async def generate_onlypdf_batch(
                 flush=True,
             )
         else:
-            print(f"RESULT {n}/{n} PASS onlypdf → {out_dir}", flush=True)
+            print(f"RESULT {n}/{n} PASS {gate_name.lower()} → {out_dir}", flush=True)
         return 0
     finally:
         try:

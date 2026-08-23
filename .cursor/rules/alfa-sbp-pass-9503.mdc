@@ -1,0 +1,29 @@
+---
+description: Live @bankpdfbot PASS 950357be — 16.08 send-time T-Bank Alfa SBP; do not clone.
+alwaysApply: true
+---
+
+# Alfa SBP live PASS 950357be (K-ALFA-SBP-PASS-9503)
+
+Live `@bankpdfbot` ✅ 16.08.2026, **direct** (not cache):
+`docs/specimen_alfa_sbp_PASS_950357be9695b18a.pdf` (58117, SHA `950357be9695b18a…`).
+
+```text
+date:     16.08.2026 14:16:02 мск
+amount:   24890
+receiver: Глеб Николаевич А
+bank:     Т-Банк
+phone:    +7 (916) 284-63-17
+account:  40817810704259664247 ledger 042
+op:       C161608261250574
+sbp:      B6228111557417240B10130011821301
+prefix:   QROFYN
+FF2:      20754 aligned, sha16 ca01209314470a34
+```
+
+Sent immediately after genuine orig `document15.08.26.pdf` cache ✅.
+
+After this PASS, the next new SHA on the same `@kronlead` chat is ❌ (g08 Ольга).
+After a FAIL streak, orig+`Г`+cooldown (4 min) still ❌ (g11/g12). Do not spam new SHAs after a ❌ — this account then keeps failing structurally green files.
+
+Do not clone this identity.

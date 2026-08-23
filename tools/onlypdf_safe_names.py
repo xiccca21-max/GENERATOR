@@ -231,9 +231,8 @@ RECV_FULL = [
     "Фырчик Щеколдин",
 ]
 
-# The production qualification set intentionally excludes letters that the
-# current donor corpus does not cover consistently.  Never transliterate them:
-# generators must fail closed if such input reaches an unsupported channel.
+# QA pool: ё/ъ/й not required (and not used). Never transliterate if they
+# still reach a generator — hydrate instead.
 _EXCLUDED = frozenset("ъЪёЁйЙ")
 
 
@@ -255,6 +254,63 @@ RECV_FULL = [value for value in RECV_FULL if _supported(value)]
 
 CYR_FULL = "абвгдежзиклмнопрстуфхцчшщыьэюя"
 CYR_NO_YO_TVERD = CYR_FULL
+
+# Complex FIO for T-Bank 10/10 — rare letters except ё/ъ/й. Attempt does not
+# swap to short easy names.
+HARD_TBANK_SENDERS = [
+    ("Харитон", "Хрусталев"),
+    ("Элина", "Белова"),
+    ("Цветана", "Яшина"),
+    ("Жанна", "Жукова"),
+    ("Роман", "Щербаков"),
+    ("Федор", "Фахрутдинов"),
+    ("Павел", "Рыбаков"),
+    ("Глеб", "Волков"),
+    ("Оксана", "Чернова"),
+    ("Зульфия", "Каримова"),
+    ("Дмитрий", "Ликс"),
+    ("Борис", "Новиков"),
+    ("Сергей", "Семенов"),
+    ("Татьяна", "Соколова"),
+    ("Юлия", "Ковалева"),
+    ("Анна", "Лебедева"),
+    ("Никита", "Орлов"),
+    ("Владимир", "Шаров"),
+    ("Максим", "Попов"),
+    ("Алексей", "Уткин"),
+]
+HARD_TBANK_RECV = [
+    "Харитон Х.",
+    "Элина Э.",
+    "Цветана Я.",
+    "Жанна Ж.",
+    "Роман Щ.",
+    "Федор Ф.",
+    "Павел Р.",
+    "Глеб Г.",
+    "Оксана Ч.",
+    "Зульфия К.",
+    "Слава Б.",
+    "Борис Н.",
+    "Сергей С.",
+    "Татьяна Т.",
+    "Юлия Ю.",
+    "Анна А.",
+    "Никита О.",
+    "Владимир Ш.",
+    "Максим М.",
+    "Алексей У.",
+]
+HARD_TBANK_SENDERS = [v for v in HARD_TBANK_SENDERS if _supported(v)]
+HARD_TBANK_RECV = [v for v in HARD_TBANK_RECV if _supported(v)]
+
+
+def pick_hard_tbank_pair(i: int, attempt: int = 0) -> tuple[str, str]:
+    return HARD_TBANK_SENDERS[(i - 1 + attempt) % len(HARD_TBANK_SENDERS)]
+
+
+def pick_hard_tbank_recv(i: int, attempt: int = 0) -> str:
+    return HARD_TBANK_RECV[(i - 1 + attempt * 3) % len(HARD_TBANK_RECV)]
 
 
 def coverage_report(text: str) -> tuple[list[str], list[str]]:

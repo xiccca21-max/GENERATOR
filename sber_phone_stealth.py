@@ -65,8 +65,10 @@ def _format_phone_commission(raw: str) -> str:
 
 def _format_phone_display(phone: str) -> str:
     digits = re.sub(r"\D", "", phone or "")
-    if len(digits) >= 11:
+    if len(digits) >= 10:
         d = digits[-10:]
+        if d[0] != "9":
+            d = "9" + d[1:]
         return f"+7({d[0:3]}) {d[3:6]}-{d[6:8]}-{d[8:10]}"
     return phone.strip()
 
@@ -212,5 +214,17 @@ def create_sber_phone_stealth(data: Dict) -> Optional[bytes]:
     if got_rub != want_rub:
         logger.warning("Sber phone: amount mismatch want=%s got=%s", want_rub, got_rub)
         return None
+    try:
+        from tools.emit_quality_gate import count_odd_tj
+    except Exception:
+        try:
+            from emit_quality_gate import count_odd_tj
+        except Exception:
+            count_odd_tj = None  # type: ignore
+    if count_odd_tj is not None:
+        odd, total = count_odd_tj(result)
+        if odd:
+            logger.warning("Sber phone: odd Tj %d/%d — reject", odd, total)
+            return None
     logger.info("Sber phone OK (%d bytes)", len(result))
     return result

@@ -1,0 +1,25 @@
+---
+description: Live @bankpdfbot PASS 98a2864d — 16.08 send-time WB Alfa SBP; do not clone.
+alwaysApply: true
+---
+
+# Alfa SBP live PASS 98a2864d (K-ALFA-SBP-PASS-98A2)
+
+Live `@bankpdfbot` ✅ 16.08.2026, **direct** (not cache):
+`docs/specimen_alfa_sbp_PASS_98a2864dfae0d8f1.pdf` (60162, SHA `98a2864dfae0d8f1…`).
+
+```text
+date:     16.08.2026 15:00:49 мск (send-time)
+amount:   21480
+receiver: Вера Геннадьевна Г
+bank:     Wildberries (Вайлдберриз Банк)
+phone:    +7 (920) 641-28-05
+account:  40817810904223917296 ledger 042
+op:       C161608261309397
+sbp:      B6228120040639730G10140011830701
+prefix:   PEMPXE
+FF2:      24850 aligned, sha16 c5e817ff90584111, cmap 69
+```
+
+Passed in a T-Bank FAIL burst (no cooldown). Next WB clone-recipe (g21 Павел) ❌.
+Do not treat WB+920 as sufficient. Do not clone this identity.

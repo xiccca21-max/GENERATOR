@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import os
 import re
+import struct
 import sys
 import unittest
+from datetime import datetime
 
 import fitz
 
@@ -13,6 +15,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 import alfa_card_stealth as card
+import alfa_emit
 import alfa_glyph_library as glyphs
 import alfa_phone_stealth as phone
 import alfa_sbp_stealth as sbp
@@ -26,9 +29,21 @@ BLOCKED_RU = "ъЪёЁйЙ"
 
 
 class AlfaExactPayloadTests(unittest.TestCase):
-    def assert_size_band(self, pdf: bytes, label: str) -> None:
-        self.assertGreaterEqual(len(pdf), 58_000, label)
-        self.assertLessEqual(len(pdf), 58_800, label)
+    def assert_natural_fontfile2(self, pdf: bytes, label: str) -> None:
+        self.assertTrue(sbp._fontfile2_has_exact_sfnt_end(pdf), label)
+
+    def test_sfnt_release_gate_rejects_trailing_bytes(self) -> None:
+        # One table at offset 28, length 1; the natural aligned SFNT end is 32.
+        sfnt = (
+            b"\x00\x01\x00\x00"
+            + struct.pack(">HHHH", 1, 16, 0, 0)
+            + b"head"
+            + struct.pack(">III", 0, 28, 1)
+            + b"\0\0\0\0"
+        )
+        self.assertEqual(alfa_emit.sfnt_aligned_end(sfnt), 32)
+        self.assertTrue(alfa_emit.sfnt_has_exact_aligned_end(sfnt))
+        self.assertFalse(alfa_emit.sfnt_has_exact_aligned_end(sfnt + b"tail"))
 
     def test_fixed_left_column_anchors(self) -> None:
         for coords in (sbp.SBP_COORDS, card.CARD_COORDS, phone.PHONE_COORDS):
@@ -160,7 +175,7 @@ class AlfaExactPayloadTests(unittest.TestCase):
         self.assertTrue(ctx.load(extended))
         self.assertTrue(phone._phone_glyphs_ok(ctx, sample)[0])
 
-    def test_live_generators_emit_exact_fields_in_original_size_band(self) -> None:
+    def test_live_generators_emit_exact_fields_with_natural_fontfile2(self) -> None:
         cases = (
             (
                 "sbp",
@@ -214,7 +229,7 @@ class AlfaExactPayloadTests(unittest.TestCase):
             with self.subTest(label=label):
                 pdf = create(data)
                 self.assertIsNotNone(pdf, label)
-                self.assert_size_band(pdf, label)
+                self.assert_natural_fontfile2(pdf, label)
                 prepared = prepare(data)
                 ctx = context_type()
                 self.assertTrue(ctx.load_bytes(pdf), label)
@@ -250,6 +265,34 @@ class AlfaExactPayloadTests(unittest.TestCase):
                         _glyphs_ok_for_text(ctx, ctx.pdf_bytes, text)[0],
                         label,
                     )
+
+
+    def test_op_tail_follows_hour_profile_not_evening_band(self) -> None:
+        dt = datetime(2026, 8, 10, 10, 48, 15)
+        self.assertEqual(sbp._op_tail_center(dt), 569543)
+        op = sbp._gen_sbp_op_num(dt)
+        self.assertTrue(op.startswith("C16100826"))
+        tail = int(op[9:])
+        self.assertGreater(tail, 500_000)
+        self.assertLess(tail, 650_000)
+        self.assertNotEqual(tail, sbp._op_tail_center(dt))
+
+    def test_generated_account_uses_live_ledger_family(self) -> None:
+        for _ in range(20):
+            account = sbp._gen_alfa_debit_account()
+            self.assertIn(account[9:12], sbp._ALFA_LIVE_LEDGERS)
+            self.assertEqual(sbp._ru_account_checksum(sbp._ALFA_PAYER_BIK, account), 0)
+
+    def test_sbp_utc_is_local_minus_3h_with_3_to_5s_lag(self) -> None:
+        dt = datetime(2026, 8, 10, 10, 48, 15)
+        self.assertEqual(sbp._sbp_utc_clock(dt, 5), datetime(2026, 8, 10, 7, 48, 10))
+        self.assertEqual(sbp._sbp_lag_bounds(dt), (3, 5))
+        self.assertTrue(
+            sbp._sbp_id_model_ok(
+                "B62220748109111V0B10130011821301", dt, "Т-Банк",
+            )
+        )
+        self.assertEqual(sbp._bank_route("Т-Банк"), ("B", "B10130011821301"))
 
 
 if __name__ == "__main__":

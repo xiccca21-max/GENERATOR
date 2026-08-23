@@ -1,0 +1,48 @@
+{
+  "role": "negative_specimen",
+  "channel": "alfa_sbp",
+  "file": "docs/specimen_alfa_sbp_NEG_3a24266b.pdf",
+  "source": "output/diag_c3_fo_lag/surgical/fresh_id/sent/3a24266b20ab0881_oracle_live.pdf",
+  "checker": "@bankpdfbot",
+  "verdict": "live_FAIL_generic_no_info",
+  "sha256": "3a24266b20ab0881b2f4fbf041356bbe13318a4b4c9809d47658c2f17a4eca8e",
+  "sha16": "3a24266b20ab0881",
+  "size": 58124,
+  "wrap": {
+    "profile": "oracle",
+    "fo_cid": "1..N",
+    "charset": "mapped-used={0} extra only CID0",
+    "sfnt": "cvt fpgm glyf head hhea hmtx loca maxp prep",
+    "csa": "0x68C48484"
+  },
+  "face": {
+    "date_formed": "10.08.2026 11:02 мск",
+    "date_time": "10.08.2026 11:02:17 мск",
+    "amount": "18640",
+    "receiver": "Игорь Денисович К",
+    "phone": "+7 (929) 507-18-42",
+    "recipient_bank": "Т-Банк",
+    "account": "40817810290575455893",
+    "operation_num": "C161008260604894",
+    "sbp_id": "B6222080212544320B10130011821301"
+  },
+  "green": [
+    "op/SBP semantics vs live 10.08 originals (C16 hour tail, UTC-3 lag 3-5s, T-Bank B10130011821301)",
+    "FO CID 1..N",
+    "charset extra {0}",
+    "Oracle SFNT order",
+    "CSA pin 0x68C48484"
+  ],
+  "remaining_diff_vs_original": [
+    "rebuilt FontFile2",
+    "rewritten Content",
+    "ToUnicode / CID assignment",
+    "live checker reputation / chat state"
+  ],
+  "forbidden": [
+    "Do not retune op/SBP generators from this FAIL",
+    "Do not retarget new faces or numbers to this specimen",
+    "Do not treat this verdict as proof of field error"
+  ],
+  "compare_against": "templates/alfa_corpus/document10.08.26.pdf"
+}

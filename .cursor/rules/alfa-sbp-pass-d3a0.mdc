@@ -1,0 +1,17 @@
+---
+description: Live @bankpdfbot PASS d3a05147 — 16.08 Sber Alfa SBP; do not clone.
+alwaysApply: true
+---
+
+# Alfa SBP live PASS d3a05147 (K-ALFA-SBP-PASS-D3A0)
+
+Live `@bankpdfbot` ✅ 16.08.2026, **direct**:
+`docs/specimen_alfa_sbp_PASS_d3a05147a1b3344c.pdf` (58430, SHA `d3a05147a1b3344c…`).
+
+```text
+receiver: Алексей Романович Т
+bank:     Сбербанк
+amount:   66496
+```
+
+Next unique SHA ❌. Do not clone this identity.

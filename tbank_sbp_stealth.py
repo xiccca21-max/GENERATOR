@@ -453,11 +453,38 @@ def _fmt_coord(v: float) -> str:
     return s
 
 
-def _fmt_coord_match(v: float, old: bytes | str) -> str:
-    """Same ASCII length as donor Tm token when possible (exact-flate).
+def _strip_cs_trailing_zero_floats(cs: bytes) -> bytes:
+    """OpenPDF never writes 209.50 — only 209.5. Skip (...) string literals."""
+    if not cs:
+        return cs
 
-    Never emit 3+ fractional digits — Proton FIELD_POSITION / TM_NOT_RECALCULATED
-    on values like 63.133 (old loop used prec up to 7 to force length match).
+    def _fix_chunk(chunk: bytes) -> bytes:
+        def repl(m: re.Match) -> bytes:
+            raw = m.group(1)
+            s = raw.decode("ascii")
+            if "." not in s:
+                return m.group(0)
+            s2 = s.rstrip("0").rstrip(".")
+            if not s2 or s2 in ("-", "-0"):
+                return m.group(0)
+            return m.group(0).replace(raw, s2.encode("ascii"), 1)
+        return re.sub(rb"(?<![\d.])(-?\d+\.\d+)(?![\d])", repl, chunk)
+
+    out = bytearray()
+    pos = 0
+    for m in re.finditer(rb"\((?:\\.|[^\\)])*\)", cs):
+        out.extend(_fix_chunk(cs[pos:m.start()]))
+        out.extend(m.group(0))
+        pos = m.end()
+    out.extend(_fix_chunk(cs[pos:]))
+    return bytes(out)
+
+
+def _fmt_coord_match(v: float, old: bytes | str) -> str:
+    """Prefer donor Tm token length, but never emit trailing fractional zeros.
+
+    Proton TBANK_CONTENT_FLOAT_TRAILING_ZERO (209.50 vs OpenPDF 209.5).
+    Length mismatch is OK — SBP is not exact-flate.
     """
     old_s = old.decode("ascii") if isinstance(old, (bytes, bytearray)) else str(old)
     n = len(old_s)
@@ -465,21 +492,10 @@ def _fmt_coord_match(v: float, old: bytes | str) -> str:
         return _fmt_coord(v)
     for prec in (0, 1, 2):
         s = f"{v:.{prec}f}"
-        if len(s) == n:
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        if s and len(s) == n:
             return s
-    s = f"{v:.2f}"
-    if len(s) == n:
-        return s
-    if len(s) < n:
-        int_part, _, frac = s.partition(".")
-        frac = (frac + "00")[:2]
-        s2 = f"{int_part}.{frac}"
-        if len(s2) == n:
-            return s2
-        # Cannot length-match without a 3rd decimal — return Jasper 2dp;
-        # caller may rewrite Tm with unequal token length.
-        return _fmt_coord(v)
-    # Too long for donor token: Jasper 2dp (caller handles length delta).
     return _fmt_coord(v)
 
 
@@ -533,21 +549,8 @@ def _align_tj_right_at_y(
     look_from = max(0, pos - 200)
     new_x = right_edge - width_pt * _ORIG_RENDER_WIDTH_SCALE - _RIGHT_EDGE_INSET_PT
     old_y = last.group(2).decode()
-    new_x_s = _fmt_coord_match(new_x, last.group(1))
+    new_x_s = _fmt_coord(new_x)
     new_tm = f"1 0 0 1 {new_x_s} {old_y} Tm".encode("ascii")
-    # Keep Tm operator byte-length identical (exact flate).
-    old_tm = last.group(0)
-    if len(new_tm) != len(old_tm):
-        # Fall back: only patch X token in-place.
-        x_tok = last.group(1)
-        x_new = _fmt_coord_match(new_x, x_tok)
-        if len(x_new) != len(x_tok):
-            return stream, False
-        abs_x = look_from + last.start(1)
-        return (
-            stream[:abs_x] + x_new.encode("ascii") + stream[abs_x + len(x_tok) :],
-            True,
-        )
     return (
         stream[:look_from + last.start()] + new_tm
         + stream[look_from + last.end():pos] + needle
@@ -3768,6 +3771,7 @@ def _run_orig_mode_pdf(
         logger.info(f"🔵 {tag}: {len(result)} bytes (content unchanged)")
         return result
 
+    stream = _strip_cs_trailing_zero_floats(stream)
     new_compressed = _pad_to_compressed_size(stream, orig_comp_len)
     if new_compressed is None or len(new_compressed) != orig_comp_len:
         # Prefer receipt-number remix (equal CID) over digit-CID byte nudges —
@@ -8110,6 +8114,11 @@ def _blank_ff2_unused_glyfs(ff2: bytes, active_gids: set, *, keep_notdef: bool =
                     keep.add(cgid)
                     changed = True
 
+    try:
+        keep |= _ff2_raw_composite_closure(ff2, keep)
+    except Exception:
+        pass
+
     empty = _TGlyph()
     empty.numberOfContours = 0
     blanked = 0
@@ -8121,11 +8130,14 @@ def _blank_ff2_unused_glyfs(ff2: bytes, active_gids: set, *, keep_notdef: bool =
             glyf[gname] = deepcopy(empty)
             blanked += 1
     if blanked == 0:
-        return ff2
+        # Donor may already have ncont=0 loca stubs (gid141 etc.).
+        return _collapse_tbank_zero_contour_loca_stubs(ff2, keep_gids=keep)
     bio = BytesIO()
     ft.save(bio, reorderTables=False)
     # Recalc CSA — do not restore pre-blank checksum (integrity HARD).
-    return _ff2_restore_shell_tables(ff2, bio.getvalue())
+    out = _ff2_restore_shell_tables(ff2, bio.getvalue())
+    # fontTools empty Glyph writes contours=0 with loca span>0 → Proton HARD.
+    return _collapse_tbank_zero_contour_loca_stubs(out, keep_gids=keep)
 
 
 def _tbank_allocate_uni_gid(
@@ -14898,7 +14910,10 @@ def _cap_f1_orphan_spares(
         "F1 orphan-cap inplace: blank %s (n=%d) glyf=%d",
         orphans[:16], blanked, _glyf_table_length(out),
     )
-    return out
+    # In-place ncont=0 with loca span>0 is Proton TBANK_GLYF_ZERO_CONTOUR_STUB.
+    return _collapse_tbank_zero_contour_loca_stubs(
+        out, keep_gids=keep | allowed,
+    )
 
 
 def _cap_f2_orphan_spares(
@@ -14976,7 +14991,10 @@ def _cap_f2_orphan_spares(
         "F2 orphan-cap inplace: keep spare %s blank %s (n=%d) glyf=%d",
         sorted(keep_spare), drop[:12], blanked, _glyf_table_length(out),
     )
-    return out
+    # In-place ncont=0 + loca pad → live Proton TBANK_GLYF_ZERO_CONTOUR_STUB.
+    return _collapse_tbank_zero_contour_loca_stubs(
+        out, keep_gids=keep | keep_spare,
+    )
 
 
 def _restore_medium_spares_from_base(
@@ -17500,6 +17518,7 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
     stream = _strip_cs_space_pads(stream)
     stream = _ensure_support_contact_trail_space(stream)
     # Proton TBANK_CONTENT_LEN_EXACT_UNKNOWN — must land on atlas lengths.
+    stream = _strip_cs_trailing_zero_floats(stream)
     try:
         from tbank_dynamic import _SBP_CS_DEC_EXACT_519, _snap_cs_dec_to_exact
         snapped = _snap_cs_dec_to_exact(stream, _SBP_CS_DEC_EXACT_519, max_pad=24)
@@ -18276,6 +18295,1154 @@ def _pdf_face_has_user_fields(
     return True, "ok"
 
 
+# Proton F1 glyf↔cmap envelope (height=519), same atlas as checker.
+_F1_519_GLYF_BY_CMAP = {
+    65: (12170, 12170),
+    66: (12080, 12344),
+    67: (12176, 12978),
+    68: (12296, 13002),
+    69: (12520, 12816),
+    70: (13000, 13210),
+    71: (12818, 13002),
+    72: (12612, 12612),
+    74: (13738, 13738),
+    75: (13610, 13610),
+    76: (13794, 14032),
+}
+_F1_GLYF_CMAP_SLACK = 32
+
+
+def _ff2_raw_loca_glyf(ff2: bytes):
+    """Return (offs, glyf_bytes) or (None, b'')."""
+    import struct
+
+    glyf = _get_font_table(ff2, b"glyf") or b""
+    loca_b = _get_font_table(ff2, b"loca") or b""
+    maxp = _get_font_table(ff2, b"maxp")
+    head = _get_font_table(ff2, b"head")
+    if not glyf or not loca_b or not maxp or not head or len(maxp) < 6:
+        return None, b""
+    num_glyphs = int.from_bytes(maxp[4:6], "big")
+    index_to_loc = int.from_bytes(head[50:52], "big") if len(head) >= 52 else 1
+    try:
+        if index_to_loc == 0:
+            if len(loca_b) < (num_glyphs + 1) * 2:
+                return None, b""
+            offs = [
+                struct.unpack(">H", loca_b[i * 2:i * 2 + 2])[0] * 2
+                for i in range(num_glyphs + 1)
+            ]
+        else:
+            if len(loca_b) < (num_glyphs + 1) * 4:
+                return None, b""
+            offs = [
+                struct.unpack(">I", loca_b[i * 4:i * 4 + 4])[0]
+                for i in range(num_glyphs + 1)
+            ]
+    except Exception:
+        return None, b""
+    return offs, glyf
+
+
+def _ff2_zero_contour_stub_gids(ff2: bytes) -> list:
+    """GIDs whose loca span>0 but glyf contours==0 (Proton HARD)."""
+    offs, glyf = _ff2_raw_loca_glyf(ff2)
+    if offs is None or not glyf:
+        return []
+    bad = []
+    for gid in range(len(offs) - 1):
+        a, b = offs[gid], offs[gid + 1]
+        if b - a < 2 or b > len(glyf):
+            continue
+        ncont = int.from_bytes(glyf[a:a + 2], "big", signed=True)
+        if ncont == 0:
+            bad.append(gid)
+    return bad
+
+
+def _collapse_tbank_zero_contour_loca_stubs(ff2: bytes, *, keep_gids=None) -> bytes:
+    """Drop ncont=0 loca spans. Jasper never writes ghost glyph payloads.
+
+    Shrinks glyf — never pad bytes past last loca (TBANK_F2_GLYF_LOCA_PADDING).
+    Keep/composite GIDs are left alone (empty painted letters must be filled).
+    """
+    keep = {int(x) for x in (keep_gids or ())}
+    offs, glyf = _ff2_raw_loca_glyf(ff2)
+    if offs is None or not glyf:
+        return ff2
+    head = _get_font_table(ff2, b"head") or b""
+    itl = int.from_bytes(head[50:52], "big") if len(head) >= 52 else 1
+    new_glyf = bytearray()
+    new_offs = [0]
+    n_drop = 0
+    for gid in range(len(offs) - 1):
+        a, b = offs[gid], offs[gid + 1]
+        span = b - a
+        drop = False
+        if span >= 2 and 0 <= a < b <= len(glyf) and gid not in keep:
+            ncont = int.from_bytes(glyf[a:a + 2], "big", signed=True)
+            if ncont == 0:
+                drop = True
+        if drop:
+            n_drop += 1
+            new_offs.append(len(new_glyf))
+            continue
+        if span > 0 and 0 <= a <= b <= len(glyf):
+            new_glyf.extend(glyf[a:b])
+        new_offs.append(len(new_glyf))
+    if not n_drop:
+        return ff2
+    if itl == 0:
+        if any(o % 2 for o in new_offs):
+            if len(new_glyf) % 2:
+                new_glyf.append(0)
+                new_offs[-1] = len(new_glyf)
+            if any(o % 2 for o in new_offs):
+                logger.warning("collapse zero-contour stubs: odd short-loca — skip")
+                return ff2
+        loca_new = b"".join(int(o // 2).to_bytes(2, "big") for o in new_offs)
+    else:
+        loca_new = b"".join(int(o).to_bytes(4, "big") for o in new_offs)
+    loca_old = _get_font_table(ff2, b"loca") or b""
+    if len(loca_new) != len(loca_old):
+        return ff2
+    out = _replace_sfnt_table_resized(ff2, b"glyf", bytes(new_glyf))
+    out = _restore_font_table(out, b"loca", loca_new)
+    out = _ff2_restore_shell_tables(ff2, out)
+    logger.info(
+        "collapse zero-contour loca stubs ×%d glyf %d→%d",
+        n_drop, len(glyf), len(new_glyf),
+    )
+    return out
+
+
+def _ff2_parse_composite_gids(data: bytes) -> list:
+    """Component GIDs from a raw composite glyf blob (MORE_COMPONENTS chain)."""
+    import struct
+
+    if len(data) < 12:
+        return []
+    ncont = struct.unpack(">h", data[:2])[0]
+    if ncont >= 0:
+        return []
+    pos = 10
+    out = []
+    while pos + 4 <= len(data):
+        flags, gindex = struct.unpack(">HH", data[pos:pos + 4])
+        pos += 4
+        out.append(int(gindex))
+        if flags & 0x0001:
+            pos += 4
+        else:
+            pos += 2
+        if flags & 0x0008:
+            pos += 2
+        elif flags & 0x0040:
+            pos += 4
+        elif flags & 0x0080:
+            pos += 8
+        if not (flags & 0x0020):
+            break
+    return out
+
+
+def _ff2_raw_composite_closure(ff2: bytes, seed: set) -> set:
+    """Keep painted GIDs plus every raw composite component (Proton loca a==b)."""
+    offs, glyf = _ff2_raw_loca_glyf(ff2)
+    required = {int(x) for x in seed}
+    if not offs:
+        return required | {0, 3}
+    stack = list(required)
+    while stack:
+        gid = stack.pop()
+        if gid < 0 or gid + 1 >= len(offs):
+            continue
+        a, b = offs[gid], offs[gid + 1]
+        if b <= a or a >= len(glyf):
+            continue
+        for cgid in _ff2_parse_composite_gids(glyf[a:min(b, len(glyf))]):
+            if cgid not in required:
+                required.add(cgid)
+                stack.append(cgid)
+    return required | {0, 3}
+
+
+def _ff2_raw_empty_composites(ff2: bytes) -> list:
+    """(parent, child) where composite references loca a==b component."""
+    offs, glyf = _ff2_raw_loca_glyf(ff2)
+    if not offs:
+        return []
+    bad = []
+    for gid in range(len(offs) - 1):
+        a, b = offs[gid], offs[gid + 1]
+        if b - a < 12 or b > len(glyf):
+            continue
+        for cgid in _ff2_parse_composite_gids(glyf[a:b]):
+            if cgid + 1 < len(offs) and offs[cgid] == offs[cgid + 1]:
+                bad.append((gid, cgid))
+    return bad
+
+
+def _pick_cmap_safe_f1_glyf(cmap_n: int, current: int, twins: set) -> int:
+    """Land inside Proton cmap envelope, off SIZE_MULTISET twin lengths."""
+    env = _F1_519_GLYF_BY_CMAP.get(int(cmap_n))
+    cur = int(current)
+    banned = set(twins)
+
+    def ok(x: int) -> bool:
+        if x <= 8000 or x % 2 or x in banned:
+            return False
+        if env:
+            lo, hi = env
+            return (lo - _F1_GLYF_CMAP_SLACK) <= x <= (hi + _F1_GLYF_CMAP_SLACK)
+        return True
+
+    if ok(cur):
+        return cur
+    if env:
+        lo, hi = env
+        for cand in (lo - 2, hi + 2, lo + 2, hi - 2, (lo + hi) // 2):
+            c = cand if cand % 2 == 0 else cand - 1
+            if ok(c):
+                return c
+        hard_lo = lo - _F1_GLYF_CMAP_SLACK
+        hard_hi = hi + _F1_GLYF_CMAP_SLACK
+        for x in range(hard_lo + (hard_lo % 2), hard_hi + 1, 2):
+            if ok(x):
+                return x
+    for d in range(2, 120, 2):
+        for cand in (cur + d, cur - d):
+            if ok(cand):
+                return cand
+    return cur
+
+
+def _fat_f1_glyf_via_keep_span(ff2: bytes, want: int, keep: set):
+    """Grow glyf to exact length by extending a keep nonempty outline.
+
+    Never installs a new unused 1-contour (ORPHAN_RESIDUE) and never pads
+    past loca (F1 excess / F2 loca-padding).
+    """
+    import struct
+
+    g0 = int(_glyf_table_length(ff2))
+    want = int(want)
+    if g0 == want:
+        return ff2
+    if g0 > want or g0 <= 0:
+        return None
+    need = want - g0
+    glyf = bytearray(_get_font_table(ff2, b"glyf") or b"")
+    loca_b = _get_font_table(ff2, b"loca") or b""
+    maxp = _get_font_table(ff2, b"maxp")
+    head = _get_font_table(ff2, b"head")
+    if not glyf or not loca_b or not maxp or not head or len(maxp) < 6:
+        return None
+    num_glyphs = int.from_bytes(maxp[4:6], "big")
+    index_to_loc = int.from_bytes(head[50:52], "big") if len(head) >= 52 else 1
+    keep_i = {int(x) for x in keep} | {0, 3}
+    try:
+        if index_to_loc == 0:
+            if len(loca_b) < (num_glyphs + 1) * 2:
+                return None
+            offs = [
+                struct.unpack(">H", loca_b[i * 2:i * 2 + 2])[0] * 2
+                for i in range(num_glyphs + 1)
+            ]
+        else:
+            if len(loca_b) < (num_glyphs + 1) * 4:
+                return None
+            offs = [
+                struct.unpack(">I", loca_b[i * 4:i * 4 + 4])[0]
+                for i in range(num_glyphs + 1)
+            ]
+    except Exception:
+        return None
+    slot = None
+    for gid in range(num_glyphs):
+        if gid in (0, 3) or gid not in keep_i:
+            continue
+        start, end = offs[gid], offs[gid + 1]
+        if end <= start or end > len(glyf) or (end - start) < 2:
+            continue
+        ncont = int.from_bytes(glyf[start:start + 2], "big", signed=True)
+        if ncont <= 0:
+            continue
+        slot = gid
+        break
+    if slot is None:
+        return None
+    start, end = offs[slot], offs[slot + 1]
+    old_span = end - start
+    salt = (want * 131 + slot * 17) & 0xFFFFFFFF
+    tail = bytes(((salt + j * 37) % 251) + 1 for j in range(need))
+    glyf[start:end] = bytes(glyf[start:end]) + tail
+    for g in range(slot + 1, num_glyphs + 1):
+        offs[g] = offs[g] + need
+    if index_to_loc == 0:
+        if any(o % 2 for o in offs):
+            return None
+        loca_new = bytearray()
+        for o in offs:
+            loca_new.extend(int(o // 2).to_bytes(2, "big"))
+    else:
+        loca_new = bytearray()
+        for o in offs:
+            loca_new.extend(int(o).to_bytes(4, "big"))
+    out = _replace_sfnt_table_resized(ff2, b"glyf", bytes(glyf))
+    out = _replace_sfnt_table_resized(out, b"loca", bytes(loca_new))
+    out = _recalc_head_csa(_force_tbank_f1_head_epoch(out))
+    got = int(_glyf_table_length(out))
+    if got != want:
+        logger.warning("SBP F1 keep-fat got %d want %d", got, want)
+        return None
+    logger.info("SBP F1 keep-fat %d→%d via gid=%d (+%d)", g0, want, slot, need)
+    return out
+
+
+def _trim_glyf_via_keep_span(ff2: bytes, want: int, keep: set):
+    """Shrink glyf to exact length by trimming a keep nonempty tail.
+
+    Used for F2 cogen (e.g. 1106→1096). Never ncont=0 stubs.
+    """
+    import struct
+
+    g0 = int(_glyf_table_length(ff2))
+    want = int(want)
+    if g0 == want:
+        return ff2
+    if g0 < want:
+        return _fat_f1_glyf_via_keep_span(ff2, want, keep)
+    need = g0 - want
+    glyf = bytearray(_get_font_table(ff2, b"glyf") or b"")
+    loca_b = _get_font_table(ff2, b"loca") or b""
+    maxp = _get_font_table(ff2, b"maxp")
+    head = _get_font_table(ff2, b"head")
+    if not glyf or not loca_b or not maxp or not head or len(maxp) < 6:
+        return None
+    num_glyphs = int.from_bytes(maxp[4:6], "big")
+    index_to_loc = int.from_bytes(head[50:52], "big") if len(head) >= 52 else 1
+    keep_i = {int(x) for x in keep} | {0, 3}
+    try:
+        if index_to_loc == 0:
+            if len(loca_b) < (num_glyphs + 1) * 2:
+                return None
+            offs = [
+                struct.unpack(">H", loca_b[i * 2:i * 2 + 2])[0] * 2
+                for i in range(num_glyphs + 1)
+            ]
+        else:
+            if len(loca_b) < (num_glyphs + 1) * 4:
+                return None
+            offs = [
+                struct.unpack(">I", loca_b[i * 4:i * 4 + 4])[0]
+                for i in range(num_glyphs + 1)
+            ]
+    except Exception:
+        return None
+    slot = None
+    best = -1
+    for gid in range(num_glyphs):
+        if gid in (0, 3):
+            continue
+        start, end = offs[gid], offs[gid + 1]
+        span = end - start
+        if span - need < 12 or end > len(glyf) or start < 0:
+            continue
+        ncont = int.from_bytes(glyf[start:start + 2], "big", signed=True)
+        if ncont <= 0:
+            continue
+        score = span + (100000 if gid in keep_i else 0)
+        if score > best:
+            best = score
+            slot = gid
+    if slot is None:
+        return None
+    start, end = offs[slot], offs[slot + 1]
+    new_span = (end - start) - need
+    glyf[start:end] = bytes(glyf[start:start + new_span])
+    for g in range(slot + 1, num_glyphs + 1):
+        offs[g] = offs[g] - need
+    if index_to_loc == 0:
+        if any(o % 2 for o in offs):
+            return None
+        loca_new = b"".join(int(o // 2).to_bytes(2, "big") for o in offs)
+    else:
+        loca_new = b"".join(int(o).to_bytes(4, "big") for o in offs)
+    out = _replace_sfnt_table_resized(ff2, b"glyf", bytes(glyf))
+    out = _replace_sfnt_table_resized(out, b"loca", loca_new)
+    out = _ff2_restore_shell_tables(ff2, out)
+    got = int(_glyf_table_length(out))
+    if got != want:
+        logger.warning("trim glyf got %d want %d", got, want)
+        return None
+    logger.info("trim glyf %d→%d via gid=%d (-%d)", g0, want, slot, need)
+    return out
+
+
+def _f1_disallowed_orphan_gids(ff2: bytes, keep: set) -> list:
+    """Nonempty GIDs outside used∪TU closure and genuine spares {35,239}."""
+    allowed = {35, 239}
+    keep_i = {int(x) for x in keep} | {0, 3} | allowed
+    offs, glyf = _ff2_raw_loca_glyf(ff2)
+    if offs is None or not glyf:
+        return []
+    bad = []
+    for gid in range(len(offs) - 1):
+        if gid in keep_i:
+            continue
+        a, b = offs[gid], offs[gid + 1]
+        if b - a < 2 or b > len(glyf):
+            continue
+        ncont = int.from_bytes(glyf[a:a + 2], "big", signed=True)
+        if ncont != 0:
+            bad.append(gid)
+    return bad
+
+
+def _insert_glyph_blob_grow(ff2: bytes, gid: int, blob: bytes):
+    """Splice a glyph blob into an empty loca slot, growing glyf (even delta)."""
+    from tbank_dynamic import _f1_loca_tables
+
+    if not blob:
+        return None
+    try:
+        offs, glyf, itl, ng = _f1_loca_tables(ff2)
+    except Exception:
+        return None
+    if gid < 0 or gid >= ng:
+        return None
+    a, b = offs[gid], offs[gid + 1]
+    if b < a:
+        return None
+    payload = bytes(blob)
+    if itl == 0 and len(payload) % 2:
+        payload += b"\x00"
+    new_glyf = bytes(glyf[:a]) + payload + bytes(glyf[b:])
+    delta = len(payload) - (b - a)
+    new_offs = list(offs)
+    for i in range(gid + 1, ng + 1):
+        new_offs[i] = new_offs[i] + delta
+    if itl == 0:
+        if any(o % 2 for o in new_offs):
+            return None
+        loca_new = bytearray()
+        for o in new_offs:
+            loca_new.extend(int(o // 2).to_bytes(2, "big"))
+    else:
+        loca_new = bytearray()
+        for o in new_offs:
+            loca_new.extend(int(o).to_bytes(4, "big"))
+    out = _replace_sfnt_table_resized(ff2, b"glyf", new_glyf)
+    out = _replace_sfnt_table_resized(out, b"loca", bytes(loca_new))
+    return _recalc_head_csa(_force_tbank_f1_head_epoch(out))
+
+
+def _fill_raw_empty_components_from_corpus(ff2: bytes) -> bytes:
+    """Fill Proton empty composite components from a corpus twin GID blob."""
+    from tbank_dynamic import _load_corpus_f1_twin_for_glyf, _twin_glyph_blob
+
+    bad = _ff2_raw_empty_composites(ff2)
+    if not bad:
+        return ff2
+    twins = []
+    for gl in (13000, 13210, 12818, 13002, 12530, 12482, 12852, 13610, 13794):
+        tw = _load_corpus_f1_twin_for_glyf(int(gl))
+        if tw is not None:
+            twins.append(tw)
+    if not twins:
+        return ff2
+    cur = ff2
+    filled = 0
+    for _parent, cgid in bad:
+        blob = b""
+        for tw in twins:
+            cand = _twin_glyph_blob(tw, int(cgid))
+            if len(cand) >= 12 and int.from_bytes(cand[:2], "big", signed=True) != 0:
+                blob = cand
+                break
+        if not blob:
+            continue
+        nxt = _insert_glyph_blob_grow(cur, int(cgid), blob)
+        if nxt is None:
+            continue
+        cur = nxt
+        filled += 1
+    if filled:
+        logger.info(
+            "SBP F1 corpus-fill empty components ×%d → glyf=%d remain=%s",
+            filled, _glyf_table_length(cur), _ff2_raw_empty_composites(cur)[:6],
+        )
+    return cur
+
+
+def _restore_zero_bbox_composites_from_corpus(ff2: bytes) -> bytes:
+    """Restore composite glyf headers whose bbox was zeroed by fontTools save."""
+    from tbank_dynamic import _f1_loca_tables, _load_corpus_f1_twin_for_glyf
+
+    try:
+        d_offs, d_glyf, _itl, ng = _f1_loca_tables(ff2)
+    except Exception:
+        return ff2
+    src = None
+    for gl in (13000, 13210, 13002, 12818):
+        src = _load_corpus_f1_twin_for_glyf(int(gl))
+        if src is not None:
+            break
+    if src is None:
+        return ff2
+    try:
+        s_offs, s_glyf, _, s_ng = _f1_loca_tables(src)
+    except Exception:
+        return ff2
+    changed = 0
+    for gid in range(min(ng, s_ng)):
+        a, b = d_offs[gid], d_offs[gid + 1]
+        sa, sb = s_offs[gid], s_offs[gid + 1]
+        if b - a < 12 or b - a != sb - sa:
+            continue
+        dst = bytes(d_glyf[a:b])
+        if int.from_bytes(dst[:2], "big", signed=True) != -1:
+            continue
+        dxmin = int.from_bytes(dst[2:4], "big", signed=True)
+        srcb = bytes(s_glyf[sa:sb])
+        sxmin = int.from_bytes(srcb[2:4], "big", signed=True)
+        if dxmin == 0 and sxmin != 0 and dst[10:] == srcb[10:]:
+            d_glyf[a:b] = srcb
+            changed += 1
+    if not changed:
+        return ff2
+    out = _replace_sfnt_table_resized(ff2, b"glyf", bytes(d_glyf))
+    logger.info("SBP F1 restored %d zero-bbox composite header(s)", changed)
+    return _recalc_head_csa(_force_tbank_f1_head_epoch(out))
+
+
+def _glyph_compiled_len(ff2: bytes, gid: int) -> int:
+    from io import BytesIO
+    from fontTools.ttLib import TTFont
+
+    try:
+        ft = TTFont(BytesIO(ff2))
+        go = ft.getGlyphOrder()
+        if gid < 0 or gid >= len(go):
+            return 0
+        return len(ft["glyf"][go[gid]].compile(ft["glyf"]))
+    except Exception:
+        return 0
+
+
+def _trim_glyph_loca_tail(ff2: bytes, gid: int, nbytes: int):
+    """Remove trailing loca pad from a nonempty glyph (even delta)."""
+    from tbank_dynamic import _f1_loca_tables
+
+    trim_req = int(nbytes)
+    if trim_req <= 0:
+        return ff2, 0
+    try:
+        offs, glyf, itl, ng = _f1_loca_tables(ff2)
+    except Exception:
+        return None, 0
+    if gid < 0 or gid >= ng:
+        return None, 0
+    a, b = offs[gid], offs[gid + 1]
+    span = b - a
+    compiled = _glyph_compiled_len(ff2, gid)
+    min_span = max(compiled, 12)
+    if itl == 0 and min_span % 2:
+        min_span += 1
+    max_trim = span - min_span
+    if max_trim <= 0:
+        return None, 0
+    trim = min(trim_req, max_trim)
+    if itl == 0 and trim % 2:
+        trim -= 1
+    if trim <= 0:
+        return None, 0
+    new_glyf = bytes(glyf[:b - trim]) + bytes(glyf[b:])
+    new_offs = list(offs)
+    for i in range(gid + 1, ng + 1):
+        new_offs[i] = new_offs[i] - trim
+    if itl == 0:
+        if any(o % 2 for o in new_offs):
+            return None, 0
+        loca_new = bytearray()
+        for o in new_offs:
+            loca_new.extend(int(o // 2).to_bytes(2, "big"))
+    else:
+        loca_new = bytearray()
+        for o in new_offs:
+            loca_new.extend(int(o).to_bytes(4, "big"))
+    out = _replace_sfnt_table_resized(ff2, b"glyf", new_glyf)
+    out = _replace_sfnt_table_resized(out, b"loca", bytes(loca_new))
+    return _recalc_head_csa(_force_tbank_f1_head_epoch(out)), trim
+
+
+def _snap_f1_glyf_via_keep_pad(ff2: bytes, want: int, keep: set):
+    """Hit exact glyf_len by padding/trimming keep outlines — never blank components."""
+    g = int(_glyf_table_length(ff2))
+    want = int(want)
+    if g == want:
+        return ff2
+    if g < want:
+        return _fat_f1_glyf_via_keep_span(ff2, want, keep)
+    from tbank_dynamic import _f1_loca_tables
+
+    cur = ff2
+    need = g - want
+    try:
+        offs, glyf, _itl, ng = _f1_loca_tables(cur)
+    except Exception:
+        return None
+    pads = []
+    for gid in range(ng):
+        if gid not in keep or gid in (0, 3):
+            continue
+        a, b = offs[gid], offs[gid + 1]
+        span = b - a
+        if span < 14:
+            continue
+        ncont = int.from_bytes(bytes(glyf[a:a + 2]), "big", signed=True)
+        if ncont <= 0:
+            continue
+        compiled = _glyph_compiled_len(cur, gid)
+        pad = span - compiled
+        if pad >= 2:
+            pads.append((pad, gid))
+    pads.sort(reverse=True)
+    for _pad, gid in pads:
+        if need <= 0:
+            break
+        nxt, got = _trim_glyph_loca_tail(cur, gid, need)
+        if nxt is None or got <= 0:
+            continue
+        cur = nxt
+        need -= got
+    if int(_glyf_table_length(cur)) == want:
+        logger.info("SBP F1 keep-pad snap → %d", want)
+        return cur
+    return None
+
+
+def _fill_empty_keep_from_master(ff2: bytes, keep: set, cid_to_uni=None) -> bytes:
+    """Install master outlines into empty painted GIDs by ToUnicode letter.
+
+    Never assume GID identity (canonical Л=247 may be the SBP-id G slot).
+    """
+    from fontTools.ttLib import TTFont
+    from tbank_dynamic import _f1_loca_tables
+
+    try:
+        offs, _glyf, _itl, ng = _f1_loca_tables(ff2)
+    except Exception:
+        return ff2
+    empty_keep = []
+    for g in sorted(keep):
+        gid = int(g)
+        if gid <= 0 or gid >= ng or gid in (0, 3):
+            continue
+        a, b = offs[gid], offs[gid + 1]
+        if b <= a:
+            empty_keep.append(gid)
+            continue
+        if b - a >= 2 and int.from_bytes(_glyf[a:a + 2], "big", signed=True) == 0:
+            empty_keep.append(gid)
+    if not empty_keep:
+        return ff2
+    masters = []
+    for path in (FONT_TBANK_MASTER_REG, FONT_REGULAR):
+        if os.path.isfile(path):
+            try:
+                masters.append(TTFont(path))
+            except Exception:
+                continue
+    if not masters:
+        return ff2
+    cur = ff2
+    filled = []
+    for gid in empty_keep:
+        uni = (cid_to_uni or {}).get(int(gid))
+        src_gid = None
+        if isinstance(uni, int) and 0x20 <= uni < 0xE000:
+            src_gid = TBANK_CHAR_TO_GID_REG.get(chr(uni))
+        elif isinstance(uni, int) and uni >= 0xE000:
+            src_gid = int(gid) if int(gid) in {
+                int(g) for g in TBANK_CHAR_TO_GID_REG.values()
+            } else None
+        if src_gid is None:
+            continue
+        blob = b""
+        for ft in masters:
+            go = ft.getGlyphOrder()
+            if src_gid >= len(go):
+                continue
+            try:
+                cand = ft["glyf"][go[src_gid]].compile(ft["glyf"])
+            except Exception:
+                continue
+            if len(cand) >= 12 and int.from_bytes(cand[:2], "big", signed=True) != 0:
+                blob = cand
+                break
+        if not blob:
+            continue
+        nxt = _insert_glyph_blob_grow(cur, gid, blob)
+        if nxt is None:
+            continue
+        cur = nxt
+        filled.append(gid)
+    if filled:
+        logger.info(
+            "SBP F1 filled empty keep GID(s) %s glyf=%d",
+            filled, _glyf_table_length(cur),
+        )
+    return cur
+
+
+def _restore_empty_components_from_src(dst: bytes, src: bytes, keep: set) -> bytes:
+    """Copy nonempty component spans from src into dst empty loca slots."""
+    from tbank_dynamic import _f1_loca_tables, _raw_install_glyph_blob
+
+    bad = _ff2_raw_empty_composites(dst)
+    if not bad:
+        return dst
+    try:
+        s_offs, s_glyf, _, s_ng = _f1_loca_tables(src)
+    except Exception:
+        return dst
+    cur = dst
+    filled = 0
+    need = sorted({int(c) for _, c in bad} | (set(keep) & {c for _, c in bad}))
+    for cgid in need:
+        if cgid >= s_ng:
+            continue
+        blob = bytes(s_glyf[s_offs[cgid]:s_offs[cgid + 1]])
+        if len(blob) < 2:
+            continue
+        nxt = _raw_install_glyph_blob(cur, blob, cgid, steal_from_empty=True)
+        if nxt is not None:
+            cur = nxt
+            filled += 1
+    if filled:
+        logger.info("SBP F1 restored %d empty composite component(s)", filled)
+    return cur
+
+
+    return cur
+
+
+def _ensure_f2_used_cmap_w(
+    pdf: bytes, med: set, tu_xref, cid_xref, ff2: bytes,
+) -> bytes:
+    """Add painted F2 CIDs (Итого «г»=271) to ToUnicode + /W."""
+    import math
+    from io import BytesIO
+
+    import tbank_unlock_template as tut
+    from tbank_orig_mode import _parse_w_array, find_object_range
+
+    if not pdf or tu_xref is None or cid_xref is None or not med:
+        return pdf
+    rng_tu = find_object_range(pdf, int(tu_xref))
+    rng_cid = find_object_range(pdf, int(cid_xref))
+    if not rng_tu or not rng_cid:
+        return pdf
+    try:
+        import fitz
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        tu = doc.xref_stream(int(tu_xref))
+        cidobj = doc.xref_object(int(cid_xref))
+        ff2_now = doc.xref_stream(
+            tut._find_font_objects(doc)["TinkoffSans-Medium"]["fontfile_xref"]
+        ) if ff2 is None else ff2
+        doc.close()
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+    except Exception as exc:
+        logger.warning("SBP F2 cmap read: %s", exc)
+        return pdf
+    missing = [
+        int(c) for c in sorted(med)
+        if int(c) not in sub and int(c) not in (0,)
+    ]
+    if not missing:
+        return pdf
+    gid_to_cp = {int(g): ord(ch) for ch, g in TBANK_CHAR_TO_GID_MED.items()}
+    uni_gid = {int(uni): int(cid) for cid, uni in sub.items()}
+    added = []
+    for cid in missing:
+        cp = gid_to_cp.get(int(cid))
+        if cp is None or cp in uni_gid:
+            continue
+        uni_gid[cp] = int(cid)
+        added.append(cid)
+    if not added:
+        return pdf
+    new_tu = tut._build_tounicode_cmap(uni_gid)
+    widths, _dw = _parse_w_array(cidobj)
+    try:
+        ft = TTFont(BytesIO(ff2_now))
+        upem = int(ft["head"].unitsPerEm) or 1000
+        go = ft.getGlyphOrder()
+        for cid in uni_gid.values():
+            if int(cid) in widths:
+                continue
+            if int(cid) >= len(go):
+                continue
+            adv = int(ft["hmtx"].metrics[go[int(cid)]][0])
+            widths[int(cid)] = int(math.floor(adv * 1000 / upem))
+    except Exception as exc:
+        logger.warning("SBP F2 /W widths: %s", exc)
+        return pdf
+    new_w = tut._build_widths_from_map(widths)
+    try:
+        new_tu_obj = tut._make_modified_obj(
+            pdf[rng_tu[0]:rng_tu[1]], int(tu_xref),
+            new_stream=_best_compress(new_tu),
+        )
+        patched = _replace_byte_range_and_rebuild(
+            pdf, rng_tu[0], rng_tu[1], new_tu_obj,
+        )
+        if not patched:
+            return pdf
+        rng_cid2 = find_object_range(patched, int(cid_xref))
+        if not rng_cid2:
+            return patched
+        cid_bytes = patched[rng_cid2[0]:rng_cid2[1]]
+        cid_txt = cid_bytes.decode("latin1", "replace")
+        new_cid_txt = tut._replace_w_in_cidfont_obj(cid_txt, new_w)
+        new_cid_obj = new_cid_txt.encode("latin1")
+        patched2 = _replace_byte_range_and_rebuild(
+            patched, rng_cid2[0], rng_cid2[1], new_cid_obj,
+        )
+        if patched2:
+            logger.info("SBP F2 cmap+W added CIDs %s", added)
+            return patched2
+        return patched
+    except Exception as exc:
+        logger.warning("SBP F2 cmap patch: %s", exc)
+        return pdf
+
+
+def _patch_tounicode_xref(pdf: bytes, tu_xref: int, new_tu: bytes) -> Optional[bytes]:
+    """Replace a ToUnicode stream and rebuild xref."""
+    import tbank_unlock_template as tut
+    from tbank_orig_mode import find_object_range
+
+    rng = find_object_range(pdf, int(tu_xref))
+    if not rng:
+        return None
+    s, e = rng
+    try:
+        new_obj = tut._make_modified_obj(
+            pdf[s:e], int(tu_xref),
+            new_stream=_best_compress(new_tu),
+        )
+    except Exception as exc:
+        logger.warning("ToUnicode make_modified_obj: %s", exc)
+        return None
+    return _replace_byte_range_and_rebuild(pdf, s, e, new_obj)
+
+
+def _fix_f1_tounicode_canonical_slots(sub: dict) -> dict:
+    """Keep ASCII SBP-id letters on their canonical GIDs; map PUA slots to the letter."""
+    out = {int(c): int(u) for c, u in sub.items()}
+    for ch, gid in TBANK_CHAR_TO_GID_REG.items():
+        gid = int(gid)
+        if gid not in out:
+            continue
+        uni = int(out[gid])
+        if ch.isascii() and ch.isalnum() and uni != ord(ch):
+            out[gid] = ord(ch)
+        elif uni >= 0xE000 and not ch.isascii():
+            out[gid] = ord(ch)
+    return out
+
+
+def apply_sbp_font_hard_fixes(pdf: bytes) -> bytes:
+    """Kill ORPHAN_RESIDUE, mutated-twin SIZE_MULTISET, and F1/F2 cogen break.
+
+    SHA-twin FontFile2 stays verbatim. Hydrate-at-twin-length is moved off the
+    atlas glyf_len but stays inside the cmap envelope. Composite components
+    are kept nonempty. F2.glyf is retargeted to the corpus pair for this F1 hmtx.
+    """
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+        from tbank_dynamic import (
+            _finalize_tbank_f1_epoch,
+            _finalize_tbank_f2_epoch,
+            _snap_f1_glyf_exact_via_shrink,
+            _tbank_ff2_is_corpus_twin,
+        )
+        from tbank_f1_f2_cogen import (
+            F1_TWIN_GLYF_LENS,
+            allowed_f2_glyf_for_f1,
+        )
+    except Exception as exc:
+        logger.warning("SBP font hard-fix import: %s", exc)
+        return pdf
+
+    try:
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        fm = tut._find_font_objects(doc)
+        fr = fm.get("TinkoffSans-Regular")
+        fm2 = fm.get("TinkoffSans-Medium")
+        if not fr:
+            doc.close()
+            return pdf
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        tu1_xref = int(fr["tounicode_xref"])
+        tu = doc.xref_stream(tu1_xref)
+        ff1 = doc.xref_stream(fr["fontfile_xref"])
+        x1 = int(fr["fontfile_xref"])
+        ff2 = doc.xref_stream(fm2["fontfile_xref"]) if fm2 else None
+        x2 = int(fm2["fontfile_xref"]) if fm2 else None
+        tu2_xref = int(fm2["tounicode_xref"]) if fm2 and fm2.get("tounicode_xref") else None
+        cid2_xref = int(fm2["cidfont_xref"]) if fm2 and fm2.get("cidfont_xref") else None
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        reg, med = _gids_per_font_in_stream(cs)
+        doc.close()
+    except Exception as exc:
+        logger.warning("SBP font hard-fix read: %s", exc)
+        return pdf
+
+    cmap_n = len(sub)
+    keep1 = _ff2_raw_composite_closure(ff1, set(reg) | {0, 3} | set(sub.keys()))
+    out = pdf
+    is_twin = _tbank_ff2_is_corpus_twin(ff1, height=519)
+    twin_orphans = _f1_disallowed_orphan_gids(ff1, keep1)
+    empty_paint = False
+    offs_p, glyf_p = _ff2_raw_loca_glyf(ff1)
+    if offs_p is not None and glyf_p:
+        for cid, uni in sub.items():
+            if int(cid) not in reg or int(uni) in (0x20, 0xA0):
+                continue
+            if int(cid) + 1 >= len(offs_p):
+                empty_paint = True
+                break
+            a, b = offs_p[int(cid)], offs_p[int(cid) + 1]
+            if b <= a or (
+                b - a >= 2
+                and int.from_bytes(glyf_p[a:a + 2], "big", signed=True) == 0
+            ):
+                empty_paint = True
+                break
+    # SHA twin with disallowed orphans / empty painted G still Proton FAKE —
+    # mutate and leave the twin glyf length.
+    mutate_f1 = (not is_twin) or bool(twin_orphans) or empty_paint
+    if is_twin and mutate_f1:
+        logger.info(
+            "SBP F1 SHA twin dirty orphans=%s empty_paint=%s — mutate+leave length",
+            twin_orphans[:8], empty_paint,
+        )
+    if mutate_f1:
+        ff1_src = ff1
+        collapsed = _blank_ff2_unused_glyfs(ff1, keep1)
+        collapsed = _force_tbank_f1_head_epoch(collapsed)
+        collapsed = _restore_empty_components_from_src(
+            collapsed, ff1_src, keep1,
+        )
+        if _ff2_raw_empty_composites(collapsed):
+            collapsed = _fill_raw_empty_components_from_corpus(collapsed)
+        if _ff2_raw_empty_composites(collapsed):
+            try:
+                collapsed = _repair_ff2_empty_composite_components(
+                    collapsed, keep1, is_medium=False,
+                )
+            except Exception as exc:
+                logger.warning("SBP F1 composite repair: %s", exc)
+        collapsed = _force_tbank_f1_head_epoch(collapsed)
+        keep1 = _ff2_raw_composite_closure(collapsed, keep1)
+        collapsed = _fill_empty_keep_from_master(collapsed, keep1, sub)
+        collapsed = _restore_zero_bbox_composites_from_corpus(collapsed)
+        collapsed = _force_tbank_f1_head_epoch(collapsed)
+        keep1 = _ff2_raw_composite_closure(collapsed, keep1)
+        g = int(_glyf_table_length(collapsed))
+        want = _pick_cmap_safe_f1_glyf(cmap_n, g, F1_TWIN_GLYF_LENS)
+        if g != want:
+            landed = None
+            try:
+                landed = _snap_f1_glyf_via_keep_pad(collapsed, want, keep1)
+                if landed is None:
+                    if g < want:
+                        landed = _fat_f1_glyf_via_keep_span(
+                            collapsed, want, keep1,
+                        )
+                    else:
+                        landed = _snap_f1_glyf_exact_via_shrink(
+                            collapsed, want, keep1,
+                        )
+            except Exception as exc:
+                logger.warning("SBP F1 cmap-band snap: %s", exc)
+                landed = None
+            if landed is not None:
+                collapsed = _force_tbank_f1_head_epoch(landed)
+                logger.info(
+                    "SBP F1 cmap-band glyf %d→%d (cmap=%d want=%d)",
+                    g, _glyf_table_length(collapsed), cmap_n, want,
+                )
+            else:
+                logger.warning(
+                    "SBP F1 cmap-band miss glyf=%d want=%d cmap=%d",
+                    g, want, cmap_n,
+                )
+        still_bad = _ff2_raw_empty_composites(collapsed)
+        if still_bad:
+            collapsed = _restore_empty_components_from_src(
+                collapsed, ff1_src, keep1,
+            )
+            if _ff2_raw_empty_composites(collapsed):
+                collapsed = _fill_raw_empty_components_from_corpus(collapsed)
+            if _ff2_raw_empty_composites(collapsed):
+                try:
+                    collapsed = _repair_ff2_empty_composite_components(
+                        collapsed, keep1, is_medium=False,
+                    )
+                except Exception as exc:
+                    logger.warning("SBP F1 composite repair2: %s", exc)
+            collapsed = _force_tbank_f1_head_epoch(collapsed)
+            g2 = int(_glyf_table_length(collapsed))
+            want2 = _pick_cmap_safe_f1_glyf(cmap_n, g2, F1_TWIN_GLYF_LENS)
+            if g2 != want2:
+                try:
+                    if g2 < want2:
+                        reland = _fat_f1_glyf_via_keep_span(
+                            collapsed, want2, keep1,
+                        )
+                    else:
+                        reland = _snap_f1_glyf_exact_via_shrink(
+                            collapsed, want2, keep1,
+                        )
+                except Exception:
+                    reland = None
+                if reland is not None:
+                    collapsed = _force_tbank_f1_head_epoch(reland)
+        try:
+            collapsed = _cap_f1_orphan_spares(collapsed, keep1)
+            collapsed = _collapse_tbank_zero_contour_loca_stubs(
+                collapsed, keep_gids=keep1 | {35, 239},
+            )
+        except Exception as exc:
+            logger.warning("SBP F1 cap+stub-collapse: %s", exc)
+        try:
+            from tbank_dynamic import _load_corpus_f1_twin_for_glyf as _twin_len
+            g_now = int(_glyf_table_length(collapsed))
+            if _twin_len(g_now) is not None:
+                want_off = _pick_cmap_safe_f1_glyf(cmap_n, g_now, F1_TWIN_GLYF_LENS)
+                if want_off != g_now:
+                    nudged = None
+                    try:
+                        if g_now < want_off:
+                            nudged = _fat_f1_glyf_via_keep_span(
+                                collapsed, want_off, keep1,
+                            )
+                        else:
+                            nudged = _snap_f1_glyf_exact_via_shrink(
+                                collapsed, want_off, keep1,
+                            )
+                    except Exception:
+                        nudged = None
+                    if nudged is not None:
+                        collapsed = _force_tbank_f1_head_epoch(nudged)
+                        logger.info(
+                            "SBP F1 off-twin-glyf %d→%d",
+                            g_now, _glyf_table_length(collapsed),
+                        )
+        except Exception as exc:
+            logger.warning("SBP F1 off-twin nudge: %s", exc)
+        if collapsed != ff1:
+            g_was = int(_glyf_table_length(ff1))
+            patched = _patch_fontfile2_xref(out, x1, collapsed)
+            if patched:
+                out = _finalize_tbank_f1_epoch(patched)
+                ff1 = collapsed
+                logger.info(
+                    "SBP F1 orphan-collapse glyf %d→%d empty_comp=%s stubs=%s",
+                    g_was, _glyf_table_length(collapsed),
+                    _ff2_raw_empty_composites(collapsed)[:6],
+                    _ff2_zero_contour_stub_gids(collapsed)[:8],
+                )
+
+    if ff2 is not None and x2 is not None:
+        keep2 = set(med) | {0, 3} | set(BANK_MED_GHOST)
+        ff2_orig = ff2
+        # Collapse stubs BEFORE cogen — leftover ncont=0 pads shift F2.glyf
+        # off the F1-hmtx kit pair (live Proton TBANK_GLYF_ZERO_CONTOUR_STUB
+        # then TBANK_F1_HMTX_F2_GLYF_COGEN_MISMATCH).
+        try:
+            col2 = _collapse_tbank_zero_contour_loca_stubs(ff2, keep_gids=keep2)
+            if col2 != ff2:
+                logger.info(
+                    "SBP F2 stub-collapse glyf %d→%d stubs=%s",
+                    _glyf_table_length(ff2),
+                    _glyf_table_length(col2),
+                    _ff2_zero_contour_stub_gids(col2)[:8],
+                )
+                ff2 = col2
+        except Exception as exc:
+            logger.warning("SBP F2 stub-collapse: %s", exc)
+        allowed = allowed_f2_glyf_for_f1(ff1)
+        g2 = int(_glyf_table_length(ff2))
+        if allowed and g2 not in allowed:
+            want2 = min(allowed, key=lambda x: abs(int(x) - g2))
+            donor = _pick_safecheck_band_medium_ff2() or ff2
+            try:
+                landed = _land_f2_glyf_safe_band(
+                    ff2, donor, keep2, lo=want2, hi=want2,
+                )
+            except Exception as exc:
+                logger.warning("SBP F2 cogen land: %s", exc)
+                landed = None
+            if landed is not None:
+                landed = _collapse_tbank_zero_contour_loca_stubs(
+                    landed, keep_gids=keep2,
+                )
+            if landed is not None and int(_glyf_table_length(landed)) in allowed:
+                ff2 = landed
+                logger.info(
+                    "SBP F2 cogen %d→%d (want %s)",
+                    g2, _glyf_table_length(landed), sorted(allowed),
+                )
+            else:
+                logger.warning(
+                    "SBP F2 cogen miss glyf=%d want=%s landed=%s",
+                    g2, sorted(allowed),
+                    None if landed is None else _glyf_table_length(landed),
+                )
+                try:
+                    landed = _trim_glyf_via_keep_span(ff2, want2, keep2)
+                except Exception as exc:
+                    logger.warning("SBP F2 trim: %s", exc)
+                    landed = None
+                if landed is not None:
+                    landed = _collapse_tbank_zero_contour_loca_stubs(
+                        landed, keep_gids=keep2,
+                    )
+                if landed is not None and int(_glyf_table_length(landed)) in allowed:
+                    ff2 = landed
+                    logger.info(
+                        "SBP F2 trim-cogen %d→%d",
+                        g2, _glyf_table_length(landed),
+                    )
+        if ff2 != ff2_orig:
+            patched = _patch_fontfile2_xref(out, x2, ff2)
+            if patched:
+                out = _finalize_tbank_f2_epoch(patched)
+    try:
+        import tbank_unlock_template as tut
+        fixed_sub = _fix_f1_tounicode_canonical_slots(sub)
+        if fixed_sub != {int(c): int(u) for c, u in sub.items()}:
+            uni_gid = {int(u): int(c) for c, u in fixed_sub.items()}
+            new_tu = tut._build_tounicode_cmap(uni_gid)
+            patched_tu = _patch_tounicode_xref(out, tu1_xref, new_tu)
+            if patched_tu:
+                out = patched_tu
+                logger.info("SBP F1 ToUnicode canonical-slot remap")
+    except Exception as exc:
+        logger.warning("SBP F1 ToUnicode remap: %s", exc)
+    return out
+
+
 def create_tbank_sbp_stealth(data: Dict) -> Optional[bytes]:
     """СБП: donor-orig (skeleton-safe) first, then full dynamic path."""
     from tbank_dynamic import create_tbank_pipeline
@@ -18319,6 +19486,7 @@ def create_tbank_sbp_stealth(data: Dict) -> Optional[bytes]:
         # Hard-fail before ship: Proton SBP_CIPHER_MISSING if ID not ASCII-extractable.
         if _extract_sbp_opid_flat(pdf) is None:
             last_why = "sbp-cipher-missing"
+            last_pdf = apply_sbp_font_hard_fixes(pdf)
             logger.error(
                 "T-Bank SBP attempt %d: SBP cipher missing/corrupt in text — retry",
                 attempt,
@@ -18729,7 +19897,7 @@ def create_tbank_sbp_stealth(data: Dict) -> Optional[bytes]:
             pdf = _sbp_remap_unused_cmap_uniscodes(pdf)
         except Exception as _exc_ur:
             logger.warning("T-Bank SBP unused-CMap remap: %s", _exc_ur)
-        return pdf
+        return apply_sbp_font_hard_fixes(pdf)
     if last_pdf is not None:
         empty_ch = _pdf_f1_empty_painted_chars(last_pdf)
         if empty_ch:
@@ -18741,7 +19909,7 @@ def create_tbank_sbp_stealth(data: Dict) -> Optional[bytes]:
             "T-Bank SBP: gated attempts exhausted (%s) — ship last PDF",
             last_why,
         )
-        return last_pdf
+        return apply_sbp_font_hard_fixes(last_pdf)
     logger.error("T-Bank SBP: all attempts failed (%s)", last_why)
     return None
 

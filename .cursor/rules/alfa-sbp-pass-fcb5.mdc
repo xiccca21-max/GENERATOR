@@ -1,0 +1,48 @@
+---
+description: Live @bankpdfbot PASS fcb58008 — 16.08 send-time T-Bank Alfa SBP; do not clone this identity.
+alwaysApply: true
+---
+
+# Alfa SBP live PASS fcb58008 (K-ALFA-SBP-PASS-FCB5)
+
+Live `@bankpdfbot` ✅ 16.08.2026, **direct** (not OnlyPDF cache):
+`docs/specimen_alfa_sbp_PASS_fcb58008e0828734.pdf` (58288, SHA `fcb58008e0828734…`).
+Source: `alfa_sbp_134457.pdf`.
+
+```text
+date:     16.08.2026 13:44:57 мск  (send-time — this CAN pass)
+amount:   56850
+receiver: Подышим Воздухом Г
+bank:     Т-Банк
+phone:    +7 (916) 340-34-69
+account:  40817810204292631614 ledger 042
+op:       C161608261064922
+sbp:      B6228104438556510B10130011821301
+prefix:   EELITP
+FF2:      21446 == aligned end, sha16 833ebd61234b58dd, CSA 0x68C48484
+```
+
+Oracle wrap green: extra `{0}`, SFNT Oracle order, CSA pin, unique prefix, **aligned SFNT end**.
+
+## vs 134353 (do not treat as bankpdf PASS)
+
+`alfa_sbp_134353.pdf` (EMLSCK, Подышим Воздухом **Э**, same phone/amount, 13:43:52) went ✅ on `@bankpdfbot` only after `@onlypdf_robot` green — shared cache, OnlyPDF weaker. Not an independent bankpdf proof. Do not clone that identity either.
+
+## What this PASS isolates
+
+- **Send-time date is allowed.** 0433’s 30.07 was one PASS, not a law that «now» is forbidden.
+- **T-Bank + `B10130011821301` can pass.** NEG 3a had the same route and still ❌ — do not retune `_BANK_ROUTES` from 3a or from this ✅.
+- NEG 3a FF2 was **not** aligned (`aligned False`, 20688). This PASS is aligned 21446. Keep `sfnt-tail` / aligned-end gate.
+- Joke / rare FIO with third-letter `Г` is fine (full charset).
+
+## Forbidden
+
+- Do not clone this face/phone/amount/op/SBP/account/prefix/FF2 SHA
+- Do not clone 134353 (`Подышим Воздухом Э`, `C161608261001387`, `EMLSCK`)
+- Do not force «дата не сейчас» as the only valid probe
+- Do not treat OnlyPDF ✅ as `@bankpdfbot` ✅
+
+## Next file law
+
+Change **one** internal axis only. Do not retarget face+date+bank together.
+Do not spam. Do not clone this identity.

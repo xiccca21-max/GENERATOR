@@ -14,11 +14,24 @@ _CORPUS_CANDIDATES = [
 ]
 
 
-def _resolve_corpus_dir() -> str:
+def _corpus_dirs() -> List[str]:
+    seen = set()
+    out: List[str] = []
     for path in _CORPUS_CANDIDATES:
-        if path and os.path.isdir(path):
-            return path
-    return _CORPUS_CANDIDATES[-1]
+        if not path:
+            continue
+        real = os.path.normpath(path)
+        key = os.path.normcase(real)
+        if key in seen or not os.path.isdir(real):
+            continue
+        seen.add(key)
+        out.append(real)
+    return out
+
+
+def _resolve_corpus_dir() -> str:
+    dirs = _corpus_dirs()
+    return dirs[0] if dirs else _CORPUS_CANDIDATES[-1]
 
 
 CORPUS_DIR = _resolve_corpus_dir()
@@ -103,18 +116,35 @@ def canonical_paths(kind: str) -> List[str]:
 
 
 def corpus_paths(kind: str) -> List[str]:
-    if not os.path.isdir(CORPUS_DIR):
-        return []
     out: List[str] = []
-    for name in sorted(os.listdir(CORPUS_DIR)):
-        if not name.lower().endswith(".pdf"):
-            continue
-        path = os.path.join(CORPUS_DIR, name)
+    seen = set()
+    for folder in _corpus_dirs():
         try:
-            if classify_pdf(path) == kind:
-                out.append(path)
-        except Exception:
-            pass
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in sorted(names):
+            if not name.lower().endswith(".pdf"):
+                continue
+            path = os.path.join(folder, name)
+            key = os.path.normcase(os.path.normpath(path))
+            if key in seen:
+                continue
+            try:
+                import hashlib
+
+                digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+            except OSError:
+                continue
+            if digest in seen:
+                continue
+            try:
+                if classify_pdf(path) == kind:
+                    seen.add(digest)
+                    seen.add(key)
+                    out.append(path)
+            except Exception:
+                pass
     return out
 
 

@@ -1,0 +1,28 @@
+---
+description: Live @bankpdfbot PASS 27009e56 — Wildberries Alfa SBP; do not clone this identity.
+alwaysApply: true
+---
+
+# Alfa SBP live PASS 27009e56 (K-ALFA-SBP-PASS-27009)
+
+Live `@bankpdfbot` ✅ 15.08.2026 (not cache):
+`docs/specimen_alfa_sbp_PASS_27009e569d3458ad.pdf` (60495, SHA `27009e569d3458ad…`).
+
+```text
+date:     14.08.2026 11:29:36 мск (not send-time)
+amount:   22370
+receiver: Лидия Сергеевна Т
+bank:     Wildberries (Вайлдберриз Банк)
+phone:    +7 (920) 715-34-82
+account:  40817810504224932832 ledger 042
+op:       C161408260609183
+sbp:      B6226082925753180G10140011830701
+```
+
+Same chat still ❌ other WB gens (Степан / Марк) and Ozon/T-Bank/Sber probes.
+WB route + ~60 KB is **not** sufficient by itself.
+
+## Next file law
+
+Change **one** internal axis only. Do not clone this identity.
+Do not retarget face+date+bank together.

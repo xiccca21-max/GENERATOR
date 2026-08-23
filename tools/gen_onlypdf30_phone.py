@@ -24,8 +24,8 @@ from onlypdf_gate import generate_onlypdf_batch  # noqa: E402
 from onlypdf_safe_names import (  # noqa: E402
     CYR_NO_YO_TVERD,
     coverage_report,
-    pick_receiver_short,
-    pick_sender_pair,
+    pick_hard_tbank_pair,
+    pick_hard_tbank_recv,
 )
 from tbank_phone_stealth import create_tbank_phone_stealth  # noqa: E402
 import fitz  # noqa: E402
@@ -45,9 +45,9 @@ def _payload(i: int, attempt: int = 0) -> dict:
         5600, 13400, 15700, 19900, 22000,
     )
     amount = amounts[(i * 3 + attempt) % len(amounts)]
-    first, last = pick_sender_pair(i, attempt)
+    first, last = pick_hard_tbank_pair(i, attempt)
     sender = f"{first} {last}"
-    receiver = pick_receiver_short(i, attempt)
+    receiver = pick_hard_tbank_recv(i, attempt)
     phone = (
         f"+7 ({rng.randint(900, 999)}) {rng.randint(100, 999)}-"
         f"{rng.randint(10, 99)}-{rng.randint(10, 99)}"
@@ -76,7 +76,7 @@ def _local_ok(pdf: bytes) -> tuple[bool, str]:
         return False, f"open:{exc}"
     if "По номеру телефона" not in text:
         return False, "no-phone-title"
-    if "DOCS-2035" not in kw:
+    if "DOCS-2035" not in kw and "| 991" not in kw and not kw.strip().endswith("991"):
         return False, f"bad-kw:{kw.split('|')[-1].strip() if kw else '?'}"
     # Reject pure template face (clone with only receipt/hash rotated).
     if "Дамир Сеничев" in text and "Марина Ч." in text and "14 000" in text:

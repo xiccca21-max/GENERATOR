@@ -11,6 +11,7 @@ import logging
 import random
 import re
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 _DIR = Path(__file__).resolve().parent
@@ -31,137 +32,195 @@ from sber_phone_stealth import create_sber_phone_stealth  # noqa: E402
 import fitz  # noqa: E402
 
 _USED_DOCS: set[str] = set()
+_USED_FACES: set[str] = set()
+_EXCL = frozenset("ъЪёЁйЙ")
+
+# Faces never used on the SBP 20/20 (proton23). No donor clones.
+_PHONE_SENDERS = [
+    "Степан Глухов",
+    "Лариса Панкова",
+    "Дарья Хмелева",
+    "Кирилл Зубов",
+    "Полина Абрамова",
+    "Артем Леонов",
+    "Вера Кузнецова",
+    "Наталья Морозова",
+    "Евгений Смирнов",
+    "Людмила Белова",
+    "Тимур Сафин",
+    "Светлана Орлова",
+    "Георгий Павлов",
+    "Василиса Крылова",
+    "Денис Фролов",
+    "Ксения Волкова",
+    "Михаил Соколов",
+    "Алина Петрова",
+    "Руслан Газизов",
+    "Ульяна Светлова",
+    "Родион Громов",
+    "Лилия Сафонова",
+    "Марк Лебедев",
+    "Софья Грачева",
+    "Платон Воронов",
+    "Карина Лескова",
+    "Эдуард Малов",
+    "Нонна Власова",
+    "Захар Плотников",
+]
+_PHONE_RECV = [
+    "Глеб Уткин",
+    "Зульфия Каримова",
+    "Татьяна Соколова",
+    "Юлия Ковалева",
+    "Анна Лебедева",
+    "Никита Орлов",
+    "Владимир Шаров",
+    "Максим Попов",
+    "Алексей Уткин",
+    "Борис Новиков",
+    "Сергей Семенов",
+    "Цветана Яшина",
+    "Элина Белова",
+    "Федор Фахрутдинов",
+    "Ольга Рыбакова",
+    "Павел Чернов",
+    "Игорь Волков",
+    "Марина Щукина",
+    "Яна Журавлева",
+    "Харитон Белов",
+]
+_AMOUNTS = [
+    1810, 2540, 3470, 4890, 5120, 6780, 7310, 8450, 9260, 10400,
+    11880, 13250, 15670, 16990, 18440, 19770, 22100, 24680, 27890, 30550,
+]
 
 
-def _extract_phone_donor_fields(path: str) -> dict | None:
-    """Field values from Sber phone CARD-shell donors (_PHONE_FIELD_Y coords)."""
-    import fitz
-    import tbank_unlock_template as tut
-    from sber_dynamic import (
-        _PHONE_FIELD_Y,
-        _pick_arial,
-        _read_field_at_y,
+def _norm_face(name: str) -> str:
+    return re.sub(r"[.\s]+", " ", (name or "").lower()).strip(" .")
+
+
+def _load_banned_faces() -> None:
+    """Never reuse SBP proton23 / prior PASS phone faces."""
+    _USED_FACES.update(
+        {
+            _norm_face("Степан Глухов"),
+            _norm_face("Глеб Уткин"),
+            _norm_face("Наталья Морозова"),
+            _norm_face("Максим Попов"),
+            _norm_face("Лариса Панкова"),
+            _norm_face("Людмила Белова"),
+            _norm_face("Дарья Хмелева"),
+            _norm_face("Полина Абрамова"),
+            _norm_face("Кирилл Зубов"),
+            _norm_face("Руслан Газизов"),
+            _norm_face("Михаил Соколов"),
+            _norm_face("Артем Леонов"),
+            _norm_face("Василиса Крылова"),
+            _norm_face("Марк Лебедев"),
+            _norm_face("Яна Журавлева"),
+        }
     )
-
-    doc = fitz.open(path)
-    cs_xref = None
-    for xref in range(1, doc.xref_length()):
+    passed = _ROOT / "_sber_passed_faces.json"
+    if passed.is_file():
         try:
-            stream = doc.xref_stream(xref)
-            if stream and b"Tm" in stream and b"Tj" in stream and b"BT" in stream:
-                cs_xref = xref
-                break
+            import json
+
+            blob = json.loads(passed.read_text(encoding="utf-8"))
+            for name in blob.get("faces") or []:
+                _USED_FACES.add(_norm_face(str(name)))
         except Exception:
             pass
-    if cs_xref is None:
-        doc.close()
-        return None
-    stream = doc.xref_stream(cs_xref)
-    fm = tut._find_font_objects(doc)
-    key = _pick_arial(fm)
-    if not key:
-        doc.close()
-        return None
-    sub = tut._parse_subset_tounicode(
-        doc.xref_stream(fm[key]["tounicode_xref"]).decode("latin1", "replace"))
-    doc.close()
-    uni_gid = {u: c for c, u in sub.items()}
-    fields: dict[str, str] = {}
-    for field_name, target_y in _PHONE_FIELD_Y.items():
-        row = _read_field_at_y(stream, target_y, uni_gid)
-        if row:
-            fields[field_name] = row[1]
-    return fields if len(fields) >= 6 else None
+    roots = [
+        _ROOT / "_test20_sber_sbp_proton23",
+        _ROOT / "_test20_sber_phone_proton01",
+        _ROOT / "_test20_sber_phone_proton02",
+        _ROOT / "_test20_sber_phone_proton03",
+    ]
+    for folder in roots:
+        if not folder.is_dir():
+            continue
+        for p in folder.glob("*.pdf"):
+            try:
+                text = fitz.open(p)[0].get_text()
+            except Exception:
+                continue
+            for ln in text.splitlines():
+                s = ln.strip()
+                if 6 <= len(s) <= 48 and any("а" <= ch.lower() <= "я" for ch in s):
+                    if "сбп" in s.lower() or "перевод" in s.lower():
+                        continue
+                    if "банк" in s.lower() or "операц" in s.lower():
+                        continue
+                    _USED_FACES.add(_norm_face(s))
 
 
 def _payload(i: int, attempt: int = 0) -> dict:
-    """Near-donor fields — corpus day/amount/FIO; nudge seconds + unique phone."""
-    from sber_dynamic import _corpus_phone_donors
-    from sber_sbp_stealth import _parse_sber_date_time_label
-
-    rng = random.Random(22072026 + i * 263 + attempt * 881)
-
-    pool: list[dict] = []
-    for path in _corpus_phone_donors():
-        orig = _extract_phone_donor_fields(path) or {}
-        if len(orig) < 6:
-            continue
-        dt = _parse_sber_date_time_label(orig.get("date_time") or "")
-        if not dt:
-            continue
-        digs = "".join(c for c in (orig.get("amount") or "") if c.isdigit())
-        if len(digs) < 3:
-            continue
-        pool.append(
-            {
-                "day": dt.strftime("%d.%m.%Y"),
-                "hh": dt.hour,
-                "mm": dt.minute,
-                "ss": dt.second,
-                "digs": digs,
-                "sender": orig.get("sender_name") or "",
-                "receiver": orig.get("receiver_name") or "",
-            }
-        )
-    if not pool:
-        pool = [{
-            "day": "23.12.2025", "hh": 10, "mm": 16, "ss": 0, "digs": "3500",
-            "sender": "Андрей Розенталь О.", "receiver": "Анна Иванова",
-        }]
-
-    d = pool[(i + attempt) % len(pool)]
-    ss = (d["ss"] + 1 + attempt + i) % 60
+    """Unique face/amount/date — not a donor clone, not a prior PASS identity."""
+    rng = random.Random(23082026 + i * 409 + attempt * 1103)
+    _load_banned_faces()
+    sender = _PHONE_SENDERS[(i - 1 + attempt) % len(_PHONE_SENDERS)]
+    receiver = _PHONE_RECV[(i - 1 + attempt * 3) % len(_PHONE_RECV)]
+    for _ in range(40):
+        if (
+            _norm_face(sender) not in _USED_FACES
+            and _norm_face(receiver) not in _USED_FACES
+            and _norm_face(sender) != _norm_face(receiver)
+            and not (set(sender + receiver) & _EXCL)
+        ):
+            break
+        sender = _PHONE_SENDERS[rng.randrange(len(_PHONE_SENDERS))]
+        receiver = _PHONE_RECV[rng.randrange(len(_PHONE_RECV))]
+    base = datetime(2026, 8, 22, 16, 0, 0) - timedelta(hours=(i * 7 + attempt * 3) % 280)
+    if base < datetime(2026, 7, 11, 0, 0, 0):
+        base = datetime(2026, 7, 11, 13, 0, 0) + timedelta(minutes=i * 17 + attempt * 5)
+    base = base.replace(
+        minute=rng.randint(0, 59),
+        second=(rng.randint(0, 59) + attempt + i) % 60,
+    )
+    amount = _AMOUNTS[(i - 1 + attempt * 5) % len(_AMOUNTS)]
     phone = (
         f"+7 ({rng.randint(900, 999)}) {rng.randint(100, 999)}-"
         f"{rng.randint(10, 99)}-{rng.randint(10, 99)}"
     )
-    sender = d["sender"] if len(d["sender"]) >= 6 else "Анна Иванова"
-    receiver = d["receiver"] if len(d["receiver"]) >= 6 else "Иван Козлов"
-    excluded = set("ъЪёЁйЙ")
-    if set(sender) & excluded:
-        sender = "Мария Александровна Ющенко"
-    if set(receiver) & excluded:
-        receiver = "Екатерина Владимировна Щукина"
-    if i % 30 == 0:
-        sender = "Мария Александровна Ющенко"
-        receiver = "Екатерина Владимировна Щукина"
-    if sender == receiver:
-        receiver = "Максим Павлов"
     return {
-        "amount": str(int(d["digs"])),
+        "amount": str(amount),
         "sender_name": sender,
         "receiver_name": receiver,
         "phone": phone,
-        "date": d["day"],
-        "time": f"{d['hh']:02d}:{d['mm']:02d}:{ss:02d}",
+        "date": base.strftime("%d.%m.%Y"),
+        "time": base.strftime("%H:%M:%S"),
         "commission": "0",
         "document_num": "авто",
     }
 
 
 def _gen(data: dict):
-    return create_sber_phone_stealth(data)
+    pdf = create_sber_phone_stealth(data)
+    if pdf:
+        return pdf
+    retry = dict(data)
+    retry["document_num"] = "авто"
+    return create_sber_phone_stealth(retry)
 
 
 def _local_ok(pdf: bytes) -> tuple[bool, str]:
     try:
+        from sber_dynamic import _pdf_proton_flate_ok
+
+        if not _pdf_proton_flate_ok(pdf):
+            return False, "proton-flate"
+    except Exception as exc:
+        return False, f"flate:{exc}"
+    try:
         doc = fitz.open(stream=pdf, filetype="pdf")
         text = doc[0].get_text()
-        xref = doc[0].get_contents()[0]
-        raw = doc.xref_stream_raw(xref)
-        dec = doc.xref_stream(xref)
         doc.close()
     except Exception as exc:
         return False, f"open:{exc}"
-    # PASS-shell content stream: 932 compressed / 4662 decoded. Иначе OnlyPDF FAKE.
-    if len(raw) != 932 or len(dec) != 4662 or raw[:2] != b"\x78\x9c":
-        return False, f"stream:{len(raw)}/{len(dec)}"
     low = text.lower()
     if "мск" not in low and "телефон" not in low:
         if "₽" not in text and "руб" not in low:
             return False, "no-sber-phone-markers"
-    if "номер карты получателя" not in low.replace("ё", "е"):
-        return False, "not-card-layout"
     m = re.search(r"\d{15,}", re.sub(r"\D", "", text))
     if m and m.group(0) in _USED_DOCS:
         return False, f"doc-used:{m.group(0)}"
@@ -171,11 +230,40 @@ def _local_ok(pdf: bytes) -> tuple[bool, str]:
 def _mark(pdf: bytes) -> None:
     try:
         doc = fitz.open(stream=pdf, filetype="pdf")
-        text = re.sub(r"\D", "", doc[0].get_text())
+        text = doc[0].get_text()
         doc.close()
-        m = re.search(r"\d{15,}", text)
+        digits = re.sub(r"\D", "", text)
+        m = re.search(r"\d{15,}", digits)
         if m:
             _USED_DOCS.add(m.group(0))
+        skip = (
+            "чек", "операц", "перевод", "телефон", "номер", "карт",
+            "счёт", "счет", "сумма", "комисс", "код", "документ",
+            "мск", "если", "деньги", "обратит", "дополнит",
+        )
+        for ln in text.splitlines():
+            s = ln.strip()
+            if not (6 <= len(s) <= 40):
+                continue
+            if any(ch.isdigit() for ch in s):
+                continue
+            low = s.lower()
+            if any(tok in low for tok in skip):
+                continue
+            if any("а" <= ch.lower() <= "я" for ch in s):
+                _USED_FACES.add(_norm_face(s))
+        passed = _ROOT / "_sber_passed_faces.json"
+        import json
+
+        clean = [
+            f for f in sorted(_USED_FACES)
+            if not any(ch.isdigit() for ch in f)
+            and not any(tok in f for tok in skip)
+        ]
+        passed.write_text(
+            json.dumps({"faces": clean}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     except Exception:
         pass
 

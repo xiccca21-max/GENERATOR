@@ -14,7 +14,7 @@ For every bank/channel, the **shipped PDF file size** must land in the same band
 | Sber SBP | **100–104 KB** (~102–103 KB corpus) |
 | T-Bank SBP | ~59–61 KB (donor shell ± small drift) |
 | T-Bank phone / card / nocomm | match that channel’s `T_*_original.pdf` |
-| Alfa SBP / card | **~58–60 KB** Oracle corpus (not unlocked ~63 KB) |
+| Alfa SBP / card | **~58–61 KB** Oracle (10.08 lean ~58.4; 15.08 Wildberries 60.6). Unlocked ~63 KB still out. |
 | Alfa phone | **~69.7–71.6 KB** Quartz iOS corpus — never crush to Oracle ~58 KB (OnlyPDF virtual printer) |
 
 ## Typical failure
@@ -26,6 +26,14 @@ Blanking unused glyf → FontFile2 **compresses much smaller** (e.g. 23KB → 14
 1. Keep FontFile2 **compressed `/Length`** equal to the donor shell (pad decoded TTF with high-entropy tail if needed — do **not** use content-stream `compress_to_size` space pads on fonts).
 2. Prefer generation shells already in the original size band; fat `*_unlocked` / `*_runtime` only when charset cannot fit a lean original.
 3. Do not treat “any size that Proton still accepts” as OK if it is far from originals — size is part of looking like the bank.
+
+### Alfa Oracle exception (NEG 3a follow-up)
+
+For Alfa FontFile2, never append entropy/PADD to reach a size band. Release
+requires `len(FontFile2)` equal to the Oracle layout: 4-pad every table
+except glyf (glyf may end 2-mod-4). Do not trim to
+`align4(max(offset+length))` — that drops a 2-byte prep pad on some
+originals. Accept the PDF size produced naturally by the subset.
 
 ## When fixing
 

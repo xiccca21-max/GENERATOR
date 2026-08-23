@@ -69,6 +69,11 @@ ALFA_ANCHORS = {
     "date": ("left", 35.45, 8.0),
     "header_date": ("right", 559.69, 12.0),
 }
+ALFA_STATEMENT_ANCHORS = {
+    "left": ("left", 146.65, 8.0),
+    "right": ("right", 567.0, 10.0),
+    "date": ("left", 146.65, 8.0),
+}
 
 TBANK_COMMON = {
     "amount": _f("amount", required=True, anchor="amount", repeats=2),
@@ -235,6 +240,20 @@ METHOD_PROFILES: Dict[str, MethodProfile] = {
         ("Квитанция о переводе клиенту Альфа-Банка", "Сумма перевода"),
         "alfa_phone",
     ),
+    "alfa_statement": MethodProfile(
+        "alfa_statement", "alfa",
+        (ROOT / "templates" / "Alfa_statement_original.pdf",),
+        (ORIGINALS / "альфа",),
+        (90_000, 130_000), 25_000, ALFA_STATEMENT_ANCHORS,
+        {
+            "amount": _f("amount", required=True, anchor="right", repeats=2),
+            "date_time": _f("datetime", required=True, anchor="date"),
+            "receiver": _f("fio", required=True, anchor="left"),
+            "account": _f("account", required=True, anchor="left"),
+        },
+        ("Выписка по счету", "Операции по счету", "Код операции"),
+        "alfa_statement",
+    ),
 }
 
 
@@ -249,6 +268,7 @@ ALIASES = {
     "create_alfa_sbp_stealth": "alfa_sbp",
     "create_alfa_card_stealth": "alfa_card",
     "create_alfa_phone_stealth": "alfa_phone",
+    "create_alfa_statement_stealth": "alfa_statement",
 }
 
 

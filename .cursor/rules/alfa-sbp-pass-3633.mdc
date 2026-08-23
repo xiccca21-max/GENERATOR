@@ -1,0 +1,28 @@
+---
+description: Live @bankpdfbot PASS 3633ea4f — 16.08 send-time T-Bank Alfa SBP; do not clone.
+alwaysApply: true
+---
+
+# Alfa SBP live PASS 3633ea4f (K-ALFA-SBP-PASS-3633)
+
+Live `@bankpdfbot` ✅ 16.08.2026, **direct** (not cache):
+`docs/specimen_alfa_sbp_PASS_3633ea4f65032e87.pdf` (57943, SHA `3633ea4f65032e87…`).
+
+```text
+date:     16.08.2026 14:54:31 мск (send-time)
+amount:   22180
+receiver: Гавриил Сергеевич Т
+bank:     Т-Банк
+phone:    +7 (916) 274-81-36
+account:  40817810904201078128 ledger 042
+op:       C161608261376498
+sbp:      B6228115416785340B10130011821301
+prefix:   XHOYSB
+FF2:      20558 aligned, sha16 181fb6634fb58567
+```
+
+Came after `document10.08.26.pdf` which this checker now returns **❌ cache**
+(global SHA burned — do not treat 10.08 orig as a live-green warmup).
+Next new SHA on the same chat (g14 Геннадий) ❌ immediately.
+
+Do not clone this identity.

@@ -18,6 +18,13 @@ from pathlib import Path
 
 import paramiko
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(errors="replace")
+        sys.stderr.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = Path(__file__).resolve().parent / ".deploy.env"
 SERVICE = "receipt-bot"

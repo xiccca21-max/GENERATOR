@@ -11,6 +11,7 @@
 |----------|------|------|---------|
 | **T‑Bank SBP** | `docs/specimen_tbank_sbp_seq_1785589390_01.pdf` | **60473** | `393ffa084886c2a70fd0e4212eac21937f8ff398c6163333247dc744aad8829b` |
 | **Alfa SBP** | `docs/specimen_alfa_sbp_155113.pdf` | **58873** | `c80160c30964b9f4426342bac9a9f0bd3a144439064fd337d967384aebcedd13` |
+| **Alfa SBP NEG** | `docs/specimen_alfa_sbp_NEG_3a24266b.pdf` | **58124** | `3a24266b20ab0881b2f4fbf041356bbe13318a4b4c9809d47658c2f17a4eca8e` |
 
 Канонический код: **только** `create_*_stealth` через `bot.py` / `tools/night_proton_seq.py`.  
 Демо без OnlyPDF/Proton gate — запрещены (`onlypdf-canonical`).
@@ -367,6 +368,27 @@ pdf = create_alfa_sbp_stealth({
 | Period-10 account | `ALFA_DEBIT_ACCOUNT_PERIODIC` |
 | Phone name unmasked | `ALFA_PHONE_NAME_UNMASKED` (для phone-канала: маска вида `Вол**в Д. В.`) |
 
+## B6. Отрицательный образец `NEG_3a24266b` (не трогать op/SBP)
+
+Live `@bankpdfbot` ❌ 15.08.2026: Oracle emit, Игорь Денисович К / Т-Банк / 18640 / `10.08.2026 11:02:17`,
+op `C161008260604894`, SBP `B6222080212544320B10130011821301`.
+
+На 3a семантика op/SBP уже совпала с живыми оригиналами 10.08. FO CID 1..N, charset, Oracle SFNT и CSA pin `0x68C48484` — зелёные. Вердикт **не** доказывает ошибку полей.
+
+Байтовое сравнение с `templates/alfa_corpus/document10.08.26.pdf` — только:
+
+- пересобранный FontFile2
+- Content
+- ToUnicode / CID
+- плюс live reputation/state чекера
+
+FontFile2 выпускается только естественным subset: без entropy/PADD и без байтов
+после aligned end последней SFNT-таблицы. Обязательный gate:
+`len(FontFile2) == align4(max(table.offset + table.length))`. Диапазон 58–59 KB
+не достигается искусственным хвостом.
+
+Запрещено: подгонять `_BANK_ROUTES` / `_OP_TAIL_KNOTS` / lag под этот ❌; генерировать новые номера и лица «как 3a». Правило: `.cursor/rules/alfa-sbp-3a-neg.mdc`.
+
 ---
 
 # C. Как гонять / деплоить
@@ -390,8 +412,12 @@ OnlyPDF QA: `tools/gen_onlypdf30_*.py` → `tools/onlypdf_gate.py` (PASS×2 + re
 
 # D. Правило памяти агента
 
-Cursor rule: `.cursor/rules/pass-recipes-tbank-alfa.mdc` (`alwaysApply`).  
-При регрессе T‑Bank/Alfa SBP — сначала сверять с **этим** документом и specimen PDF в `docs/`, не изобретать третий layout.
+Cursor rules (alwaysApply):
+
+- `.cursor/rules/pass-recipes-tbank-alfa.mdc` — golden specimens T‑Bank SBP + Alfa SBP  
+- `.cursor/rules/tbank-all-from-alfa-sbp-discipline.mdc` — Alfa SBP live-check discipline на **все** методы T‑Bank (SBP/phone/card/nocomm/statement), без снятия Jasper/CSA/Keywords/`x1=250`
+
+При регрессе T‑Bank/Alfa — сначала сверять с **этим** документом и specimen PDF в `docs/`, не изобретать третий layout.
 
 ---
 

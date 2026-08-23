@@ -1025,9 +1025,12 @@ def _splice_amount_slot(old_b: bytes, amount_text: str, enc, *, phone_style: boo
         return enc(amount_text)
 
     tail = old_b[marker_pos:]
-    # Proton SBER_AMOUNT_RUBLE_SPACING: exactly two SPACE CIDs before ₽.
-    # Never let a longer digit head eat those two CIDs.
-    _SP2 = b"\x00\x03\x00\x03"
+    # Phone / sber_internal_jasper: exactly ONE SPACE CID before ₽.
+    # SBP outgoing: exactly TWO SPACE CIDs before ₽.
+    if phone_style:
+        _SP2 = b"\x00\x03"
+    else:
+        _SP2 = b"\x00\x03\x00\x03"
     digit_budget = marker_pos - len(_SP2)
     if digit_budget < 2 or digit_budget % 2 != 0:
         digit_budget = marker_pos  # fallback: old behaviour
@@ -2655,39 +2658,93 @@ def _best_compress(stream: bytes) -> bytes:
     return _jasper_compress(stream)
 
 
+def _flate_proton_safe(comp: bytes) -> bool:
+    """Proton sber_v2.streams: rstrip(CR/LF) then zlib; regex stops at endstream.
+
+    A FontFile2 that ends with 0x0A/0x0D (Марк 3470) → Error -5 truncated.
+    Binary ``endstream`` inside flate would also cut the object early.
+    """
+    if not comp or comp[:2] != _JASPER_ZLIB:
+        return False
+    if comp.endswith((b"\r", b"\n")):
+        return False
+    if b"endstream" in comp or b"endobj" in comp:
+        return False
+    if comp.rstrip(b"\r\n") != comp:
+        return False
+    try:
+        zlib.decompress(comp)
+    except Exception:
+        return False
+    return True
+
+
 def _jasper_compress(stream: bytes, target_size: Optional[int] = None) -> bytes:
     """Только Jasper zlib (0x789c), никогда 0x78da (best compression = маркер подделки)."""
     from openpdf_deflate import compress_to_size
 
+    fallback = b""
     if target_size is not None:
         hit = compress_to_size(stream, target_size)
-        if hit and hit[:2] == _JASPER_ZLIB:
+        if hit and hit[:2] == _JASPER_ZLIB and _flate_proton_safe(hit):
             return hit
-    for level in (6, 5, 7, 4, 8, 3):
+        if hit and hit[:2] == _JASPER_ZLIB:
+            fallback = hit
+    for level in (6, 5, 7, 4, 8, 3, 2, 1, 9):
         comp = compress_like_jasper(stream, level=level)
-        if comp[:2] == _JASPER_ZLIB:
+        if comp[:2] == _JASPER_ZLIB and _flate_proton_safe(comp):
             return comp
+        if comp[:2] == _JASPER_ZLIB:
+            fallback = fallback or comp
     comp = zlib.compress(stream, 6)
     if comp[:2] == _FAKE_ZLIB:
-        for level in (5, 4, 7, 3):
-            comp = zlib.compress(stream, level)
-            if comp[:2] == _JASPER_ZLIB:
-                return comp
-    return comp
+        for level in (5, 4, 7, 3, 2, 1, 8, 9):
+            alt = zlib.compress(stream, level)
+            if alt[:2] == _JASPER_ZLIB and _flate_proton_safe(alt):
+                return alt
+            if alt[:2] == _JASPER_ZLIB:
+                fallback = fallback or alt
+    if _flate_proton_safe(comp):
+        return comp
+    return fallback or comp
 
 
 def _zlib_roundtrip_ok(comp: bytes, stream: bytes) -> bool:
-    if not comp or comp[:2] != _JASPER_ZLIB:
-        return False
-    # Proton sber_v2.streams: body = raw.rstrip(b"\r\n") then zlib.decompress.
-    # If flate ends with CR/LF, rstrip eats payload → STREAM_INTEGRITY_VIOLATION.
-    if comp.endswith((b"\r", b"\n")):
+    if not _flate_proton_safe(comp):
         return False
     try:
-        body = comp.rstrip(b"\r\n")
-        if body != comp:
-            return False
         return zlib.decompress(comp) == stream
+    except Exception:
+        return False
+
+
+_PROTON_STREAM_OBJ_RE = re.compile(
+    rb"(\d+)\s+(\d+)\s+obj(.*?)stream(\r\n|\n|\r)(.*?)endstream",
+    re.S,
+)
+_PROTON_LENGTH_RE = re.compile(rb"/Length\s+(\d+)(?:\s+0\s+R)?")
+_PROTON_FILTER_FLATE = re.compile(rb"/Filter\s*(?:\[\s*)?/FlateDecode")
+
+
+def _pdf_proton_flate_ok(pdf: bytes) -> bool:
+    """Same walk as detector/sber_v2/streams.py — refuse before Telegram."""
+    try:
+        for m in _PROTON_STREAM_OBJ_RE.finditer(pdf):
+            hdr = m.group(3)
+            body = m.group(5).rstrip(b"\r\n")
+            if re.search(rb"/Length\s+\d+\s+0\s+R", hdr):
+                continue
+            lm = _PROTON_LENGTH_RE.search(hdr)
+            if not lm or not _PROTON_FILTER_FLATE.search(hdr) or not body:
+                continue
+            declared = int(lm.group(1))
+            if abs(declared - len(body)) > 2:
+                return False
+            try:
+                zlib.decompress(body)
+            except Exception:
+                return False
+        return True
     except Exception:
         return False
 
@@ -3670,22 +3727,94 @@ def _allocate_uni_gid(
     return out
 
 
-def _uni_gid_for_active(uni_gid: Dict[int, int], active_gids: Set[int]) -> Dict[int, int]:
-    """ToUnicode только для CID из content stream (как T-Bank)."""
-    if not active_gids:
-        return dict(uni_gid)
-    rev = {gid: cp for cp, gid in uni_gid.items()}
+def _sber_known_cid_unicode(gid: int) -> Optional[int]:
+    """Template identity CIDs (0x0242=И …) must map to Cyrillic, never IPA."""
+    try:
+        from sber_stealth_v3 import CID_TO_CHAR
+
+        ch = CID_TO_CHAR.get(int(gid))
+        if ch:
+            return ord(ch)
+    except Exception:
+        pass
+    return None
+
+
+def _sber_lookup_gid_unicode(gid: int, *maps: Optional[Dict[int, int]]) -> Optional[int]:
+    gid = int(gid)
+    for mp in maps:
+        if not mp:
+            continue
+        for cp, g in mp.items():
+            if int(g) == gid:
+                return int(cp)
+    return _sber_known_cid_unicode(gid)
+
+
+def _gid_cp_for_active(
+    uni_gid: Dict[int, int],
+    active_gids: Set[int],
+    fallback: Optional[Dict[int, int]] = None,
+) -> Dict[int, int]:
+    """gid → unicode for every painted CID. IPA-range holes get Cyrillic."""
     out: Dict[int, int] = {}
     for gid in active_gids:
+        gid = int(gid)
         if gid == 0:
             continue
         if gid == 3:
-            out[0x20] = 3
+            out[3] = 0x20
             continue
-        cp = rev.get(gid)
-        if cp is not None:
-            out[cp] = gid
+        cp = _sber_lookup_gid_unicode(gid, uni_gid, fallback)
+        if cp is None:
+            continue
+        if cp == gid and 0x0180 <= gid <= 0x02AF:
+            known = _sber_known_cid_unicode(gid)
+            if known:
+                cp = known
+        out[gid] = int(cp)
     return out
+
+
+def _sber_build_tounicode_gid_map(gid_to_cp: Dict[int, int]) -> bytes:
+    """One bfrange per GID so shell CID 0x0242 and a grafted «И» both exist."""
+    pairs = sorted((int(gid), int(cp)) for gid, cp in gid_to_cp.items() if gid)
+    lines = [f"{len(pairs)} beginbfrange"]
+    for gid, cp in pairs:
+        lines.append(f"<{gid:04x}><{gid:04x}><{cp:04x}>")
+    lines.append("endbfrange")
+    body = "\n".join(lines)
+    cmap = f"""/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo
+<< /Registry (TTX+0)
+/Ordering (T42UV)
+/Supplement 0
+>> def
+/CMapName /TTX+0 def
+/CMapType 2 def
+1 begincodespacerange
+<0000><FFFF>
+endcodespacerange
+{body}
+endcmap
+CMapName currentdict /CMap defineresource pop
+end end
+"""
+    return cmap.encode("latin1")
+
+
+def _uni_gid_for_active(
+    uni_gid: Dict[int, int],
+    active_gids: Set[int],
+    fallback: Optional[Dict[int, int]] = None,
+) -> Dict[int, int]:
+    """ToUnicode для всех CID из content stream, включая template identity."""
+    if not active_gids:
+        return dict(uni_gid)
+    g2c = _gid_cp_for_active(uni_gid, active_gids, fallback=fallback)
+    return {cp: gid for gid, cp in g2c.items()}
 
 
 def _get_font_table(font_bytes: bytes, tag: bytes) -> Optional[bytes]:
@@ -4339,11 +4468,12 @@ def _sfnt_tables_end(font_bytes: bytes) -> int:
     return end
 
 
-def _entropy_fill_sfnt_tail(font_bytes: bytes, n_tail: int) -> bytes:
+def _entropy_fill_sfnt_tail(font_bytes: bytes, n_tail: int, salt: bytes = b"") -> bytes:
     """Replace last n_tail bytes (after tables) with high-entropy pad.
 
     Keeps decoded length identical; raises zlib size after blanking orphans
     emptied glyf (phone HARD needs compressed ~25KB at decoded 55136).
+    ``salt`` retunes flate so the payload never ends with CR/LF (Proton rstrip).
     """
     if n_tail <= 0:
         return font_bytes
@@ -4353,7 +4483,7 @@ def _entropy_fill_sfnt_tail(font_bytes: bytes, n_tail: int) -> bytes:
     if n <= 0:
         return font_bytes
     out = bytearray(font_bytes)
-    seed = hashlib.sha256(font_bytes[:end] + n.to_bytes(4, "big")).digest()
+    seed = hashlib.sha256(font_bytes[:end] + n.to_bytes(4, "big") + salt).digest()
     pad = bytearray()
     block = seed
     while len(pad) < n:
@@ -4484,30 +4614,45 @@ def _compress_font_phone(
     prefer = len(donor_raw) if donor_raw else (
         (_PHONE_FF2_COMP_LO + _PHONE_FF2_COMP_HI) // 2
     )
-    for _ in range(24):
-        mid = (lo_t + hi_t) // 2
-        trial = _entropy_fill_sfnt_tail(font_bytes, mid)
+    def _phone_comp(trial: bytes) -> Optional[bytes]:
         comp = _jasper_compress(trial)
-        if not comp or comp[:2] != _JASPER_ZLIB:
-            comp = zlib.compress(trial, 6)
-        if not comp:
-            break
-        csz = len(comp)
-        if _PHONE_FF2_COMP_LO <= csz <= _PHONE_FF2_COMP_HI:
-            best = (comp, trial)
-            # Refine toward prefer
-            if csz < prefer:
-                lo_t = mid + 1
-            elif csz > prefer:
+        if comp and _flate_proton_safe(comp):
+            return comp
+        for level in (6, 5, 7, 4, 8, 3, 2, 1, 9):
+            alt = zlib.compress(trial, level)
+            if _flate_proton_safe(alt):
+                return alt
+        return None
+
+    for salt_i in range(8):
+        salt = b"" if salt_i == 0 else salt_i.to_bytes(2, "big")
+        lo_t, hi_t = 0, max_tail
+        for _ in range(24):
+            mid = (lo_t + hi_t) // 2
+            trial = _entropy_fill_sfnt_tail(font_bytes, mid, salt)
+            comp = _phone_comp(trial)
+            if not comp:
                 hi_t = mid - 1
+                if lo_t > hi_t:
+                    break
+                continue
+            csz = len(comp)
+            if _PHONE_FF2_COMP_LO <= csz <= _PHONE_FF2_COMP_HI:
+                best = (comp, trial)
+                if csz < prefer:
+                    lo_t = mid + 1
+                elif csz > prefer:
+                    hi_t = mid - 1
+                else:
+                    break
+                continue
+            if csz < _PHONE_FF2_COMP_LO:
+                lo_t = mid + 1
             else:
+                hi_t = mid - 1
+            if lo_t > hi_t:
                 break
-            continue
-        if csz < _PHONE_FF2_COMP_LO:
-            lo_t = mid + 1
-        else:
-            hi_t = mid - 1
-        if lo_t > hi_t:
+        if best:
             break
     if best:
         logger.info(
@@ -4518,15 +4663,29 @@ def _compress_font_phone(
     # Fallback: try exact donor length via classic pad (may exceed dec HARD).
     if donor_raw:
         hit = _compress_font_exact_size(font_bytes, len(donor_raw))
-        if hit and hit[:2] == _JASPER_ZLIB:
+        if hit and _flate_proton_safe(hit):
             decoded = getattr(
                 _compress_font_exact_size, "_last_decoded", font_bytes
             )
             if _PHONE_FF2_COMP_LO <= len(hit) <= _PHONE_FF2_COMP_HI:
                 return hit, decoded
     natural = _jasper_compress(font_bytes)
-    if not natural or natural[:2] != _JASPER_ZLIB:
+    if not natural or not _flate_proton_safe(natural):
+        for salt_i in range(1, 16):
+            trial = _entropy_fill_sfnt_tail(
+                font_bytes, max(64, max_tail // 2), salt_i.to_bytes(2, "big"),
+            )
+            hit = _phone_comp(trial)
+            if hit:
+                logger.warning(
+                    "Sber phone FontFile2 band miss — proton-safe salt=%d comp=%d",
+                    salt_i, len(hit),
+                )
+                return hit, trial
         natural = zlib.compress(font_bytes, 6)
+    if not _flate_proton_safe(natural):
+        logger.error("Sber phone FontFile2 flate not Proton-safe — abort")
+        return None, font_bytes
     logger.warning(
         "Sber phone FontFile2 band miss natural_comp=%d — keep natural",
         len(natural or b""),
@@ -6128,6 +6287,228 @@ def _attach_sber_orphans_as_components(
 
 
 
+_PHONE_CONTOUR_FLOOR = 75
+
+
+def _count_sber_contour_nonempty(ff2: bytes) -> int:
+    """Count loca spans whose glyf header ncont ≠ 0 (Proton-style)."""
+    try:
+        glyf = _get_font_table(ff2, b"glyf") or b""
+        loca = _get_font_table(ff2, b"loca") or b""
+        head = _get_font_table(ff2, b"head") or b""
+        maxp = _get_font_table(ff2, b"maxp") or b""
+        if len(maxp) < 6 or len(head) < 52 or not glyf or not loca:
+            return 0
+        ng = int.from_bytes(maxp[4:6], "big")
+        if int.from_bytes(head[50:52], "big") == 0:
+            offs = [
+                int.from_bytes(loca[i * 2:i * 2 + 2], "big") * 2
+                for i in range(ng + 1)
+            ]
+        else:
+            offs = [
+                int.from_bytes(loca[i * 4:i * 4 + 4], "big")
+                for i in range(ng + 1)
+            ]
+        n = 0
+        for gid in range(ng):
+            a, b = offs[gid], offs[gid + 1]
+            if b - a < 2 or b > len(glyf):
+                continue
+            if int.from_bytes(glyf[a:a + 2], "big", signed=True) != 0:
+                n += 1
+        return n
+    except Exception:
+        return 0
+
+
+def _tiny_one_contour_blob() -> bytes:
+    import struct
+
+    # Valid 1-point simple glyph: flag X_SHORT+Y_SHORT+positive (0x37).
+    blob = struct.pack(">hhhhhHH", 1, 0, 0, 8, 8, 0, 0) + bytes([0x37, 0x08, 0x08])
+    if len(blob) % 2:
+        blob += b"\x00"
+    return blob
+
+
+def _ensure_sber_phone_contour_floor(
+    ff2: bytes, ff2_orig: bytes, keep: Set[int], floor: int = _PHONE_CONTOUR_FLOOR,
+) -> bytes:
+    """sber_internal_jasper: contour-nonempty ≥75 via raw loca insert (no fontTools)."""
+    n = _count_sber_contour_nonempty(ff2)
+    if n >= floor:
+        return ff2
+    try:
+        import struct
+
+        glyf = bytearray(_get_font_table(ff2, b"glyf") or b"")
+        loca = _get_font_table(ff2, b"loca") or b""
+        head = _get_font_table(ff2, b"head") or b""
+        maxp = _get_font_table(ff2, b"maxp") or b""
+        if len(glyf) < 12 or len(loca) < 8 or len(head) < 52 or len(maxp) < 6:
+            return ff2
+        ng = int.from_bytes(maxp[4:6], "big")
+        long_loca = int.from_bytes(head[50:52], "big") == 1
+        if long_loca:
+            offs = [
+                int.from_bytes(loca[i * 4:i * 4 + 4], "big")
+                for i in range(ng + 1)
+            ]
+        else:
+            offs = [
+                int.from_bytes(loca[i * 2:i * 2 + 2], "big") * 2
+                for i in range(ng + 1)
+            ]
+        empty = [
+            gid
+            for gid in range(1, ng)
+            if gid not in keep and offs[gid] == offs[gid + 1]
+        ]
+        if not empty:
+            return ff2
+        need = min(floor - n, 2)
+        extra: list[int] = []
+        tiny = _tiny_one_contour_blob()
+        for gid in reversed(empty):
+            if need <= 0:
+                break
+            a = offs[gid]
+            glyf[a:a] = tiny
+            for i in range(gid + 1, ng + 1):
+                offs[i] += len(tiny)
+            extra.append(gid)
+            need -= 1
+        if long_loca:
+            loca_new = b"".join(int(o).to_bytes(4, "big") for o in offs)
+        else:
+            if any(o % 2 for o in offs):
+                return ff2
+            loca_new = b"".join(int(o // 2).to_bytes(2, "big") for o in offs)
+        out = _replace_font_table_data(ff2, "glyf", bytes(glyf))
+        out = _replace_font_table_data(out, "loca", loca_new)
+        # Hang extras off existing .notdef composite (42 B room).
+        g0 = _get_font_table(out, b"glyf") or b""
+        if extra and len(g0) >= 16 and int.from_bytes(g0[:2], "big", signed=True) == -1:
+            flags0 = int.from_bytes(g0[10:12], "big")
+            host = int.from_bytes(g0[12:14], "big")
+            rec = _sber_composite_glyph_record([host] + extra)
+            if offs[0] == 0 and offs[1] >= len(rec):
+                room = offs[1]
+                padded = rec + b"\x00" * (room - len(rec))
+                g1 = bytearray(g0)
+                g1[:room] = padded[:room]
+                out = _replace_font_table_data(out, "glyf", bytes(g1))
+        try:
+            out = _recalculate_sfnt_checksum_adjustment(out)
+        except Exception:
+            pass
+        logger.info(
+            "Sber phone contour floor raw +%s → nonempty=%d dec=%d",
+            extra, _count_sber_contour_nonempty(out), len(out),
+        )
+        return out
+    except Exception as exc:
+        logger.warning("Sber phone contour floor: %s", exc)
+        return ff2
+
+
+def _count_sber_composites(ff2: bytes) -> int:
+    try:
+        ft = TTFont(BytesIO(ff2))
+        glyf = ft["glyf"]
+        n = sum(
+            1
+            for name in ft.getGlyphOrder()
+            if int(getattr(glyf[name], "numberOfContours", 0) or 0) == -1
+        )
+        ft.close()
+        return n
+    except Exception:
+        return 0
+
+
+def _ensure_sber_phone_composite_floor(
+    ff2: bytes, ff2_orig: bytes, keep: Set[int], floor: int = 14,
+) -> bytes:
+    """sber_internal_jasper: composites always ≥14. Restore unused donor ones."""
+    from copy import deepcopy
+
+    if _count_sber_composites(ff2) >= floor:
+        return ff2
+    try:
+        ft = TTFont(BytesIO(ff2))
+        orig = TTFont(BytesIO(ff2_orig))
+        go = ft.getGlyphOrder()
+        go0 = orig.getGlyphOrder()
+        glyf = ft["glyf"]
+        oglyf = orig["glyf"]
+        restored = 0
+        live = sum(
+            1
+            for name in go
+            if int(getattr(glyf[name], "numberOfContours", 0) or 0) == -1
+        )
+        for gid, name0 in enumerate(go0):
+            if live >= floor:
+                break
+            if gid in keep or gid >= len(go):
+                continue
+            if int(getattr(oglyf[name0], "numberOfContours", 0) or 0) != -1:
+                continue
+            name = go[gid]
+            if int(getattr(glyf[name], "numberOfContours", 0) or 0) == -1:
+                continue
+            glyf[name] = deepcopy(oglyf[name0])
+            if name0 in orig["hmtx"].metrics:
+                ft["hmtx"].metrics[name] = orig["hmtx"].metrics[name0]
+            restored += 1
+            live += 1
+        if live < floor or not restored:
+            ft.close()
+            orig.close()
+            return ff2
+        bio = BytesIO()
+        ft.save(bio)
+        ft.close()
+        orig.close()
+        out = bio.getvalue()
+        logger.info(
+            "Sber phone composite floor: restored %d unused donor composites → %d",
+            restored, _count_sber_composites(out),
+        )
+        return out
+    except Exception as exc:
+        logger.warning("Sber phone composite floor: %s", exc)
+        return ff2
+
+
+def _finalize_sber_phone_jasper_font(
+    ff2: bytes, ff2_orig: bytes, active_gids: Set[int],
+) -> bytes:
+    """Close orphans + keep composite floor for sber_internal_jasper."""
+    keep = set(active_gids) | {0, 3}
+    orph = _sber_orphan_nonempty_gids(ff2, active_gids)
+    if orph:
+        att = _attach_sber_orphans_as_components(ff2, keep, orph)
+        if att != ff2:
+            ff2 = att
+            keep = keep | {0} | set(orph)
+            logger.info("Sber phone attach orphans %s", orph[:8])
+        still = _sber_orphan_nonempty_gids(ff2, active_gids)
+        if still:
+            # Never blank on phone — drops contour-nonempty below 75.
+            att2 = _attach_sber_orphans_as_components(ff2, keep, still)
+            if att2 != ff2:
+                ff2 = att2
+                keep = keep | set(still)
+    ff2 = _ensure_sber_phone_composite_floor(ff2, ff2_orig, keep, 14)
+    ff2 = _ensure_sber_phone_contour_floor(
+        ff2, ff2_orig, keep, _PHONE_CONTOUR_FLOOR,
+    )
+    return ff2
+
+
 def _blank_sber_font_orphans(ff2_orig: bytes, active_gids: Set[int]) -> Tuple[bytes, int]:
     """Content-only / donor-orig: attach orphans into .notdef, else blank."""
     ft = TTFont(BytesIO(ff2_orig))
@@ -7639,6 +8020,7 @@ def _patch_sber_font(
     donor_compressed_len: Optional[int] = None,
     date_center_y: Optional[float] = None,
     date_center_exclusive: bool = False,
+    flatten_painted: bool = True,
 ) -> Tuple[bytes, Dict[int, int], TTFont, Set[int]]:
     from copy import deepcopy
     from fontTools.ttLib.tables._g_l_y_f import Glyph as _TGlyph
@@ -7786,7 +8168,10 @@ def _patch_sber_font(
     # Flattening Tahoma composites changes outline SHA →
     # SBER_STATIC_LABEL_OUTLINE_MISMATCH (exact-profile HARD).
     paint_flat = set(filled_cids) | (set(active_gids) - set(native_cids))
-    _flatten_sber_composites(ft, paint_flat)
+    # Phone / sber_internal_jasper: composites must stay ≥14. Flattening
+    # grafted CIDs drops the floor → K-SBER-SBP-EXACT-PROFILE composite HARD.
+    if flatten_painted:
+        _flatten_sber_composites(ft, paint_flat)
     # Re-assert native outlines after any composite surgery.
     for cid in native_cids:
         if cid >= len(go):
@@ -8061,12 +8446,28 @@ def _prune_sber_font_subset(pdf: bytearray, meta: dict, stream: bytes) -> bytes:
     try:
         subset = tut._parse_subset_tounicode(
             doc.xref_stream(tu_xref).decode("latin1", "replace"))
-        pruned = {subset[cid]: cid for cid in active if cid in subset}
+        pruned_g2c: Dict[int, int] = {}
+        for cid in active:
+            cid = int(cid)
+            if cid == 0:
+                continue
+            if cid == 3:
+                pruned_g2c[3] = 0x20
+                continue
+            if cid in subset:
+                pruned_g2c[cid] = int(subset[cid])
+            else:
+                known = _sber_known_cid_unicode(cid)
+                if known:
+                    pruned_g2c[cid] = known
         if 3 in active:
-            pruned[0x20] = 3
+            pruned_g2c[3] = 0x20
+        pruned = {cp: gid for gid, cp in pruned_g2c.items()}
 
-        if len(pruned) < len(subset):
-            cmap = tut._build_tounicode_cmap(pruned)
+        if len(pruned_g2c) != len(subset) or any(
+            int(c) not in subset for c in active if int(c) not in (0,)
+        ):
+            cmap = _sber_build_tounicode_gid_map(pruned_g2c)
             cs, ce = _find_stream_pos_for_xref(bytes(pdf), tu_xref)
             orig_tu_len = (ce - cs) if cs is not None else None
             new_comp = None
@@ -9052,6 +9453,7 @@ def _build_from_base(
             ),
             date_center_y=None,
             date_center_exclusive=False,
+            flatten_painted=(not phone_style),
         )
         # Fail closed: empty painted CIDs → bars on face (Proton + viewers).
         try:
@@ -9075,7 +9477,7 @@ def _build_from_base(
             logger.warning("Sber face-ink check failed: %s — abort", exc)
             return None
         _lock_outlines = set(native_cids)
-        uni_gid = _uni_gid_for_active(uni_gid, active_gids)
+        uni_gid = _uni_gid_for_active(uni_gid, active_gids, fallback=uni_gid0)
         # Recenter date Tm with FINAL font/cmap (includes grafted month letters).
         if date_y_for_tune is not None and prepared.get("date_time"):
             date_face = re.sub(r"\s+", " ", str(prepared["date_time"]).strip())
@@ -9411,10 +9813,13 @@ def _build_from_base(
                 return None
             font = TTFont(BytesIO(ff2))
 
-        cmap = tut._build_tounicode_cmap(uni_gid)
+        cmap = _sber_build_tounicode_gid_map(
+            _gid_cp_for_active(uni_gid, active_gids, fallback=uni_gid0)
+        )
         w_arr = tut._build_widths_array(font, sorted(active_gids | {3}))
         if phone_style:
             # Prefer atlas compressed band; exact decoded ∈ {55136,55476,56064}.
+            ff2 = _finalize_sber_phone_jasper_font(ff2, ff2_orig, active_gids)
             if prepared.get("date_time"):
                 ff2 = _micro_tune_date_center_font(
                     ff2, stream, uni_gid, PHONE_DATE_Y,
@@ -9825,6 +10230,9 @@ def _build_from_base(
                     result = _pad_pdf_to_exact_size(result, len(before))
                 except Exception:
                     pass
+    if not _pdf_proton_flate_ok(result):
+        logger.error("Sber dynamic: Proton flate walk fail — abort")
+        return None
     return result
 
 

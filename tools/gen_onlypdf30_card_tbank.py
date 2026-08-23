@@ -23,8 +23,8 @@ from onlypdf_gate import generate_onlypdf_batch  # noqa: E402
 from onlypdf_safe_names import (  # noqa: E402
     CYR_NO_YO_TVERD,
     coverage_report,
-    pick_receiver_short,
-    pick_sender_pair,
+    pick_hard_tbank_pair,
+    pick_hard_tbank_recv,
 )
 from tbank_card_tbank_stealth import create_tbank_card_tbank_stealth  # noqa: E402
 import fitz  # noqa: E402
@@ -87,13 +87,12 @@ def _payload(i: int, attempt: int = 0) -> dict:
 
     d = pool[(i + attempt) % len(pool)]
     ss = (d["ss"] + 1 + attempt + i) % 60
-    sender = d["sender"] if len(d["sender"]) >= 6 else (
-        f"{pick_sender_pair(i, attempt)[0]} {pick_sender_pair(i, attempt)[1]}"
-    )
-    receiver = d["receiver"] if d["receiver"] else pick_receiver_short(i, attempt)
+    first, last = pick_hard_tbank_pair(i, attempt)
+    sender = f"{first} {last}"
+    receiver = pick_hard_tbank_recv(i, attempt)
     return {
         "date_time": f"{d['day']}, {d['hh']:02d}:{d['mm']:02d}:{ss:02d}",
-        "amount": str(int(d["digs"])),
+        "amount": str(int(d["digs"]) + (i * 13 + attempt) % 80),
         "sender": sender,
         "receiver": receiver,
         "card": d["card"],

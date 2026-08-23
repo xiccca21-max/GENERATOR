@@ -1,0 +1,32 @@
+---
+description: Live @bankpdfbot PASS aa52508b — 15.08 Ozon (Ozon) Alfa SBP; do not clone this identity.
+alwaysApply: true
+---
+
+# Alfa SBP live PASS aa52508b (K-ALFA-SBP-PASS-AA52)
+
+Live `@bankpdfbot` ✅ 15.08.2026 (not cache):
+`docs/specimen_alfa_sbp_PASS_aa52508bcd6e2b7e.pdf` (58896, SHA `aa52508bcd6e2b7e…`).
+
+```text
+date:     15.08.2026 16:08:41 мск (not send-time)
+amount:   14280
+receiver: Полина Игоревна Н
+bank:     Озон Банк (Ozon)
+phone:    +7 (921) 456-18-03
+account:  40817810804245819074 ledger 042
+op:       C161508261506374
+sbp:      B6227130836691600G10120011830701
+```
+
+Profile taken from genuine 15.08 orig `Документ (6).pdf` / `templates/alfa_corpus/document15.08.26_late.pdf`
+(Алина Александровна А — **ЧС** on the checker, live ❌; layout still orig).
+Do **not** clone Alina’s phone `9274890391` / FIO / op / SBP / account.
+
+Ozon on/after 15.08.2026: face `Озон Банк (Ozon)`, route `G10120011830701`.
+Before 15.08: keep `B10130011790502` (Elena PASS 0433).
+
+## Next file law
+
+Change **one** internal axis only. Do not clone this identity.
+Do not retarget face+date+bank together.

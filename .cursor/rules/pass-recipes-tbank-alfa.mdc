@@ -7,6 +7,9 @@ alwaysApply: true
 
 **Full from-zero playbook:** `docs/PASS_RECIPES_TBANK_SBP_AND_ALFA_SBP.md`
 
+**Alfa SBP live discipline on every T-Bank method** (one-axis probes, NEG byte-diff, no PASS clone, no soft-ship over HARD) — without removing T-Bank recipes below:
+`.cursor/rules/tbank-all-from-alfa-sbp-discipline.mdc`
+
 Specimens (passed Proton + external / competitor validators):
 
 | Channel | File | Size | SHA-256 prefix |
@@ -15,6 +18,16 @@ Specimens (passed Proton + external / competitor validators):
 | Alfa SBP | `docs/specimen_alfa_sbp_155113.pdf` | 58873 | `c80160c30964b9f4…` |
 
 Face of T‑Bank specimen: `21.04.2026  20:54:15` / `93934` / `Харитон Хромов` → `Цвета Ц.` / `+7 (315) 697-20-48` / Сбербанк / Keywords `… \| 991`.
+
+## T‑Bank — all methods (generators)
+
+| Method | Generator only |
+|--------|----------------|
+| SBP | `create_tbank_sbp_stealth` |
+| Phone | `create_tbank_phone_stealth` |
+| Card (T-Bank) | `create_tbank_card_tbank_stealth` |
+| Nocomm | `create_tbank_nocomm_stealth` |
+| Statement | `create_tbank_statement_stealth` |
 
 ## T‑Bank SBP — invariants
 
@@ -34,5 +47,12 @@ Face of T‑Bank specimen: `21.04.2026  20:54:15` / `93934` / `Харитон Х
 - Generator: **only** `create_alfa_sbp_stealth`
 - Lean Oracle shell ~58–59 KB (≤59087); Producer `Oracle BI Publisher 12.2.1.4.0`
 - LEFT anchors **`35.45` / `304.75`**; trailing pad only; no soft-remap face glyphs
+- **ПСБ** SBP-id: lead **`B`** + tail `G10170011770101` (orig `альфа сбп.pdf`). Never G-lead. Prefer that shell; decoded CS must not be **5111** or **5115** (see `alfa-sbp-psb-route`)
+- FontFile2 **aligned SFNT end** (live PASS `fcb58008` 21446 aligned; NEG 3a was unaligned)
+- Live `@bankpdfbot` ✅ (direct, not OnlyPDF cache): `docs/specimen_alfa_sbp_PASS_fcb58008e0828734.pdf` — 16.08 **send-time** Т-Банк, `B10130011821301` (see `alfa-sbp-pass-fcb5`). Do **not** clone that identity.
+- Live `@bankpdfbot` ✅ (direct): `docs/specimen_alfa_sbp_PASS_9faac125e7171328.pdf` — 16.08 send-time Т-Банк `Галина Ивановна Б` (see `alfa-sbp-pass-9faa`). Same 916+042 recipe is **not** enough (g05/g06 ❌). Do **not** clone that identity.
+- Live `@bankpdfbot` ✅ (direct): `docs/specimen_alfa_sbp_PASS_3633ea4f65032e87.pdf` — 16.08 send-time Т-Банк `Гавриил Сергеевич Т` (see `alfa-sbp-pass-3633`). `document10.08.26.pdf` is now ❌ cache on this checker — do not use that SHA as proof the shell is live-green.
+- Live `@bankpdfbot` ✅ (direct): `docs/specimen_alfa_sbp_PASS_98a2864dfae0d8f1.pdf` — 16.08 send-time Wildberries `Вера Геннадьевна Г` ~60 KB (see `alfa-sbp-pass-98a2`). Next WB SHA on the same chat ❌. Do **not** clone that identity.
+- Negative live ❌: `docs/specimen_alfa_sbp_NEG_3a24266b.pdf` — op/SBP/FO/CSA were already green; do **not** retune identifiers or faces from that FAIL (see `alfa-sbp-3a-neg`)
 
 When fixing FAKE on these channels: match the doc + specimen metrics first — do not invent a third layout or soft-ship over HARD.

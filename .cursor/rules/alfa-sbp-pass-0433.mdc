@@ -1,0 +1,37 @@
+---
+description: Live @bankpdfbot PASS 0433b3a6 — freeze this Alfa SBP path; next probe changes one internal axis only.
+alwaysApply: true
+---
+
+# Alfa SBP live PASS 0433b3a6 (K-ALFA-SBP-PASS-0433)
+
+Live `@bankpdfbot` ✅ 15.08.2026 15:47, **not cache**:
+`docs/specimen_alfa_sbp_PASS_0433b3a63e01afc6.pdf` (58494, SHA `0433b3a63e01afc6…`).
+
+```text
+date:     30.07.2026 18:12:44 мск   (not "now")
+amount:   36110
+receiver: Елена Павловна Р
+bank:     Озон Банк
+phone:    +7 (920) 633-18-52
+account:  40817810416059944688   ledger 160
+op:       C163007261686546
+sbp:      B6211151241382380B10130011790502
+prefix:   EHPPTR
+FF2:      21300 == aligned end, sha16 ecdd4e7245e357d3
+```
+
+Oracle wrap green: FO 1..N, extra `{0}`, SFNT Oracle, CSA pin, Java 6/6, unique prefix.
+
+## What this PASS isolates vs today's ❌
+
+- Date is **not** send-time. 30.07 vs 15.08 send.
+- Recipient bank **Озон**, route `B10130011790502`.
+- Same chat still ❌ T-Bank gens dated 10.08 / 11.08 / 19.05 / 29.06 / 13.06.
+
+T6 (01.08 Ozon, Денис, 80980) was ❌ — do not treat “any Ozon” as sufficient.
+
+## Next file law
+
+Change **one** internal axis only. Do not retarget face+date+bank together.
+Do not spam. Do not clone this identity.

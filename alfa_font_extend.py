@@ -5,6 +5,7 @@ import hashlib
 import logging
 import os
 import re
+import struct
 import sys
 import tempfile
 import zlib
@@ -85,7 +86,256 @@ def _label_cids(
     return keep
 
 
-def _save_oracle_ttf(font: TTFont, template: Optional[TTFont] = None) -> bytes:
+def _pin_head_checksum_adjustment(ttf: bytes, csa: int) -> bytes:
+    """Oracle keeps source Tahoma checkSumAdjustment on every subset.
+
+    fontTools.save() recalculates it — HARD ALFA_ORACLE_TTF_HEAD_MECHANICS_CONFLICT
+    and the bankpdf reassembly tell.
+    """
+    if len(ttf) < 28:
+        return ttf
+    n = struct.unpack(">H", ttf[4:6])[0]
+    buf = bytearray(ttf)
+    packed = struct.pack(">I", int(csa) & 0xFFFFFFFF)
+    for i in range(n):
+        rec = 12 + i * 16
+        if rec + 16 > len(buf):
+            break
+        if bytes(buf[rec:rec + 4]) != b"head":
+            continue
+        off = struct.unpack(">I", buf[rec + 8:rec + 12])[0]
+        if off + 12 <= len(buf):
+            buf[off + 8:off + 12] = packed
+        break
+    return bytes(buf)
+
+
+def _head_table_offset(ttf: bytes) -> Optional[int]:
+    if len(ttf) < 28:
+        return None
+    n = struct.unpack(">H", ttf[4:6])[0]
+    for i in range(n):
+        rec = 12 + i * 16
+        if rec + 16 > len(ttf):
+            break
+        if ttf[rec:rec + 4] == b"head":
+            off = struct.unpack(">I", ttf[rec + 8:rec + 12])[0]
+            if off + 12 <= len(ttf):
+                return off
+            return None
+    return None
+
+
+def _ot_recalc_checksum_adjustment(ttf: bytes) -> bytes:
+    """OpenType formula: checkSumAdjustment = 0xB1B0AFBA - sum32(font).
+
+    bankpdf HARD when this does not match (streak_08 adj=1234120242).
+    Call after any TTF pad/mutation. Do NOT pin Alfa canon 1757709444.
+    """
+    off = _head_table_offset(ttf)
+    if off is None:
+        return ttf
+    buf = bytearray(ttf)
+    buf[off + 8:off + 12] = b"\x00\x00\x00\x00"
+    padded = bytes(buf)
+    if len(padded) % 4:
+        padded = padded + b"\x00" * (4 - (len(padded) % 4))
+    total = 0
+    for i in range(0, len(padded), 4):
+        total = (total + struct.unpack(">I", padded[i:i + 4])[0]) & 0xFFFFFFFF
+    adj = (0xB1B0AFBA - total) & 0xFFFFFFFF
+    buf[off + 8:off + 12] = struct.pack(">I", adj)
+    return bytes(buf)
+
+
+def _ot_checksum_matches(ttf: bytes) -> bool:
+    off = _head_table_offset(ttf)
+    if off is None:
+        return False
+    got = struct.unpack(">I", ttf[off + 8:off + 12])[0]
+    # Oracle-native emit pins corpus CSA; other paths use OpenType formula.
+    if got == 1757709444:
+        return True
+    want = struct.unpack(
+        ">I", _ot_recalc_checksum_adjustment(ttf)[off + 8:off + 12],
+    )[0]
+    return got == want
+
+
+def uniquify_alfa_ff2_ot_valid(pdf: bytes) -> Optional[bytes]:
+    """Unique FontFile2 without touching used outlines.
+
+    Unused hmtx +1 → fontTools save → OpenType CSA. Atlas of painted glyphs
+    stays; bankpdf caches exact FF2 bytes so a PASS font cannot be reused.
+    """
+    import secrets
+
+    refs = _load_font_xrefs_from_bytes(pdf)
+    if not refs:
+        return None
+    ff2 = _ff2_read_decompressed(pdf, refs["ff2"])
+    if not ff2:
+        return None
+    ctx = AlfaOrigContext()
+    if not ctx.load_bytes(pdf):
+        return None
+    used = _collect_alfa_used_cids(bytes(ctx.stream)) | _label_cids(ctx)
+    ft = TTFont(BytesIO(ff2))
+    template = TTFont(BytesIO(ff2))
+    go = ft.getGlyphOrder()
+    cands = [i for i in range(1, len(go)) if i not in used]
+    if not cands:
+        return None
+    pick = cands[int.from_bytes(secrets.token_bytes(2), "big") % len(cands)]
+    name = go[pick]
+    aw, lsb = ft["hmtx"].metrics[name]
+    ft["hmtx"].metrics[name] = (int(aw) + 1, int(lsb))
+    new_ff2 = _ot_recalc_checksum_adjustment(_save_oracle_ttf(ft, template))
+    if not _ot_checksum_matches(new_ff2):
+        logger.warning("Alfa uniquify: OT checksum still mismatch")
+        return None
+    if hashlib.sha256(new_ff2).digest() == hashlib.sha256(ff2).digest():
+        return None
+    out = bytearray(pdf)
+    if not _patch_ff2_decompressed(out, refs["ff2"], new_ff2):
+        return None
+    landed_refs = _load_font_xrefs_from_bytes(bytes(out)) or refs
+    landed = _ff2_read_decompressed(bytes(out), landed_refs["ff2"])
+    if not landed or not _ot_checksum_matches(landed):
+        logger.warning("Alfa uniquify: landed FF2 OT checksum fail")
+        return None
+    logger.info(
+        "Alfa uniquify unused hmtx cid=%d aw=%d→%d ff2 %s→%s",
+        pick, int(aw), int(aw) + 1,
+        hashlib.sha256(ff2).hexdigest()[:16],
+        hashlib.sha256(landed).hexdigest()[:16],
+    )
+    return bytes(out)
+
+
+def _repack_sfnt_split(
+    font_bytes: bytes,
+    dir_order: list,
+    phys_order: list,
+    *,
+    pad_glyf: bool = False,
+) -> bytes:
+    """Directory tags in dir_order; payloads laid out in phys_order.
+
+    Offsets are rewritten. Tables stay 4-byte zero-padded except glyf when
+    pad_glyf is False: Oracle packs the next table immediately after glyf even
+    when len(glyf) % 4 == 2. Directory checksums of table bodies are unchanged.
+    """
+    import math
+    import struct
+
+    data = font_bytes
+    if len(data) < 12:
+        return font_bytes
+    sfnt_version = data[0:4]
+    num_tables = struct.unpack(">H", data[4:6])[0]
+    tables: dict = {}
+    for i in range(num_tables):
+        e = 12 + i * 16
+        tag_str = data[e:e + 4].decode("latin-1")
+        checksum = struct.unpack(">I", data[e + 4:e + 8])[0]
+        tbl_off = struct.unpack(">I", data[e + 8:e + 12])[0]
+        tbl_len = struct.unpack(">I", data[e + 12:e + 16])[0]
+        tables[tag_str] = {
+            "checksum": checksum,
+            "data": data[tbl_off:tbl_off + tbl_len],
+        }
+
+    def _merge(preferred: list) -> list:
+        order = [t for t in preferred if t in tables]
+        for t in tables:
+            if t not in order:
+                order.append(t)
+        return order
+
+    dir_tags = _merge(dir_order)
+    phys_tags = _merge(phys_order)
+    n = len(dir_tags)
+    entry_selector = int(math.log2(n)) if n > 0 else 0
+    search_range = (2 ** entry_selector) * 16
+    range_shift = n * 16 - search_range
+    header = sfnt_version + struct.pack(
+        ">HHHH", n, search_range, entry_selector, range_shift,
+    )
+
+    data_start = 12 + n * 16
+    current_off = data_start
+    phys_info = {}
+    body = b""
+    for tag_str in phys_tags:
+        tbl = tables[tag_str]
+        tbl_bytes = tbl["data"]
+        if tag_str == "glyf" and not pad_glyf:
+            pad = b""
+        else:
+            pad = b"\x00" * ((4 - (len(tbl_bytes) % 4)) % 4)
+        phys_info[tag_str] = (current_off, len(tbl_bytes), tbl["checksum"])
+        body += tbl_bytes + pad
+        current_off += len(tbl_bytes) + len(pad)
+
+    directory = b""
+    for tag_str in dir_tags:
+        off, length, checksum = phys_info[tag_str]
+        directory += tag_str.encode("latin-1") + struct.pack(">III", checksum, off, length)
+    return header + directory + body
+
+
+def _ot_table_checksum(table_bytes: bytes) -> int:
+    padded = table_bytes + b"\x00" * ((-len(table_bytes)) % 4)
+    total = 0
+    for i in range(0, len(padded), 4):
+        total = (total + struct.unpack(">I", padded[i:i + 4])[0]) & 0xFFFFFFFF
+    return total
+
+
+def _finalize_sfnt_checksums(ttf: bytes) -> bytes:
+    """Rewrite directory table checksums (head CSA=0), then pin Oracle CSA.
+
+    Does not apply the textbook whole-SFNT formula.
+    """
+    if len(ttf) < 12:
+        return ttf
+    n = struct.unpack(">H", ttf[4:6])[0]
+    buf = bytearray(ttf)
+    for i in range(n):
+        e = 12 + i * 16
+        tag = bytes(buf[e:e + 4])
+        off = struct.unpack(">I", buf[e + 8:e + 12])[0]
+        ln = struct.unpack(">I", buf[e + 12:e + 16])[0]
+        body = bytes(buf[off:off + ln])
+        if tag == b"head" and len(body) >= 12:
+            body = bytearray(body)
+            body[8:12] = b"\x00\x00\x00\x00"
+            body = bytes(body)
+        buf[e + 4:e + 8] = struct.pack(">I", _ot_table_checksum(body))
+    return _pin_head_checksum_adjustment(bytes(buf), 1757709444)
+
+
+def _sfnt_physical_tags(ttf: bytes) -> list:
+    n = struct.unpack(">H", ttf[4:6])[0]
+    recs = []
+    for i in range(n):
+        rec = 12 + i * 16
+        tag = ttf[rec:rec + 4].decode("latin-1")
+        off = struct.unpack(">I", ttf[rec + 8:rec + 12])[0]
+        recs.append((off, i, tag))
+    recs.sort()
+    return [t for _off, _i, t in recs]
+
+
+def _save_oracle_ttf(
+    font: TTFont,
+    template: Optional[TTFont] = None,
+    *,
+    oracle_native: bool = False,
+    competitor_repack: bool = False,
+    keep_cmap: bool = False,
+) -> bytes:
     """fontTools.save; preserve Oracle head flags + Alfa created/modified epochs.
 
     fontTools defaults break Proton HARD checks:
@@ -94,11 +344,25 @@ def _save_oracle_ttf(font: TTFont, template: Optional[TTFont] = None) -> bytes:
       - recalcBBoxes=True → head xMin.. drift vs frozen /FontBBox
     Oracle Alfa F1 requires flags=27, indexToLocFormat=1, and
     created=2931866140 ⇒ modified=3170332026.
+
+    oracle_native=True: directory and payloads in Oracle order
+    cvt,fpgm,glyf,head,hhea,hmtx,loca,maxp,prep; pin CSA 1757709444.
+    Each glyf record is padded to even length (Oracle loca); maxp/hhea
+    capacity fields are copied from the live shell, not recalculated.
+    competitor_repack=True: head,hhea,maxp,hmtx,fpgm,prep,cvt,loca,glyf
+    + textbook checkSumAdjustment. Native path is unchanged.
     """
     import array
+    import sys as _sys
 
     _ALFA_CREATED = 2931866140
     _ALFA_MODIFIED = 3170332026
+    _ORACLE_DIR_ORDER = [
+        "cvt ", "fpgm", "glyf", "head", "hhea", "hmtx", "loca", "maxp", "prep",
+    ]
+    _COMPETITOR_PHYS = [
+        "head", "hhea", "maxp", "hmtx", "fpgm", "prep", "cvt ", "loca", "glyf",
+    ]
     font.recalcTimestamp = False
     font.recalcBBoxes = False
     font["head"].flags = 27
@@ -111,15 +375,62 @@ def _save_oracle_ttf(font: TTFont, template: Optional[TTFont] = None) -> bytes:
         for attr in ("xMin", "yMin", "xMax", "yMax"):
             if hasattr(th, attr):
                 setattr(font["head"], attr, int(getattr(th, attr)))
+        if oracle_native and "maxp" in template and "maxp" in font:
+            num = int(font["maxp"].numGlyphs)
+            for attr in (
+                "maxPoints", "maxContours", "maxCompositePoints",
+                "maxCompositeContours", "maxZones", "maxTwilightPoints",
+                "maxStorage", "maxFunctionDefs", "maxInstructionDefs",
+                "maxStackElements", "maxSizeOfInstructions",
+                "maxComponentElements", "maxComponentDepth",
+            ):
+                if hasattr(template["maxp"], attr):
+                    setattr(font["maxp"], attr, int(getattr(template["maxp"], attr)))
+            font["maxp"].numGlyphs = num
+        if oracle_native and "hhea" in template and "hhea" in font:
+            for attr in (
+                "ascent", "descent", "lineGap", "advanceWidthMax",
+                "minLeftSideBearing", "minRightSideBearing", "xMaxExtent",
+                "caretSlopeRise", "caretSlopeRun", "caretOffset",
+            ):
+                if hasattr(template["hhea"], attr):
+                    setattr(font["hhea"], attr, int(getattr(template["hhea"], attr)))
     created = int(getattr(font["head"], "created", 0) or 0)
     if created == _ALFA_CREATED:
         font["head"].created = _ALFA_CREATED
         font["head"].modified = _ALFA_MODIFIED
     font["head"].indexToLocFormat = 1
+    if (oracle_native or competitor_repack) and "hhea" in font and "maxp" in font:
+        font["hhea"].numberOfHMetrics = int(font["maxp"].numGlyphs)
+
+    if oracle_native:
+        order = [t for t in _ORACLE_DIR_ORDER if t in font]
+        if keep_cmap and "cmap" in font and "cmap" not in order:
+            order.append("cmap")
+        for tag in list(font.keys()):
+            if tag not in order and tag not in ("GlyphOrder",):
+                if tag == "cmap" and keep_cmap:
+                    continue
+                if tag not in _ORACLE_DIR_ORDER:
+                    try:
+                        del font[tag]
+                    except Exception:
+                        pass
+        font.tableOrder = [t for t in order if t in font]
+    elif competitor_repack:
+        for tag in list(font.keys()):
+            if tag not in _COMPETITOR_PHYS and tag not in ("GlyphOrder",):
+                try:
+                    del font[tag]
+                except Exception:
+                    pass
+        font.tableOrder = [t for t in _COMPETITOR_PHYS if t in font]
 
     # Force long loca (Oracle indexToLocFormat=1) — default compile picks short.
     loca = font["loca"]
     _orig_compile = loca.compile
+    hmtx = font["hmtx"]
+    _orig_hmtx = hmtx.compile
 
     def _compile_long(ttFont):
         try:
@@ -128,17 +439,57 @@ def _save_oracle_ttf(font: TTFont, template: Optional[TTFont] = None) -> bytes:
             loca.set([])
             locations = array.array("I", loca.locations)
         ttFont["head"].indexToLocFormat = 1
-        if sys.byteorder != "big":
+        if _sys.byteorder != "big":
             locations.byteswap()
         return locations.tobytes()
 
+    def _compile_full_hmtx(ttFont):
+        metrics = hmtx.metrics
+        chunks = []
+        for name in ttFont.getGlyphOrder():
+            aw, lsb = metrics[name]
+            chunks.append(struct.pack(">Hh", int(aw) & 0xFFFF, int(lsb)))
+        return b"".join(chunks)
+
     loca.compile = _compile_long  # type: ignore[method-assign]
+    hmtx.compile = _compile_full_hmtx  # type: ignore[method-assign]
+    _glyph_compile = None
+    if oracle_native:
+        from fontTools.ttLib.tables._g_l_y_f import Glyph as _Glyph
+
+        _glyph_compile = _Glyph.compile
+
+        def _compile_even(self, *args, **kwargs):
+            data = _glyph_compile(self, *args, **kwargs)
+            if data and len(data) % 2:
+                data += b"\x00"
+            return data
+
+        _Glyph.compile = _compile_even  # type: ignore[method-assign]
     try:
         out = BytesIO()
         font.save(out)
-        return out.getvalue()
+        raw = out.getvalue()
+        if oracle_native:
+            raw = _repack_sfnt_split(
+                raw, list(font.tableOrder), list(font.tableOrder),
+                pad_glyf=False,
+            )
+            return _finalize_sfnt_checksums(raw)
+        if competitor_repack:
+            raw = _repack_sfnt_split(
+                raw, list(_COMPETITOR_PHYS), list(_COMPETITOR_PHYS),
+                pad_glyf=True,
+            )
+            return _ot_recalc_checksum_adjustment(raw)
+        return _ot_recalc_checksum_adjustment(raw)
     finally:
         loca.compile = _orig_compile  # type: ignore[method-assign]
+        hmtx.compile = _orig_hmtx  # type: ignore[method-assign]
+        if _glyph_compile is not None:
+            from fontTools.ttLib.tables._g_l_y_f import Glyph as _Glyph
+
+            _Glyph.compile = _glyph_compile  # type: ignore[method-assign]
 
 
 def _head_pdf_bbox(tt: TTFont) -> Tuple[int, int, int, int]:
@@ -426,6 +777,7 @@ def _patch_tu_decompressed(pdf: bytearray, tu_xref: int, new_tu: bytes) -> bool:
         return True
     patched = _patch_length_and_rebuild(pdf, cs, ce, compressed)
     if patched is None:
+        logger.warning("Alfa ToUnicode: exact flate miss — skip xref rebuild")
         return False
     pdf[:] = patched
     return True
@@ -464,23 +816,46 @@ def _glyphs_ok_for_text(
     return (len(bad) == 0, bad)
 
 
-def _patch_ff2_decompressed(pdf: bytearray, ff2_xref: int, new_ttf: bytes) -> bool:
-    from alfa_orig_mode import _unreproducible_flate
+def _ff2_java_exact(ttf: bytes, orig_len: int, level: int) -> Optional[Tuple[bytes, bytes]]:
+    """Use the natural SFNT only; never append bytes to match donor /Length."""
+    from alfa_orig_mode import _oracle_near_flate
 
+    ttf_csa = _ot_recalc_checksum_adjustment(ttf)
+    comp = _oracle_near_flate(ttf_csa, level)
+    if len(comp) == orig_len:
+        return comp, ttf_csa
+    return None
+
+
+def _patch_ff2_decompressed(pdf: bytearray, ff2_xref: int, new_ttf: bytes) -> bool:
+    from alfa_emit import sfnt_has_exact_aligned_end
+
+    if not sfnt_has_exact_aligned_end(new_ttf):
+        logger.warning("Alfa FF2: bytes found after aligned final SFNT table")
+        return False
     pos = _find_stream_pos_for_xref(bytes(pdf), ff2_xref)
     if not pos:
         return False
     cs, ce = pos
     level = _zlib_level_from_header(bytes(pdf)[cs : cs + 2])
-    # Не zlib.compress: иначе content/font «canonical», image — нет → MIXED_ZLIB.
+    orig_len = ce - cs
+    hit = _ff2_java_exact(new_ttf, orig_len, level)
+    if hit:
+        compressed, used_ttf = hit
+        pdf[cs:ce] = compressed
+        return _patch_fontfile2_length1(pdf, ff2_xref, len(used_ttf))
+    from alfa_orig_mode import _unreproducible_flate
+
     compressed = _unreproducible_flate(new_ttf, level)
+    if len(compressed) == orig_len:
+        pdf[cs:ce] = compressed
+        return _patch_fontfile2_length1(pdf, ff2_xref, len(new_ttf))
     patched = _patch_length_and_rebuild(pdf, cs, ce, compressed)
     if patched is None:
+        logger.warning("Alfa FF2: cannot land new subset without broken xref")
         return False
     pdf[:] = patched
-    # /Length1 должен = len(decoded TTF)
-    ok_len = _patch_fontfile2_length1(pdf, ff2_xref, len(new_ttf))
-    return ok_len
+    return _patch_fontfile2_length1(pdf, ff2_xref, len(new_ttf))
 
 
 def _patch_fontfile2_length1(pdf: bytearray, ff2_xref: int, length1: int) -> bool:
@@ -544,6 +919,8 @@ def _find_font_donor(paths: List[str], text: str) -> Optional[str]:
 
 def _find_donor_for_char(paths: List[str], ch: str) -> Optional[str]:
     for path in paths:
+        if "unlocked" in os.path.basename(path).lower():
+            continue
         ctx = AlfaOrigContext()
         if not ctx.load(path):
             continue
@@ -657,6 +1034,92 @@ def _set_bfchar_unicode(tu_bytes: bytes, cid: int, cp: int) -> Optional[bytes]:
         repl = newu if len(newu) >= len(old) else newu.rjust(len(old), "0")
         out = out[: m.start(2)] + repl + out[m.end(2) :]
     return out.encode("latin1")
+
+
+def _rebind_bfchar_inplace(
+    tu_bytes: bytes, old_cid: int, new_cid: int, new_cp: int,
+) -> Optional[bytes]:
+    """Same-length CMap rewrite: <old> <uni> → <new> <uni'>. No beginbfchar grow."""
+    text = tu_bytes.decode("latin1", "replace")
+    pat = re.compile(rf"<({old_cid:04X})>([ \t]+)<([0-9A-Fa-f]+)>")
+    m = pat.search(text)
+    if not m:
+        return None
+    old_uni = m.group(3)
+    new_uni = f"{new_cp:04X}"
+    if len(new_uni) != len(old_uni):
+        new_uni = new_uni.rjust(len(old_uni), "0")[-len(old_uni):]
+    repl = f"<{new_cid:04X}>{m.group(2)}<{new_uni}>"
+    if len(repl) != (m.end() - m.start()):
+        return None
+    out = text[: m.start()] + repl + text[m.end() :]
+    return out.encode("latin1")
+
+
+def _sfnt_table_off(ttf: bytes, tag: bytes) -> Optional[int]:
+    if len(ttf) < 12:
+        return None
+    n = struct.unpack(">H", ttf[4:6])[0]
+    for i in range(n):
+        rec = 12 + i * 16
+        if rec + 16 > len(ttf):
+            break
+        if ttf[rec:rec + 4] == tag:
+            return struct.unpack(">I", ttf[rec + 8:rec + 12])[0]
+    return None
+
+
+def _inject_glyf_raw_inplace(
+    ttf: bytes, dst_cid: int, simple, aw: int, lsb: int,
+) -> Optional[bytes]:
+    """Overwrite an existing glyf slot. Same TTF length — no fontTools.save."""
+    ft = TTFont(BytesIO(ttf))
+    go = list(ft.getGlyphOrder())
+    if dst_cid < 0 or dst_cid >= len(go):
+        return None
+    try:
+        from fontTools.ttLib.tables.ttProgram import Program
+
+        prog = Program()
+        prog.fromBytecode(b"")
+        simple.program = prog
+        payload = simple.compile(ft)
+    except Exception:
+        return None
+    locs = list(ft["loca"].locations)
+    slot = locs[dst_cid + 1] - locs[dst_cid]
+    if len(payload) > slot:
+        return None
+    glyf_off = _sfnt_table_off(ttf, b"glyf")
+    hmtx_off = _sfnt_table_off(ttf, b"hmtx")
+    if glyf_off is None or hmtx_off is None:
+        return None
+    buf = bytearray(ttf)
+    start = glyf_off + locs[dst_cid]
+    buf[start:start + slot] = payload + (b"\x00" * (slot - len(payload)))
+    lsb_i = max(-32767, min(32767, int(lsb)))
+    aw_i = max(0, int(aw)) & 0xFFFF
+    hm = hmtx_off + dst_cid * 4
+    if hm + 4 <= len(buf):
+        buf[hm:hm + 4] = struct.pack(">Hh", aw_i, lsb_i)
+    return bytes(buf)
+
+
+def _largest_unused_glyf_cid(
+    ctx: AlfaOrigContext, ttf: bytes, need_bytes: int, reserved: Set[int],
+) -> Optional[int]:
+    ft = TTFont(BytesIO(ttf))
+    locs = list(ft["loca"].locations)
+    best = None
+    best_sz = 10**9
+    for cid in range(1, len(locs) - 1):
+        if cid in reserved:
+            continue
+        sz = locs[cid + 1] - locs[cid]
+        if sz >= need_bytes and sz < best_sz:
+            best = cid
+            best_sz = sz
+    return best
 
 
 def _component_cids(ff2: bytes) -> Set[int]:
@@ -787,6 +1250,34 @@ def _copy_glyf_slot(dst_ff2: bytes, src_ff2: bytes, src_cid: int, dst_cid: int) 
     return _save_oracle_ttf(dst, template)
 
 
+def append_alfa_orphan_clone(base_path: str, src_cid: int = 62) -> Optional[str]:
+    """maxp+1: duplicate an already-present unused glyf. No ToUnicode change.
+
+    Unique FontFile2 without permuting unused slots: clone orphan CID 62–76.
+    """
+    refs = _load_font_xrefs(base_path)
+    if not refs:
+        return None
+    with open(base_path, "rb") as fh:
+        pdf = bytearray(fh.read())
+    ff2 = _ff2_read_decompressed(bytes(pdf), refs["ff2"])
+    ft = TTFont(BytesIO(ff2))
+    n = len(ft.getGlyphOrder())
+    if src_cid < 1 or src_cid >= n or n >= 220:
+        return None
+    new_ff2 = _copy_glyf_slot(ff2, ff2, src_cid, n)
+    if not new_ff2:
+        return None
+    if not _patch_ff2_decompressed(pdf, refs["ff2"], new_ff2):
+        return None
+    fd, out = tempfile.mkstemp(suffix=".pdf", prefix="alfa_font_orph_")
+    os.close(fd)
+    with open(out, "wb") as fh:
+        fh.write(bytes(pdf))
+    logger.info("Alfa orphan clone cid=%d -> cid=%d n=%d", src_cid, n, n + 1)
+    return out
+
+
 def _alloc_cid(
     ctx: AlfaOrigContext,
     ff2: bytes,
@@ -794,30 +1285,61 @@ def _alloc_cid(
     *,
     seed: bytes = b"",
     extra_reserved: Optional[Set[int]] = None,
+    need_cps: Optional[Set[int]] = None,
+    label_cids: Optional[Set[int]] = None,
+    prefer_append: bool = False,
 ) -> Optional[int]:
-    """Prefer an empty slot; else append one glyph (five_01/02 live PASS path)."""
-    reserved = set(ctx.uni_to_cid.values())
-    reserved |= set(stream_used or ())
-    reserved |= set(extra_reserved or ())
-    reserved |= _component_cids(ff2)
-    reserved.add(0)
+    """Свободный CID без роста maxp: unused ink (донорское ФИО) → empty.
+
+    Не резервируем всю CMap донора — иначе charset = «буквы одного PDF».
+    Нельзя трогать: .notdef, composite-deps, статичные подписи, буквы текущего лица.
+    five_01/02 live PASS: append maxp+1 (CID 77 on pdf3), do not steal.
+    """
     ft = TTFont(BytesIO(ff2))
     n = len(ft.getGlyphOrder())
+    if prefer_append and n < 220:
+        return n
+    reserved = {0}
+    reserved |= set(label_cids or ())
+    reserved |= set(extra_reserved or ())
+    reserved |= set(stream_used or ())
+    reserved |= _component_cids(ff2)
+    need = set(need_cps or ())
+    for cp, cid in ctx.uni_to_cid.items():
+        if cp in need:
+            reserved.add(cid)
+
     glyf = ft["glyf"]
     go = ft.getGlyphOrder()
+
+    def _pick(cids: List[int]) -> Optional[int]:
+        if not cids:
+            return None
+        if seed:
+            return cids[int(hashlib.sha256(seed).hexdigest(), 16) % len(cids)]
+        return cids[0]
+
+    steal_tu: List[int] = []
+    steal_other: List[int] = []
     empties: List[int] = []
     for cid in range(n):
         if cid in reserved:
             continue
-        g = glyf[go[cid]]
-        if getattr(g, "numberOfContours", 0) == 0:
+        nc = int(getattr(glyf[go[cid]], "numberOfContours", 0) or 0)
+        if nc == 0:
             empties.append(cid)
-    if empties:
-        if seed:
-            idx = int(hashlib.sha256(seed).hexdigest(), 16) % len(empties)
-            return empties[idx]
-        return empties[0]
-    if n < 80:
+            continue
+        if cid in ctx.cid_to_uni:
+            steal_tu.append(cid)
+        else:
+            steal_other.append(cid)
+    # Сначала overwrite существующего bfchar (ToUnicode не растёт).
+    hit = _pick(steal_tu) or _pick(steal_other) or _pick(empties)
+    if hit is not None:
+        return hit
+    # Последний резерв: новый CID (maxp+1). Без этого полный алфавит не влезает
+    # в subset ~70 глифов (подписи + лицо).
+    if n < 220:
         return n
     return None
 
@@ -926,8 +1448,11 @@ def _set_oracle_cid_width(pdf: bytearray, cid_xref: int, cid: int, width: int) -
     if len(new_obj_b) == o_end - o_start:
         pdf[o_start:o_end] = new_obj_b
         return True
+    from tbank_sbp_stealth import _replace_byte_range_and_rebuild
+
     patched = _replace_byte_range_and_rebuild(bytes(pdf), o_start, o_end, new_obj_b)
     if patched is None:
+        logger.warning("Alfa /W: length drift")
         return False
     pdf[:] = patched
     return True
@@ -967,6 +1492,7 @@ def _append_oracle_cid_width(pdf: bytearray, cid_xref: int, cid: int, width: int
 
     patched = _replace_byte_range_and_rebuild(bytes(pdf), o_start, o_end, new_obj_b)
     if patched is None:
+        logger.warning("Alfa /W append: length drift")
         return False
     pdf[:] = patched
     return True
@@ -1054,8 +1580,12 @@ def inject_alfa_char(
     glyph_donor_path: Optional[str] = None,
     *,
     face_text: str = "",
+    prefer_append: bool = False,
 ) -> Optional[str]:
-    """Поставить glyf в свободный CID донора (без роста maxp / CID)."""
+    """Поставить glyf в чужой/пустой CID донора.
+
+    prefer_append=True: five_01/02 recipe — new CID at maxp (pdf3 → 77).
+    """
     if not ch or ch in ("\n", "\r", "\t"):
         return base_path
     cp = _char_codepoint(ch)
@@ -1110,6 +1640,10 @@ def inject_alfa_char(
         import alfa_glyph_library as agl
 
         agl.ensure_library()
+        # Do not paint Windows Tahoma into a used CID — bankpdf atlases it.
+        if not agl.has_corpus_outline(ch) and ch not in "Жж":
+            logger.warning("Alfa inject %r refused: not a live Oracle outline", ch)
+            return None
         got = agl.get_glyph(cp)
         if got:
             simple, aw_font, lsb_font = got
@@ -1128,44 +1662,95 @@ def inject_alfa_char(
     if simple is None or getattr(simple, "numberOfContours", 0) <= 0:
         return None
 
-    stream_used = _collect_alfa_used_cids(bytes(ctx_b.stream))
-    extra_reserved: Set[int] = set()
+    label_cids = _label_cids(ctx_b)
+    extra_reserved: Set[int] = set(label_cids)
+    need_cps = _needed_codepoints(face_text or ch)
     for face_ch in face_text or "":
         if face_ch in ("\n", "\r", "\t"):
             continue
-        mapped = ctx_b.uni_to_cid.get(_char_codepoint(face_ch))
-        if mapped is not None:
+        fcp = _char_codepoint(face_ch)
+        mapped = ctx_b.uni_to_cid.get(fcp)
+        if mapped is not None and _glyph_slot_has_ink(dst_ff2_ttf, mapped):
             extra_reserved.add(mapped)
 
-    dst_cid = ctx_b.uni_to_cid.get(cp)
-    if dst_cid is not None and dst_cid in _component_cids(dst_ff2_ttf):
-        dst_cid = None
-    if dst_cid is None:
-        seed = f"{face_text}|{ch}".encode("utf-8")
-        dst_cid = _alloc_cid(
-            ctx_b, dst_ff2_ttf, stream_used,
-            seed=seed, extra_reserved=extra_reserved,
-        )
-    if dst_cid is None:
-        return None
-    go_n = len(TTFont(BytesIO(dst_ff2_ttf)).getGlyphOrder())
-    if dst_cid > go_n:
-        logger.warning("Alfa inject %r refused cid=%d n=%d", ch, dst_cid, go_n)
-        return None
+    stream_used = _collect_alfa_used_cids(bytes(ctx_b.stream))
+    reserved = {0} | extra_reserved | set(label_cids) | _component_cids(dst_ff2_ttf)
+    for cid in stream_used:
+        uni = ctx_b.cid_to_uni.get(cid)
+        if uni is not None and uni in need_cps:
+            reserved.add(cid)
+    new_ff2_ttf = None
+    dst_cid: Optional[int] = None
+    # five_01/02: append maxp with library hints intact. Inplace steal +
+    # hint-strip was an experiment and live-failed.
+    if not prefer_append:
+        try:
+            from fontTools.ttLib.tables.ttProgram import Program
 
-    if use_copy_slot and src_ff2_ttf is not None and src_cid is not None:
-        new_ff2_ttf = _copy_glyf_slot(dst_ff2_ttf, src_ff2_ttf, src_cid, dst_cid)
-    else:
-        new_ff2_ttf = _install_simple_glyph(
-            dst_ff2_ttf, dst_cid, simple, int(aw_font), int(lsb_font),
-        )
-    if not new_ff2_ttf or not _glyph_slot_has_ink(new_ff2_ttf, dst_cid):
+            stripped = deepcopy(simple)
+            prog = Program()
+            prog.fromBytecode(b"")
+            stripped.program = prog
+            need_bytes = len(stripped.compile(TTFont(BytesIO(dst_ff2_ttf))))
+        except Exception:
+            stripped = simple
+            need_bytes = 10**9
+        inplace_cid = _largest_unused_glyf_cid(ctx_b, dst_ff2_ttf, need_bytes, reserved)
+        if inplace_cid is not None:
+            new_ff2_ttf = _inject_glyf_raw_inplace(
+                dst_ff2_ttf, inplace_cid, stripped, int(aw_font), int(lsb_font),
+            )
+            if new_ff2_ttf and _glyph_slot_has_ink(new_ff2_ttf, inplace_cid):
+                dst_cid = inplace_cid
+                src_label = f"{src_label}+inplace@{inplace_cid}"
+
+    if dst_cid is None:
+        dst_cid = ctx_b.uni_to_cid.get(cp)
+        if dst_cid is not None and dst_cid in _component_cids(dst_ff2_ttf):
+            dst_cid = None
+        if dst_cid is None:
+            seed = f"{face_text}|{ch}".encode("utf-8")
+            dst_cid = _alloc_cid(
+                ctx_b, dst_ff2_ttf, None,
+                seed=seed, extra_reserved=extra_reserved,
+                need_cps=need_cps, label_cids=label_cids,
+                prefer_append=prefer_append,
+            )
+        if dst_cid is None:
+            logger.warning("Alfa inject %r: no stealable CID", ch)
+            return None
+        go_n = len(TTFont(BytesIO(dst_ff2_ttf)).getGlyphOrder())
+        if dst_cid > go_n:
+            logger.warning("Alfa inject %r refused cid=%d n=%d", ch, dst_cid, go_n)
+            return None
+        if use_copy_slot and src_ff2_ttf is not None and src_cid is not None:
+            new_ff2_ttf = _copy_glyf_slot(dst_ff2_ttf, src_ff2_ttf, src_cid, dst_cid)
+        else:
+            new_ff2_ttf = _install_simple_glyph(
+                dst_ff2_ttf, dst_cid, simple, int(aw_font), int(lsb_font),
+            )
+    if not new_ff2_ttf or dst_cid is None or not _glyph_slot_has_ink(new_ff2_ttf, dst_cid):
         return None
     if not _patch_ff2_decompressed(pdf, refs_b["ff2"], new_ff2_ttf):
         return None
 
     tu_dec = _tu_read_decompressed(bytes(pdf), refs_b["tu"])
     tu_new = _set_bfchar_unicode(tu_dec, dst_cid, cp)
+    if not prefer_append and (
+        tu_new is None or (tu_new != tu_dec and len(tu_new) != len(tu_dec))
+    ):
+        tu_new = None
+        for old_cid, old_cp in list(ctx_b.cid_to_uni.items()):
+            if old_cid in label_cids or old_cid == 0:
+                continue
+            if old_cp in need_cps:
+                continue
+            rebound = _rebind_bfchar_inplace(tu_dec, old_cid, dst_cid, cp)
+            if rebound is not None and len(rebound) == len(tu_dec):
+                tu_new = rebound
+                ctx_b.uni_to_cid.pop(old_cp, None)
+                ctx_b.cid_to_uni.pop(old_cid, None)
+                break
     if tu_new is None:
         return None
     if tu_new != tu_dec and not _patch_tu_decompressed(pdf, refs_b["tu"], tu_new):
@@ -1286,7 +1871,13 @@ def _donor_glyph_score(path: str, text: str) -> int:
     return len(need) - len(miss)
 
 
-def ensure_alfa_font_chars(base_path: str, text: str, pool: List[str]) -> Optional[str]:
+def ensure_alfa_font_chars(
+    base_path: str,
+    text: str,
+    pool: List[str],
+    *,
+    prefer_append: bool = False,
+) -> Optional[str]:
     """Гарантировать charset: PDF-донор → библиотека, без swap ToUnicode."""
     import alfa_glyph_library as agl
 
@@ -1305,31 +1896,71 @@ def ensure_alfa_font_chars(base_path: str, text: str, pool: List[str]) -> Option
 
     working = base_path
     seen: Set[str] = set()
-    # Rare glyphs first — late CID slots often fail for й after bulk inject
-    rare_first = "йЙёЁъыэщШЩЦЮ"
+    rare_first = "йЙёЁъыэщШЩЦЮЖжФфХхЧч"
     miss_ordered = sorted(
         set(miss),
         key=lambda c: (0 if c in rare_first else 1, ord(c)),
     )
-    for ch in miss_ordered:
-        if ch in seen or ch in ("\n", "\r", "\t"):
-            continue
-        seen.add(ch)
-        ctx = AlfaOrigContext()
-        if not ctx.load(working):
-            continue
-        ok, miss_now = _glyphs_ok_for_text(ctx, ctx.pdf_bytes, ch)
-        if ok:
-            continue
-        donor = None if agl.has_char(ch) else _find_donor_for_char(candidates, ch)
-        if donor is None and not agl.has_char(ch):
-            logger.warning("Alfa: no source for %r", ch)
-            continue
-        injected = inject_alfa_char(working, ch, donor, face_text=text)
-        if injected:
-            working = injected
-        else:
-            logger.warning("Alfa: cannot inject %r", ch)
+    for _pass in range(2):
+        pending = []
+        for ch in miss_ordered:
+            if ch in seen or ch in ("\n", "\r", "\t"):
+                continue
+            ctx = AlfaOrigContext()
+            if not ctx.load(working):
+                continue
+            ok, miss_now = _glyphs_ok_for_text(ctx, ctx.pdf_bytes, ch)
+            if ok:
+                seen.add(ch)
+                continue
+            # Ж: library only (streak_03). Never steal Ж from unlocked/other PDF.
+            # Other missing letters: do not copy from a second PDF onto this
+            # shell (streak_10 Е/г from pdf2 → FAIL). Skip the shell instead.
+            if ch in "Жж":
+                donor = None
+            else:
+                donor = _find_donor_for_char(candidates, ch)
+                if donor is None:
+                    try:
+                        from alfa_corpus import canonical_paths
+
+                        extra = []
+                        for kind in ("sbp", "card", "phone"):
+                            extra.extend(canonical_paths(kind) or [])
+                        donor = _find_donor_for_char(extra, ch)
+                    except Exception:
+                        donor = None
+                if donor is not None:
+                    same = os.path.normcase(os.path.abspath(donor)) == os.path.normcase(
+                        os.path.abspath(working)
+                    )
+                    if not same:
+                        logger.warning(
+                            "Alfa: refuse copy %r from %s onto %s",
+                            ch, os.path.basename(donor), os.path.basename(working),
+                        )
+                        pending.append(ch)
+                        continue
+            if donor is None and not agl.has_corpus_outline(ch) and ch not in "Жж":
+                logger.warning("Alfa: no live Oracle outline for %r — skip Windows Tahoma", ch)
+                pending.append(ch)
+                continue
+            if donor is None and not agl.has_char(ch) and ch not in "Жж":
+                logger.warning("Alfa: no source for %r", ch)
+                pending.append(ch)
+                continue
+            injected = inject_alfa_char(
+                working, ch, donor, face_text=text, prefer_append=prefer_append,
+            )
+            if injected:
+                working = injected
+                seen.add(ch)
+            else:
+                logger.warning("Alfa: cannot inject %r", ch)
+                pending.append(ch)
+        if not pending:
+            break
+        miss_ordered = pending
 
     ctx = AlfaOrigContext()
     if not ctx.load(working):

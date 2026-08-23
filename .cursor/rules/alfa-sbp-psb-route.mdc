@@ -1,0 +1,48 @@
+---
+description: Alfa SBP ПСБ — SBP-id B-lead from genuine orig; never G-lead; never CS 5111.
+alwaysApply: true
+---
+
+# Alfa SBP ПСБ (K-ALFA-SBP-PSB-001)
+
+Genuine orig `templates/alfa_corpus/альфа сбп.pdf` (lean Oracle, bank face **ПСБ**):
+
+```text
+sbp: B6140114259469100G10170011770101
+lead: B
+tail: G10170011770101
+```
+
+## Ship law
+
+- `_BANK_ROUTES` ПСБ = `("B", "G10170011770101")`. **Never** lead `G`.
+- Prefer that orig via `_shells_for_face` (3-CID `ПСБ` already on the shell).
+- Do **not** paint ПСБ onto the 10.08 `Т-Банк` shell as the first choice — CID math lands decoded `/Contents` on **5111**.
+- After rewrite, decoded CS must **not** be **5111** or **5115** (10.08 donor clone tell; 5115 is 5111+1 NBSP). Natural PASS lengths were 5087 / 5091 / 5107 / 5123. Bump trailing NBSP on receiver until off those lengths.
+- Card emit stays `match_cs=True`. SBP stays `match_cs=False`.
+
+Live `@onlypdf_robot` ✅ 18.08.2026, **direct**:
+`output/alfa_sbp_215038.pdf` (58134, CS **5087**, SHA `9837d697…`).
+
+```text
+date: 18.08.2026 21:50:38 мск
+amount: 18740
+receiver: Никита Павлович М
+bank: ПСБ
+phone: +7 (908) 512-47-19
+sbp: B6230185023645140G10170011770101
+shell: альфа сбп.pdf
+```
+
+Do **not** clone this identity. Next file: one axis only.
+
+## Not the bug
+
+- 3-letter bank is fine: OnlyPDF ✅ `ВТБ` with lead `A` + `G10080011770901`.
+- Do **not** retune `_BANK_ROUTES` from a live ❌ (NEG 3a). This B-lead is from the **orig**, not from a FAIL.
+
+## Forbidden
+
+- Do not clone orig identity (`Михаил Евгеньевич В`, `B6140114259469100…`).
+- Do not switch ПСБ back to G-lead to “match other G-tails” (WB/Ozon tails are unrelated).
+- Do not force CS = 5111 / donor exact length on SBP.

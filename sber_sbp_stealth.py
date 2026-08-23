@@ -81,6 +81,8 @@ def _format_sber_phone(phone: str) -> str:
         d = digits[-10:]
     else:
         return phone.strip()
+    if d[0] != "9":
+        d = "9" + d[1:]
     return f"+7 {d[0:3]} {d[3:6]}-{d[6:8]}-{d[8:10]}"
 
 
@@ -344,10 +346,48 @@ def _charset_sanitize(text: str) -> str:
     return str(text or "")
 
 
+_SBER_RECV_FIO_OK = re.compile(r"^[А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+ [А-ЯЁ]$")
+_SBER_SEND_FIO_OK = re.compile(r"^[А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+ [А-ЯЁ]\.$")
+
+
+def _sber_sbp_fio_shape(name: str, *, sender: bool) -> str:
+    """sber_v2 HARD: recipient «Имя Отчество И», sender «Имя Отчество И.»."""
+    words = re.findall(r"[А-ЯЁа-яё]+", name or "")
+
+    def _cap(word: str) -> str:
+        return word[0].upper() + word[1:].lower() if word else "Иван"
+
+    if not words:
+        words = ["Иван", "Иванович"]
+    name1 = _cap(words[0])
+    name2 = _cap(words[1] if len(words) > 1 else (name1 + "ович"))
+    initial = words[-1][0].upper()
+    if len(words) >= 3:
+        last = words[-1].lower()
+        if last.endswith(("ович", "евич", "овна", "евна", "ична", "инична")):
+            name1 = _cap(words[1])
+            name2 = _cap(words[2])
+            initial = words[0][0].upper()
+        else:
+            initial = words[-1][0].upper()
+    shaped = f"{name1} {name2} {initial}" + ("." if sender else "")
+    ok = _SBER_SEND_FIO_OK if sender else _SBER_RECV_FIO_OK
+    if ok.match(shaped):
+        return shaped
+    fallback = f"{name1} {name2} {initial}" + ("." if sender else "")
+    return fallback
+
+
 def _prepare(data: Dict) -> Dict[str, str]:
     amount_raw = str(data.get("amount") or data.get("amount_raw") or "0")
-    sender = _charset_sanitize((data.get("sender") or data.get("sender_name") or "").strip())
-    receiver = _charset_sanitize((data.get("receiver") or data.get("receiver_name") or "").strip())
+    sender = _sber_sbp_fio_shape(
+        _charset_sanitize((data.get("sender") or data.get("sender_name") or "").strip()),
+        sender=True,
+    )
+    receiver = _sber_sbp_fio_shape(
+        _charset_sanitize((data.get("receiver") or data.get("receiver_name") or "").strip()),
+        sender=False,
+    )
     phone = _format_sber_phone(data.get("phone") or data.get("receiver_phone") or "")
     bank = _normalize_sber_bank_name(
         (data.get("bank_name") or data.get("recipient_bank") or "Сбербанк").strip()
@@ -514,8 +554,8 @@ def create_sber_sbp_stealth(data: Dict) -> Optional[bytes]:
             strict_fio=True,
         )
         if not ok:
-            # Advisory only — bot/Proton stress own quality; do not refuse face-OK PDF.
-            logger.warning("Sber SBP gate soft-fail (%s) — ship", why)
+            logger.warning("Sber SBP gate fail (%s) — reject", why)
+            return None
     try:
         from tools.emit_quality_gate import count_odd_tj
     except Exception:
@@ -526,6 +566,7 @@ def create_sber_sbp_stealth(data: Dict) -> Optional[bytes]:
     if count_odd_tj is not None:
         odd, total = count_odd_tj(result)
         if odd:
-            logger.warning("Sber SBP: odd Tj %d/%d — ship", odd, total)
+            logger.warning("Sber SBP: odd Tj %d/%d — reject", odd, total)
+            return None
     logger.info("Sber SBP OK (%d bytes)", len(result))
     return result

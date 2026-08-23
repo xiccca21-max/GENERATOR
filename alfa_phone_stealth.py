@@ -255,7 +255,7 @@ def _attempt(path: str, data: Dict, *, tag: str, max_trials: int = 6) -> Optiona
                     rb"(?<![A-Za-z0-9])ET(?![A-Za-z0-9])", stream_b,
                 )
             ]
-            pt = ets[-1] if ets else len(stream_b)
+            pt = (ets[-1] + 2) if ets else len(stream_b)
             stream_b = stream_b[:pt] + (b" " * need) + stream_b[pt:]
             ctx.stream = bytearray(stream_b)
         comp = _oracle_near_flate(stream_b, ctx.zlib_level)
@@ -288,23 +288,45 @@ def _attempt(path: str, data: Dict, *, tag: str, max_trials: int = 6) -> Optiona
         if not _verify_committed(result, prepared):
             logger.info("[%s %s] post-commit verify failed", tag, os.path.basename(path))
             continue
-        from alfa_sbp_stealth import _fit_alfa_fontfile_size
+        from alfa_sbp_stealth import _fontfile2_has_exact_sfnt_end
 
-        # Quartz corpus: 69706–71632 (Proton HARD ~67500–73000). Keep native
-        # image Flate — never Oracle-compact swap (OnlyPDF virtual printer).
-        sized = _fit_alfa_fontfile_size(
-            result,
-            bytes(ctx.stream),
-            lean=True,
-            compact_images=False,
-            size_min=69_706,
-            size_max=71_632,
-            target=70_500,
-        )
-        if sized is None or not _verify_committed(sized, prepared):
-            logger.info("[%s %s] FontFile2 size fit failed", tag, os.path.basename(path))
+        # Never fit PDF size through FontFile2. The donor/subset SFNT must end
+        # naturally at align4(max(table.offset + table.length)).
+        if not _fontfile2_has_exact_sfnt_end(result):
+            logger.info("[%s %s] FontFile2 has trailing bytes", tag, os.path.basename(path))
             continue
-        result = sized
+        from alfa_emit import emit_invariants
+
+        why = emit_invariants(result, channel="phone")
+        if why:
+            logger.info("[%s %s] %s — skip", tag, os.path.basename(path), why)
+            continue
+        _PHONE_SIZE_MIN = 67_500
+        _PHONE_SIZE_MAX = 73_000
+        if not (_PHONE_SIZE_MIN <= len(result) <= _PHONE_SIZE_MAX):
+            logger.warning(
+                "[%s %s] soft-ship size:%d",
+                tag, os.path.basename(path), len(result),
+            )
+        from alfa_op_minutes import remember_prepared
+        from alfa_sbp_stealth import (
+            _ff2_sha16,
+            _remember_phone_identity,
+            _remember_sent_payload,
+        )
+
+        sha = _ff2_sha16(result)
+        prefixes = set(re.findall(rb"/([A-Z]{6})\+", result))
+        prefix = next(iter(prefixes), b"XXXXXX")
+        _remember_sent_payload(
+            prepared,
+            result,
+            prefix=prefix if re.fullmatch(rb"[A-Z]{6}", prefix or b"") else b"XXXXXX",
+            ff2_sha=sha or "0" * 16,
+            cid_signature="-",
+        )
+        _remember_phone_identity(prepared)
+        remember_prepared(prepared, channel="alfa_phone")
         logger.info("🔴 ALFA PHONE %s: %d bytes (trial %d)", tag, len(result), trial)
         return result
 
@@ -343,18 +365,51 @@ def _fmt_phone_masked(phone: str) -> str:
     if len(d) == 11 and d.startswith("7"):
         d = d[1:]
     if len(d) == 10:
+        if d[0] != "9":
+            d = "9" + d[1:]
         return f"{d[:3]}***{d[-4:]}"
     if "***" in (phone or ""):
-        return re.sub(r"\s+", "", phone)
+        compact = re.sub(r"\s+", "", phone)
+        m = re.fullmatch(r"(\d{3})\*{3}(\d{4})", compact)
+        if m and not m.group(1).startswith("9"):
+            return f"9{m.group(1)[1:]}***{m.group(2)}"
+        return compact
     return phone.strip()
+
+
+def _last4_ladder_ok(last4: str) -> bool:
+    if not (last4.isdigit() and len(last4) == 4):
+        return False
+    digits = [int(ch) for ch in last4]
+    score = sum(1 for i in range(3) if digits[i + 1] - digits[i] == 1)
+    return score < 3
 
 
 def _fmt_account_masked(account: str) -> str:
     d = re.sub(r"\D", "", account or "")
     if len(d) >= 20:
-        return f"{d[:6]}**********{d[-4:]}"
+        last4 = d[-4:]
+        if not _last4_ladder_ok(last4):
+            import secrets
+
+            for _ in range(16):
+                last4 = f"{secrets.randbelow(9000) + 1000:04d}"
+                if _last4_ladder_ok(last4):
+                    break
+        return f"{d[:6]}**********{last4}"
     if "*" in (account or ""):
-        return re.sub(r"\s+", "", account)
+        compact = re.sub(r"\s+", "", account)
+        m = re.fullmatch(r"(\d{6})\*+(\d{4})", compact)
+        if m and not _last4_ladder_ok(m.group(2)):
+            import secrets
+
+            last4 = m.group(2)
+            for _ in range(16):
+                last4 = f"{secrets.randbelow(9000) + 1000:04d}"
+                if _last4_ladder_ok(last4):
+                    break
+            return f"{m.group(1)}**********{last4}"
+        return compact
     return account.strip()
 
 
@@ -362,9 +417,17 @@ def _gen_debit_account() -> str:
     """Счёт списания 20 цифр (40817…) — маска 408178**********XXXX."""
     import secrets
 
-    tail = f"{secrets.randbelow(10_000):04d}"
-    mid = f"{secrets.randbelow(10**10):010d}"
-    return f"408178{mid}{tail}"
+    for _ in range(48):
+        tail = f"{secrets.randbelow(9000) + 1000:04d}"
+        if not _last4_ladder_ok(tail):
+            continue
+        mid = f"{secrets.randbelow(10**10):010d}"
+        acc = f"408178{mid}{tail}"
+        body = acc[6:]
+        if len(body) == 14 and all(body[i] == body[i + 10] for i in range(4)):
+            continue
+        return acc
+    return "4081781049275831"
 
 
 def _resolve_account(raw: str) -> str:
@@ -462,6 +525,7 @@ def _prepare_phone(
 ) -> Dict[str, str]:
     date_in = str(data.get("date_time") or data.get("date") or "сейчас")
     op_dt = _parse_dt(date_in)
+    formed_in = str(data.get("date_formed") or "").strip()
     op = str(data.get("operation_num") or data.get("operation_number") or "")
     if not op or op.lower() in ("авто", "auto", "-"):
         op = _gen_phone_op_num(op_dt)
@@ -470,9 +534,12 @@ def _prepare_phone(
         msg = _ALFA_PHONE_MESSAGE
     else:
         msg = msg.replace(" ", _NBSP)
-    # One MSK clock for date_formed + date_time (no random minute skew).
+    if formed_in and formed_in.lower() not in ("авто", "auto", "-", "same", "same-as-op"):
+        formed_dt = _parse_dt(formed_in)
+    else:
+        formed_dt = op_dt
     return {
-        "date_formed": _fmt_datetime(op_dt, with_seconds=False),
+        "date_formed": _fmt_datetime(formed_dt, with_seconds=False),
         "amount": _fmt_amount(str(data.get("amount", "0"))),
         "commission": _fmt_commission(),
         "date_time": _fmt_datetime(op_dt, with_seconds=True),
@@ -608,7 +675,6 @@ def _ensure_phone_font_chars(base_path: str, text: str) -> Optional[str]:
         ff2_ttf = afe._ff2_read_decompressed(bytes(pdf), ctx.ff2_xref)
         dst_ft = TTFont(BytesIO(ff2_ttf))
         upem = int(dst_ft["head"].unitsPerEm) or 2048
-        n_glyphs = len(dst_ft.getGlyphOrder())
         del dst_ft
 
         simple = None
@@ -674,9 +740,41 @@ def _ensure_phone_font_chars(base_path: str, text: str) -> Optional[str]:
             logger.warning("Alfa PHONE: no glyph for %r", ch)
             return None
 
-        dst_cid = n_glyphs if n_glyphs < 255 else None
+        need_cps = afe._needed_codepoints(text)
+        extra_reserved: set = set()
+        for face_ch in text or "":
+            if face_ch in ("\n", "\r", "\t"):
+                continue
+            mapped = ctx.uni_to_cid.get(afe._char_codepoint(face_ch))
+            if mapped is not None and afe._glyph_slot_has_ink(ff2_ttf, mapped):
+                extra_reserved.add(mapped)
+        # Never overwrite a CID painted in the page stream — that remaps
+        # labels (н/а → Х/О) when ToUnicode is rewritten for a new face letter.
+        stream_used = afe._collect_alfa_used_cids(bytes(ctx.stream))
+        phone_yx = tuple(PHONE_COORDS[k] for k in PHONE_COORDS)
+        label_cids = afe._label_cids(ctx, value_yx=phone_yx) | stream_used
+        dst_cid = ctx.uni_to_cid.get(cp)
+        if dst_cid is not None and dst_cid in stream_used:
+            # Existing map points at a painted slot with no/wrong ink — do not
+            # overwrite that glyf; allocate a fresh CID instead.
+            if not afe._glyph_slot_has_ink(ff2_ttf, dst_cid):
+                dst_cid = None
+            else:
+                # Already has ink for this CP — nothing to inject.
+                continue
         if dst_cid is None:
-            logger.warning("Alfa PHONE: no free CID for %r", ch)
+            dst_cid = afe._alloc_cid(
+                ctx,
+                ff2_ttf,
+                stream_used,
+                seed=f"{text}|{ch}".encode("utf-8"),
+                extra_reserved=extra_reserved | stream_used,
+                need_cps=need_cps,
+                label_cids=label_cids,
+                prefer_append=True,
+            )
+        if dst_cid is None:
+            logger.warning("Alfa PHONE: no stealable CID for %r", ch)
             return None
 
         new_ff2 = afe._install_simple_glyph(
@@ -722,74 +820,209 @@ def _ensure_phone_font_chars(base_path: str, text: str) -> Optional[str]:
     return working
 
 
-def create_alfa_phone_stealth(data: Dict) -> Optional[bytes]:
-    from alfa_sbp_stealth import _blocked_alfa_chars
+def _layout_shells() -> list:
+    """Quartz phone page shells — font rebuilt by Oracle emit like SBP/CARD."""
+    lean, fat = [], []
+    for p in _iter_donors({"amount": "1000", "receiver": "А А.", "phone": "79001112233"}):
+        if not p or not os.path.isfile(p):
+            continue
+        if "unlock" in os.path.basename(p).lower():
+            continue
+        try:
+            sz = os.path.getsize(p)
+        except OSError:
+            continue
+        (lean if 67_500 <= sz <= 73_000 else fat).append(p)
+    return lean or fat
 
-    # NATIVE only: LIB FontFile2 growth → OnlyPDF FAKE (need in-place glyf later).
-    pool = list(_iter_donors(data))[:16]
-    if not pool:
-        logger.error("Alfa PHONE: нет доноров")
+
+def create_alfa_phone_stealth(
+    data: Dict,
+    *,
+    allow_repeat: bool = False,
+    allow_ff2_repeat: bool = False,
+    claim_minute: bool = True,
+    shells: Optional[list] = None,
+) -> Optional[bytes]:
+    """Oracle emit onto Quartz phone shell — same ship contract as Alfa SBP/CARD."""
+    import hashlib
+
+    from alfa_emit import emit_invariants, emit_onto_shell
+    from alfa_font_extend import (
+        _ff2_read_decompressed,
+        _load_font_xrefs_from_bytes,
+        _ot_checksum_matches,
+    )
+    from alfa_op_minutes import remember_prepared, stamp_unique_minute
+    from alfa_oracle_master import ensure_master, missing_chars
+    from alfa_orig_mode import AlfaOrigContext
+    from alfa_sbp_stealth import (
+        _BANNED_FF2_SHA16,
+        _BLOCKED_FACE_LETTERS,
+        _PASS_FF2_SHA16,
+        _cid_map_signature,
+        _corpus_ff2_shas,
+        _corpus_subset_tags,
+        _ff2_sha16,
+        _fontfile2_has_exact_sfnt_end,
+        _is_auto_token,
+        _payload_reuse_field,
+        _phone_identity_blocked,
+        _remember_ff2_sha,
+        _remember_phone_identity,
+        _remember_prefix,
+        _remember_sent_payload,
+        _sent_cid_signatures,
+        _sent_ff2_shas,
+        _sent_prefix_map,
+        _trailer_id_reused,
+        _parse_dt as _sbp_parse_dt,
+    )
+
+    ensure_master()
+    preview = _prepare_phone(data, available=None)
+    miss = missing_chars("".join(preview.values()))
+    blocked = list(miss)
+    for ch in "".join(preview.values()):
+        if ch in _BLOCKED_FACE_LETTERS and ch not in blocked:
+            blocked.append(ch)
+    if blocked:
+        logger.error(
+            "Alfa PHONE: unsupported exact chars: %s",
+            "".join(dict.fromkeys(blocked)),
+        )
+        return None
+    if not allow_repeat and _phone_identity_blocked(preview):
+        # Soft-ship: same face retry must still emit (bot UX).
+        logger.warning("Alfa PHONE soft-ship duplicate identity")
+
+    data = dict(data)
+    if claim_minute:
+        stamp_unique_minute(data, _sbp_parse_dt, channel="alfa_phone")
+
+    shells = list(shells) if shells else _layout_shells()
+    if not shells:
+        logger.error("Alfa PHONE: нет shell")
         return None
 
-    for outer in range(3):
-        work_data = dict(data)
-        from alfa_sbp_stealth import _is_auto_token
-
-        auto_operation = _is_auto_token(
-            data.get("operation_num") or data.get("operation_number")
-        )
-        if auto_operation:
-            work_data["operation_num"] = "авто"
-        if "receipt_num" in work_data:
-            work_data["receipt_num"] = "авто"
-
-        for path in pool:
-            ctx = AlfaPhoneOrigContext()
-            if not ctx.load(path):
-                continue
-            # Keep user date («сейчас»/«авто»/explicit). Only fall back to donor
-            # calendar when the user left the field empty (should not happen).
-            user_dt = str(work_data.get("date_time") or work_data.get("date") or "").strip()
-            from alfa_sbp_stealth import _is_auto_datetime
-
-            if not user_dt or _is_auto_datetime(user_dt):
-                # Resolve to now once so op#/message stay consistent this attempt.
-                work_data["date_time"] = "сейчас"
-            if auto_operation:
-                work_data["operation_num"] = "авто"
-            prepared = _prepare_phone(work_data, available=None)
-            all_text = "".join(prepared.values())
-            ok, _ = _phone_glyphs_ok(ctx, all_text)
-            work_path = path
-            if not ok:
-                injected = _ensure_phone_font_chars(path, all_text)
-                if not injected:
-                    continue
-                work_path = injected
-                ctx2 = AlfaPhoneOrigContext()
-                if not ctx2.load(work_path) or not _phone_glyphs_ok(ctx2, all_text)[0]:
-                    continue
-            hit = _attempt(
-                work_path,
-                work_data,
-                tag="NATIVE",
-                max_trials=12,
+    _PHONE_SIZE_MIN = 67_500
+    _PHONE_SIZE_MAX = 73_000
+    last_why = ""
+    for trial in range(24):
+        work = dict(data)
+        if trial and _is_auto_token(data.get("operation_num") or data.get("operation_number")):
+            work["operation_num"] = "авто"
+        user_dt = str(work.get("date_time") or work.get("date") or "").strip()
+        if not user_dt or user_dt.lower() in ("сейчас", "авто", "auto", "now", "-"):
+            work["date_time"] = "сейчас"
+        work["operation_num"] = work.get("operation_num") or "авто"
+        prepared = _prepare_phone(work, available=None)
+        reused_field = _payload_reuse_field(prepared)
+        if reused_field == "operation_num" and _is_auto_token(
+            data.get("operation_num") or "авто"
+        ):
+            work["operation_num"] = "авто"
+            prepared = _prepare_phone(work, available=None)
+        seed = hashlib.sha256(
+            repr(sorted(prepared.items())).encode("utf-8") + bytes([trial])
+        ).digest()
+        path = shells[trial % len(shells)]
+        try:
+            with open(path, "rb") as fh:
+                shell = fh.read()
+        except OSError:
+            last_why = "xref/Length mismatch shell-read"
+            continue
+        try:
+            pdf, why = emit_onto_shell(
+                shell, prepared, PHONE_COORDS, seed, profile="quartz",
             )
-            if hit:
-                return hit
+        except Exception as exc:
+            last_why = f"xref/Length mismatch {type(exc).__name__}"
+            logger.info(
+                "Alfa PHONE rebuild %s trial=%d shell=%s",
+                last_why, trial, os.path.basename(path),
+            )
+            continue
+        if pdf is None:
+            last_why = why or "emit"
+            logger.info(
+                "Alfa PHONE rebuild %s trial=%d shell=%s",
+                last_why, trial, os.path.basename(path),
+            )
+            continue
+        pdf = _randomize_trailer_id(pdf)
+        if _trailer_id_reused(pdf):
+            last_why = "identity mismatch reused-pdf-id"
+            continue
+        chk = AlfaOrigContext()
+        if not chk.load_bytes(pdf):
+            last_why = "xref/Length mismatch verify"
+            continue
+        if not _verify_committed(pdf, prepared):
+            last_why = "text overflow"
+            continue
+        refs = _load_font_xrefs_from_bytes(pdf)
+        landed = _ff2_read_decompressed(pdf, refs["ff2"]) if refs else b""
+        if not landed or not _ot_checksum_matches(landed):
+            last_why = "glyph mismatch ot-checksum"
+            logger.info("Alfa PHONE rebuild %s trial=%d", last_why, trial)
+            continue
+        if not _fontfile2_has_exact_sfnt_end(pdf):
+            last_why = "glyph mismatch sfnt-tail"
+            logger.info("Alfa PHONE rebuild %s trial=%d", last_why, trial)
+            continue
+        why = emit_invariants(pdf, channel="phone")
+        if why:
+            last_why = why
+            logger.info(
+                "Alfa PHONE rebuild %s trial=%d shell=%s",
+                why, trial, os.path.basename(path),
+            )
+            continue
+        if not (_PHONE_SIZE_MIN <= len(pdf) <= _PHONE_SIZE_MAX):
+            logger.warning("Alfa PHONE soft-ship size:%d trial=%d", len(pdf), trial)
+        sha = _ff2_sha16(pdf)
+        prefixes = set(re.findall(rb"/([A-Z]{6})\+(?:Tahoma|font[0-9a-f]+)", pdf))
+        if len(prefixes) != 1:
+            last_why = f"glyph mismatch prefix-count:{len(prefixes)}"
+            continue
+        prefix = next(iter(prefixes))
+        if prefix in _corpus_subset_tags() or prefix in _sent_prefix_map():
+            last_why = f"glyph mismatch prefix-reused:{prefix.decode('ascii')}"
+            continue
+        cid_signature = _cid_map_signature(chk)
+        if cid_signature in _sent_cid_signatures():
+            logger.warning("Alfa PHONE soft-ship cid-map-reused trial=%d", trial)
+        if sha in _BANNED_FF2_SHA16 or (
+            not allow_ff2_repeat
+            and (
+                sha in _PASS_FF2_SHA16
+                or (sha in _sent_ff2_shas() and sha not in _corpus_ff2_shas())
+            )
+        ):
+            logger.warning("Alfa PHONE soft-ship ff2-collision %s trial=%d", sha, trial)
+        elif sha not in _corpus_ff2_shas():
+            _remember_ff2_sha(sha)
+        _remember_prefix(prefix, sha, cid_signature)
+        _remember_sent_payload(
+            prepared, pdf, prefix=prefix, ff2_sha=sha, cid_signature=cid_signature,
+        )
+        _remember_phone_identity(prepared)
+        remember_prepared(prepared, channel="alfa_phone")
+        logger.info("🔴 ALFA PHONE EMIT: %d bytes trial=%d ff2=%s", len(pdf), trial, sha)
+        return pdf
 
-    logger.error("Alfa PHONE: все пути не удались (charset/slots)")
+    logger.error("Alfa PHONE: все пути не удались (%s)", last_why)
     return None
 
 
 def check_text(text: str) -> list:
-    import alfa_glyph_library as agl
+    from alfa_oracle_master import missing_chars
+    from alfa_sbp_stealth import _BLOCKED_FACE_LETTERS
 
-    agl.ensure_library()
-    chars = set(agl.available_chars())
-    from alfa_sbp_stealth import _BLOCKED_ALFA_CHARS
-
-    return [
-        c for c in text
-        if c in _BLOCKED_ALFA_CHARS or (c not in chars and c not in " \t\n")
-    ]
+    found = missing_chars(text)
+    for ch in text or "":
+        if ch in _BLOCKED_FACE_LETTERS and ch not in found:
+            found.append(ch)
+    return found

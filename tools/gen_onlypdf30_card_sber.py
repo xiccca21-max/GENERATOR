@@ -29,9 +29,8 @@ from onlypdf_gate import generate_onlypdf_batch  # noqa: E402
 from onlypdf_safe_names import (  # noqa: E402
     CYR_NO_YO_TVERD,
     coverage_report,
-    force_rare_pair,
-    pick_receiver_short,
-    pick_sender_pair,
+    pick_hard_tbank_pair,
+    pick_hard_tbank_recv,
 )
 from tbank_stealth_v3 import create_tbank_stealth  # noqa: E402
 import fitz  # noqa: E402
@@ -48,10 +47,7 @@ def _stem(receipt: str) -> str:
 
 def _payload(i: int, attempt: int = 0) -> dict:
     rng = random.Random(22072026 + i * 211 + attempt * 809)
-    fn, ln = pick_sender_pair(i, attempt)
-    rare = force_rare_pair(i)
-    if rare and attempt == 0:
-        fn, ln = rare
+    fn, ln = pick_hard_tbank_pair(i, attempt)
     hh, mm = rng.randint(8, 22), rng.randint(0, 59)
     day = 10 + ((i * 3 + attempt * 5) % 19)  # 10..28
     # Prefer amount lengths that fit corpus zero-comm slots (≈7 chars with spaces)
@@ -66,7 +62,7 @@ def _payload(i: int, attempt: int = 0) -> dict:
     last4 = f"{(i * 137 + attempt * 41) % 10000:04d}"
     bin3 = rng.choice(["220220", "427612", "553691", "220070", "546938"])
     card = f"{bin3}******{last4}"
-    recv = pick_receiver_short(i, attempt)
+    recv = pick_hard_tbank_recv(i, attempt)
     return {
         "date_time": f"{day:02d}.07.2026, {hh:02d}:{mm:02d}",
         "amount": str(amt),
@@ -95,7 +91,7 @@ def _local_ok(pdf: bytes) -> tuple[bool, str]:
         return False, "no-card-title"
     if "Сбербанк" not in text:
         return False, "no-sber"
-    if "DOCS-2035" not in kw:
+    if "DOCS-2035" not in kw and "| 991" not in kw and not kw.strip().endswith("991"):
         return False, f"bad-kw:{kw.split('|')[-1].strip() if kw else '?'}"
     m = re.search(r"Квитанция\s+№\s+([\d-]+)", text)
     if m:

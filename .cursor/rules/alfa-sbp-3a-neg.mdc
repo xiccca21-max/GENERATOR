@@ -1,0 +1,41 @@
+---
+description: Alfa SBP 3a is a negative specimen — do not retune op/SBP or faces from that FAIL.
+alwaysApply: true
+---
+
+# Alfa SBP — negative specimen 3a (K-ALFA-SBP-NEG-3A)
+
+Live `@bankpdfbot` ❌ `docs/specimen_alfa_sbp_NEG_3a24266b.pdf`
+(SHA-256 `3a24266b20ab0881…`, 58124, Oracle emit 10.08 11:02, Игорь / Т-Банк / 18640).
+
+Sidecar: `docs/specimen_alfa_sbp_NEG_3a24266b.json`.
+Positive original to compare against: `templates/alfa_corpus/document10.08.26.pdf`.
+
+## What 3a does **not** prove
+
+Op/SBP on 3a already matched the new 10.08 originals (C16 hour tail, UTC−3 lag 3–5s, T-Bank `B`+`B10130011821301`).
+FO CID 1..N, charset extra `{0}`, Oracle SFNT, CSA pin `0x68C48484` were green.
+The generic FAIL is **not** a field-semantics bug.
+
+## Remaining diffs vs original (byte compare these, not the face)
+
+- rebuilt **FontFile2**
+- rewritten **Content**
+- **ToUnicode / CID**
+- live checker **reputation / chat state** (same chat still caches known original SHAs as ✅)
+
+## FontFile2 release law
+
+- Never append entropy, PADD, or opaque bytes to hit a PDF-size band.
+- Require `len(FontFile2)` = last table’s `offset + length + 4-pad`, with
+  **glyf unpadded** (Oracle may leave later tables 2-mod-4). Never
+  `align4(max(offset+length))` — that cuts 2 bytes off prep when glyf
+  is odd-aligned. No entropy after that natural end.
+- Natural subset size is authoritative even when the PDF lands below 58 KB.
+- Keep Content, ToUnicode/CID, FO, Oracle SFNT order, and CSA behavior unchanged.
+
+## Forbidden
+
+- Do not change `_BANK_ROUTES` / `_OP_TAIL_KNOTS` / SBP lag / live core from this ❌
+- Do not generate new numbers or faces aimed at “fixing” 3a
+- Do not clone 3a identity (`C161008260604894`, `B6222080212544320B10130011821301`, Игорь Денисович К)

@@ -208,11 +208,25 @@ def build_library(*, force: bool = False) -> str:
 
     store: Dict[int, dict] = {}
     corpus_n = 0
+    corpus_pdfs: list = []
     if os.path.isdir(CORPUS_DEFAULT):
         for name in sorted(os.listdir(CORPUS_DEFAULT)):
-            if not name.lower().endswith(".pdf"):
-                continue
-            corpus_n += _ingest_pdf(os.path.join(CORPUS_DEFAULT, name), store)
+            if name.lower().endswith(".pdf"):
+                corpus_pdfs.append(os.path.join(CORPUS_DEFAULT, name))
+    try:
+        from alfa_corpus import canonical_paths
+
+        for kind in ("sbp", "card", "phone"):
+            corpus_pdfs.extend(canonical_paths(kind) or [])
+    except Exception:
+        pass
+    seen_pdf = set()
+    for path in corpus_pdfs:
+        key = os.path.normcase(os.path.normpath(path))
+        if key in seen_pdf or not os.path.isfile(path):
+            continue
+        seen_pdf.add(key)
+        corpus_n += _ingest_pdf(path, store)
 
     master_n = _ingest_master_tahoma(store)
     with open(LIB_PICKLE, "wb") as fp:
@@ -248,6 +262,13 @@ def _load() -> Dict[int, dict]:
 def has_char(ch: str) -> bool:
     cp = 0x00A0 if ch == " " else ord(ch)
     return cp in _load()
+
+
+def has_corpus_outline(ch: str) -> bool:
+    """True only for glyphs harvested from live Oracle PDFs, not Windows Tahoma."""
+    cp = 0x00A0 if ch == " " else ord(ch)
+    rec = _load().get(cp)
+    return bool(rec and rec.get("from_corpus"))
 
 
 def available_chars() -> set:

@@ -1,0 +1,106 @@
+---
+description: Port Alfa SBP live-check discipline onto ALL T-Bank methods — keep existing T-Bank recipes intact.
+alwaysApply: true
+---
+
+# T-Bank all methods ← Alfa SBP discipline (K-TBANK-FROM-ALFA-SBP-001)
+
+Port the **process / ship laws** proven on Alfa SBP (`alfa-sbp-pass-0433`, `alfa-sbp-3a-neg`, Oracle emit gates) onto every T-Bank channel. Adapt them to **Jasper / OpenPDF T-Bank receipts** — never paste Alfa Oracle layout, Producer, FO CID, or LEFT `35.45`/`304.75` onto T-Bank.
+
+## Do not remove (still authoritative)
+
+Keep and prefer existing T-Bank rules when they conflict with Alfa-specific mechanics:
+
+| Keep | Where |
+|------|--------|
+| Twin F1 / hydrate / F2 cmap≤9 / no CS space-pad | `tbank-sbp-pass-recipe` |
+| Keywords `991` / `DOCS-2035` by face date | `tbank-keywords-generation` |
+| F1 CSA `0x337C7D3F`, head epoch pin, V3 / FONTFILE2 HARD ceilings | `pass-recipes-tbank-alfa` |
+| RIGHT `x1=250`, labels LEFT `x0≈20` | `field-edge-anchors` |
+| Decoded-TTF entropy pad to hit **T-Bank** size band | `pdf-size-like-original` (**Alfa’s “no FF2 pad” does not apply here**) |
+| One live generator per method | `onlypdf-canonical` |
+| Phone emit must not return `None` | `phone-emit-regression` |
+
+## Generators (all methods)
+
+| Method | Generator only | Shell band (approx) |
+|--------|----------------|---------------------|
+| SBP | `create_tbank_sbp_stealth` | ~59–61 KB |
+| Phone | `create_tbank_phone_stealth` | ~`T_phone_original.pdf` |
+| Card → T-Bank | `create_tbank_card_tbank_stealth` | ~`T_card_tbank_original.pdf` |
+| Nocomm | `create_tbank_nocomm_stealth` | ~`T_nocomm_original.pdf` |
+| Statement | `create_tbank_statement_stealth` | ~`T_statement_original.pdf` |
+
+No parallel demo generators. No soft-remap of user FIO to donor names as the primary fix.
+
+## Laws ported from Alfa SBP (T-Bank wording)
+
+### 1. Next-file / next-probe — one axis only
+
+Same as Alfa PASS 0433: change **one** internal axis per live send (font / CS length / keywords token / SBP-id knot / date skew / twin choice…).  
+Do **not** retarget face + date + bank + amount together. Do not spam regenerations with the same mismatch.
+
+### 2. NEG / FAKE that is already structurally green
+
+Mirror Alfa 3a: if Proton/`@bankpdfbot` ❌ but F1/F2 sizes, CSA, Keywords↔date, and edge anchors are already in-band, the FAIL is **not** a face-field bug.
+
+Byte-compare remaining diffs vs that method’s `T_*_original.pdf` / corpus twin:
+
+- rebuilt **FontFile2** (and twin vs hydrate choice)
+- rewritten **Content** (exact flate / no `)Tj`/ET pads on SBP)
+- **ToUnicode / cmap** (labels not PUA/mojibake)
+- live checker **reputation / chat cache** (known SHA ✅ does not prove the new file)
+
+Forbidden: retune op/SBP-id / phone / card routes from that ❌; clone the FAIL identity to “fix” the verdict.
+
+### 3. PASS specimen — freeze, don’t clone
+
+When a method has a live PASS specimen (SBP: `docs/specimen_tbank_sbp_*` / night_dual seq):
+
+- Do not ship clones of that face/op/SBP-id/prefix bundle
+- Next probe changes one axis only
+- Date on PASS may be **not** send-time — do not force «сейчас» as the only valid probe
+
+### 4. Ship gates (soft vs HARD)
+
+- **Never soft-ship over Proton HARD** (FONTFILE2 atlas, Keywords token, CSA, head epoch, CONTENT_SKELETON / ET_WHITESPACE). Prefer GEN_NONE / reject.
+- Soft-ship only where existing T-Bank code already allows (e.g. size within donor ±small drift after pad) — same spirit as Alfa soft size, **stricter** on font HARD.
+- No `BAKE_SHELL` / fat unlocked as the fix for font-outlier FAKE.
+
+### 5. FontFile2 / subset (T-Bank mapping of Alfa FO laws)
+
+Alfa: FO 1..N, aligned SFNT end, no entropy after tables, unique subset prefix.  
+T-Bank equivalent:
+
+- Prefer **corpus SHA twin** FontFile2 when it covers the face (byte-identical)
+- Else hydrate from multi-corpus glyph library with **shell-scale** advances only
+- Full charset law (all Cyrillic + digits) — union of twins, not one donor
+- Randomize subset tag / `/ID` each ship; do not reuse a known PASS FF2 SHA as a new “fresh” file
+- Keep F1 CSA force + head epoch **last** (do not “fix” with math-valid CSA)
+
+### 6. Content / face
+
+- Equal-face rewrite so decoded CS lands on donor length **naturally** (SBP); phone/nocomm/card keep their exact-flate recipes
+- Trailing pad only where that method already pads; never lead-pad that breaks RIGHT `250` / LEFT `20`
+- Merge painted ToUnicode so UI labels stay readable
+
+### 7. Identity / anti-spam (Alfa remember_* spirit)
+
+Across SBP / phone / card / nocomm / statement:
+
+- Do not silently re-ship the exact same face+amount+ids bundle as a “new” check when the channel already remembered it — regenerate ids/minute or soft-warn, don’t infinite GEN_NONE loops in the bot
+- Unique operation / SBP / receipt identifiers per successful ship when the method auto-generates them
+
+## Forbidden (ported)
+
+- Inventing a third layout for any T-Bank method
+- Applying Alfa Oracle Producer / `35.45`/`304.75` / Java6-6/6 / FO CID gates **as-is** to T-Bank PDFs
+- Removing or weakening Keywords↔date, CSA pin, twin recipe, or `x1=250` to “match Alfa”
+- Spamming live validators with the same FAIL payload
+- Treating chat-cache ✅ of an original SHA as proof a new gen will pass
+
+## When fixing FAKE
+
+1. Match that method’s specimen / `T_*_original.pdf` metrics and the rules in the table above.  
+2. Apply this discipline (one axis, byte-diff, no clone).  
+3. Deploy yourself (`always-deploy`).

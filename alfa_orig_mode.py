@@ -11,13 +11,63 @@ import fitz
 logger = logging.getLogger(__name__)
 
 _NBSP = "\u00a0"
-_TM_RE = re.compile(rb"1 0 0 1 ([\d.]+) ([\d.]+) Tm")
+# Quartz phone often splits `x y` / `Tm` across a newline.
+_TM_RE = re.compile(
+    rb"(?:1 0 0 1|[\d.]+ 0 0 [\d.]+) ([\d.]+) ([\d.]+)\s+Tm"
+)
+# Semantic trailing NBSP (CID 000A): datetime, operation id, FIO, RUR amounts.
+# phone / bank / account / SBP / message — no trailing NBSP.
+_TRAILING_NBSP_KEYS = frozenset({
+    "receiver", "operation_num", "date_time", "date_formed",
+})
+
+
+def _need_len(text: str, *, key: str = "") -> int:
+    """Visible slot length. Keep one trailing NBSP on RUR / FIO / op number.
+
+    Do not treat every field that happens to end with NBSP as +1 — that grew
+    date_time slots and made content flate miss donor /Length (1001).
+    """
+    stripped = (text or "").rstrip(_NBSP)
+    if stripped.endswith("RUR") or key in _TRAILING_NBSP_KEYS:
+        return len(stripped) + 1
+    return len(stripped)
+
+
+def _slot_face_text(new_text: str, *, key: str = "") -> str:
+    """Keep trailing NBSP only on RUR / FIO / operation_num.
+
+    date_time formatter may add a spare NBSP after «мск» — 03 did not paint it.
+    """
+    t = (new_text or "").rstrip(_NBSP)
+    if t.endswith("RUR") or key in _TRAILING_NBSP_KEYS:
+        t = t + _NBSP
+    return t
 
 
 def _parse_bfchar(tu: str) -> Dict[int, int]:
+    """ToUnicode → {cid: codepoint}. Oracle bfchar + Quartz bfrange."""
     out: Dict[int, int] = {}
-    for m in re.finditer(r"<([0-9A-Fa-f]{4})>\s*<([0-9A-Fa-f]{4})>", tu):
-        out[int(m.group(1), 16)] = int(m.group(2), 16)
+    for block in re.finditer(r"\d+\s+beginbfrange(.*?)endbfrange", tu, re.S | re.I):
+        body = block.group(1)
+        for lo, hi, base in re.findall(
+            r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", body
+        ):
+            start, stop, uni0 = int(lo, 16), int(hi, 16), int(base, 16)
+            for off, cid in enumerate(range(start, stop + 1)):
+                out[cid] = uni0 + off
+        for lo, hi, arr in re.findall(
+            r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\[([^\]]*)\]", body
+        ):
+            start, stop = int(lo, 16), int(hi, 16)
+            vals = re.findall(r"<([0-9A-Fa-f]+)>", arr)
+            for off, cid in enumerate(range(start, stop + 1)):
+                if off >= len(vals):
+                    break
+                out[cid] = int(vals[off], 16)
+    for block in re.finditer(r"beginbfchar(.*?)endbfchar", tu, re.S | re.I):
+        for m in re.finditer(r"<([0-9A-Fa-f]{4})>\s*<([0-9A-Fa-f]{4})>", block.group(1)):
+            out[int(m.group(1), 16)] = int(m.group(2), 16)
     return out
 
 
@@ -573,12 +623,12 @@ class AlfaOrigContext:
         row = self._slot_at(y, x)
         return row[2] if row else 0
 
-    def fits_text_at(self, y: float, x: float, new_text: str) -> bool:
+    def fits_text_at(self, y: float, x: float, new_text: str, *, key: str = "") -> bool:
         row = self._slot_at(y, x)
         if not row:
             return False
         _, _, slot_chars, _ = row
-        t = new_text.rstrip(_NBSP)
+        t = _slot_face_text(new_text, key=key)
         if len(t) > slot_chars:
             return False
         if len(t) < slot_chars:
@@ -591,8 +641,8 @@ class AlfaOrigContext:
         for key, (y, x) in coords.items():
             if key not in prepared:
                 continue
-            if not self.fits_text_at(y, x, prepared[key]):
-                need = len(prepared[key].rstrip(_NBSP))
+            if not self.fits_text_at(y, x, prepared[key], key=key):
+                need = _need_len(prepared[key], key=key)
                 have = self.slot_size_at(y, x)
                 return False, f"{key}:{need}>{have}"
         body = "".join(prepared.get(k, "") for k in coords)
@@ -601,13 +651,13 @@ class AlfaOrigContext:
             return False, f"glyph:{''.join(miss[:5])}"
         return True, ""
 
-    def replace_at(self, y: float, x: float, new_text: str) -> bool:
+    def replace_at(self, y: float, x: float, new_text: str, *, key: str = "") -> bool:
         row = self._slot_at(y, x)
         if not row:
             return False
         start, end, slot_chars, _old_t = row
         nbsp = _NBSP
-        t = new_text.rstrip(nbsp)
+        t = _slot_face_text(new_text, key=key)
         if len(t) > slot_chars:
             logger.warning(
                 "Alfa replace too long at y=%s: need %d have %d (%s)",
@@ -653,8 +703,90 @@ class AlfaOrigContext:
         self.stream[end:end] = pad_hex
         return True
 
+    def shrink_slot_at(self, y: float, x: float, new_chars: int) -> bool:
+        """Укоротить hex-слот до new_chars (хвост — пад). Декодированная длина CS падает."""
+        row = self._slot_at(y, x)
+        if not row:
+            return False
+        start, end, slot_chars, _old = row
+        if new_chars == slot_chars:
+            return True
+        if new_chars < 1 or new_chars > slot_chars:
+            return False
+        new_end = start + new_chars * 4
+        if new_end > end or (end - new_end) % 4 != 0:
+            return False
+        del self.stream[new_end:end]
+        return True
+
+    def rebalance_slots(
+        self,
+        coords: Dict[str, Tuple[float, float]],
+        prepared: Dict[str, str],
+        *,
+        extra_need: Optional[Dict[str, int]] = None,
+    ) -> bool:
+        """Grow short fields; steal trailing hex from long ones so decoded CS stays put."""
+        extra = extra_need or {}
+        grows: List[Tuple[str, float, float, int]] = []
+        surplus: List[Tuple[str, float, float, int, int]] = []
+        for key, (y, x) in coords.items():
+            if key not in prepared:
+                continue
+            need = _need_len(prepared[key], key=key) + int(extra.get(key, 0))
+            have = self.slot_size_at(y, x)
+            if have <= 0:
+                continue
+            if need > have:
+                grows.append((key, y, x, need))
+            elif have > need:
+                surplus.append((key, y, x, have, need))
+        total_grow = 0
+        for _key, y, x, need in grows:
+            have = self.slot_size_at(y, x)
+            total_grow += max(0, need - have)
+        stolen = 0
+        surplus.sort(key=lambda t: t[3] - t[4], reverse=True)
+        for _key, y, x, have, need in surplus:
+            if stolen >= total_grow:
+                break
+            take = min(have - need, total_grow - stolen)
+            if take <= 0:
+                continue
+            if self.shrink_slot_at(y, x, have - take):
+                stolen += take
+        for _key, y, x, need in grows:
+            if not self.grow_slot_at(y, x, need):
+                return False
+        return True
+
+    def trim_spare_pad(
+        self,
+        coords: Dict[str, Tuple[float, float]],
+        prepared: Dict[str, str],
+        *,
+        extra_need: Optional[Dict[str, int]] = None,
+    ) -> bool:
+        """Drop one trailing pad CID from the longest spare slot (flate overshoot)."""
+        extra = extra_need or {}
+        best = None
+        best_spare = 0
+        for key, (y, x) in coords.items():
+            if key not in prepared:
+                continue
+            need = _need_len(prepared[key], key=key) + int(extra.get(key, 0))
+            have = self.slot_size_at(y, x)
+            spare = have - need
+            if spare > best_spare:
+                best_spare = spare
+                best = (y, x, have)
+        if not best:
+            return False
+        y, x, have = best
+        return self.shrink_slot_at(y, x, have - 1)
+
     def ensure_slot_at(self, y: float, x: float, text: str) -> bool:
-        need = len((text or "").rstrip(_NBSP))
+        need = _need_len(text)
         if need <= 0:
             return True
         if self.slot_size_at(y, x) >= need:
@@ -665,6 +797,16 @@ class AlfaOrigContext:
         stream_b = bytes(self.stream)
         # near-oracle flate: не трогаем image/font (распознавание), content — near zlib-6.
         compressed = _flate_fit_size(stream_b, self.orig_comp_len, self.zlib_level)
+        if compressed is None:
+            nudged = _nudge_stream_exact_flate(
+                stream_b, self.orig_comp_len, self.zlib_level,
+            )
+            if nudged is not None:
+                self.stream[:] = bytearray(nudged)
+                stream_b = bytes(self.stream)
+                compressed = _flate_fit_size(
+                    stream_b, self.orig_comp_len, self.zlib_level,
+                )
         if compressed is None:
             # SafeCheck «структура»: never Length/xref-rebuild content stream.
             # Prefer GEN_FAIL → retry another payload/donor over structure FAKE.
@@ -684,6 +826,21 @@ class AlfaOrigContext:
         out[self.cs_cs : self.cs_ce] = compressed
         from sber_dynamic import _strip_pdf_eof_tail
         return _strip_pdf_eof_tail(bytes(out))
+
+    def commit_rebuild(self) -> Optional[bytes]:
+        """Java Deflater(6,false) + /Length + xref + startxref (05_fio PASS)."""
+        from tbank_sbp_stealth import _patch_length_and_rebuild
+        from sber_dynamic import _strip_pdf_eof_tail
+
+        stream_b = bytes(self.stream)
+        compressed = _oracle_near_flate(stream_b, self.zlib_level)
+        patched = _patch_length_and_rebuild(
+            bytearray(self.pdf_bytes), self.cs_cs, self.cs_ce, compressed,
+        )
+        if patched is None:
+            logger.warning("Alfa: xref rebuild after Deflater failed")
+            return None
+        return _strip_pdf_eof_tail(bytes(patched))
 
     @property
     def available_chars(self) -> set:

@@ -1,0 +1,18 @@
+---
+description: Live @bankpdfbot PASS ca9cca31 — 16.08 Gazprom Alfa SBP; do not clone.
+alwaysApply: true
+---
+
+# Alfa SBP live PASS ca9cca31 (K-ALFA-SBP-PASS-CA9C)
+
+Live `@bankpdfbot` ✅ 16.08.2026, **direct**:
+`docs/specimen_alfa_sbp_PASS_ca9cca31badbe952.pdf` (58194, SHA `ca9cca31badbe952…`).
+
+```text
+receiver: Григорий Игоревич Г
+bank:     Газпромбанк
+phone:    +7 (925) 990-12-25
+amount:   13465
+```
+
+Next unique SHA on the same chat ❌ immediately. Do not clone this identity.

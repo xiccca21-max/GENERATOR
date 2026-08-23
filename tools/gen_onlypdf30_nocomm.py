@@ -23,7 +23,7 @@ from onlypdf_gate import generate_onlypdf_batch  # noqa: E402
 from onlypdf_safe_names import (  # noqa: E402
     CYR_NO_YO_TVERD,
     coverage_report,
-    pick_sender_pair,
+    pick_hard_tbank_pair,
 )
 from tbank_nocomm_stealth import create_tbank_nocomm_stealth  # noqa: E402
 import fitz  # noqa: E402
@@ -85,12 +85,11 @@ def _payload(i: int, attempt: int = 0) -> dict:
 
     d = pool[(i + attempt) % len(pool)]
     ss = (d["ss"] + 1 + attempt + i) % 60
-    sender = d["sender"] if len(d["sender"]) >= 6 else (
-        f"{pick_sender_pair(i, attempt)[0]} {pick_sender_pair(i, attempt)[1]}"
-    )
+    first, last = pick_hard_tbank_pair(i, attempt)
+    sender = f"{first} {last}"
     return {
         "date_time": f"{d['day']}, {d['hh']:02d}:{d['mm']:02d}:{ss:02d}",
-        "amount": str(int(d["digs"])),
+        "amount": str(int(d["digs"]) + (i * 17 + attempt) % 90),
         "sender": sender,
         "card": d["card"],
         "receipt_num": "авто",
@@ -111,7 +110,7 @@ def _local_ok(pdf: bytes) -> tuple[bool, str]:
         return False, f"open:{exc}"
     if "На карту" not in text:
         return False, "no-nocomm-title"
-    if "DOCS-2035" not in kw:
+    if "DOCS-2035" not in kw and "| 991" not in kw and not kw.strip().endswith("991"):
         return False, f"bad-kw:{kw.split('|')[-1].strip() if kw else '?'}"
     m = re.search(r"Квитанция\s+№\s+([\d-]+)", text)
     if m:

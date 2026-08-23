@@ -1,0 +1,32 @@
+---
+description: Live @bankpdfbot PASS 9faac125 — 16.08 send-time T-Bank Alfa SBP; do not clone this identity.
+alwaysApply: true
+---
+
+# Alfa SBP live PASS 9faac125 (K-ALFA-SBP-PASS-9FAA)
+
+Live `@bankpdfbot` ✅ 16.08.2026, **direct** (not cache, not OnlyPDF):
+`docs/specimen_alfa_sbp_PASS_9faac125e7171328.pdf` (57868, SHA `9faac125e7171328…`).
+Source: `output/bankpdf_checks/ab_g04_tbank_galina.pdf`.
+
+```text
+date:     16.08.2026 14:10:27 мск  (send-time)
+amount:   33470
+receiver: Галина Ивановна Б
+bank:     Т-Банк
+phone:    +7 (916) 551-20-44
+account:  40817810904263517753 ledger 042
+op:       C161608261146186
+sbp:      B6228111021977060B10130011821301
+prefix:   NPOQHM
+FF2:      20442 aligned, sha16 6f4ed6977cacb55b, CSA 0x68C48484
+```
+
+Parser trap: `/start` help quotes «признаки подделки». Verdict is only the reply **after** the PDF (`✅ Чек Альфабанка по СБП`).
+
+Same-recipe files **without** this face still ❌: g05 Борис / g06 Виктор (916, 042, T-Bank, aligned FF2). Do not treat 916+042+T-Bank as sufficient.
+
+## Next file law
+
+Change **one** internal axis only. Do not clone this identity.
+Do not retarget face+date+bank together.

@@ -1,0 +1,194 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<jasperReport xmlns="http://jasperreports.sourceforge.net/jasperreports"
+              xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+              xsi:schemaLocation="http://jasperreports.sourceforge.net/jasperreports http://jasperreports.sourceforge.net/xsd/jasperreport.xsd"
+              name="ReceiptCard"
+              pageWidth="270"
+              pageHeight="431"
+              columnWidth="270"
+              leftMargin="0" rightMargin="0" topMargin="0" bottomMargin="0"
+              whenNoDataType="AllSectionsNoDetail">
+  <property name="net.sf.jasperreports.export.pdf.force.linebreak.policy" value="true"/>
+  <property name="net.sf.jasperreports.awt.ignore.missing.font" value="true"/>
+  <import value="tbank.jasper.ReceiptApp"/>
+  <parameter name="date" class="java.lang.String"/>
+  <parameter name="amount" class="java.lang.String"/>
+  <parameter name="amountBig" class="java.lang.String"/>
+  <parameter name="sender" class="java.lang.String"/>
+  <parameter name="receiver" class="java.lang.String"/>
+  <parameter name="phone" class="java.lang.String"/>
+  <parameter name="bank" class="java.lang.String"/>
+  <parameter name="account" class="java.lang.String"/>
+  <parameter name="card" class="java.lang.String"/>
+  <parameter name="sbpId" class="java.lang.String"/>
+  <parameter name="sbpSuffix" class="java.lang.String"/>
+  <parameter name="receipt" class="java.lang.String"/>
+  <parameter name="transfer" class="java.lang.String"/>
+  <parameter name="status" class="java.lang.String"/>
+  <parameter name="commission" class="java.lang.String"/>
+  <title>
+    <band height="431" splitType="Stretch">
+    <image scaleImage="FillFrame" onErrorType="Blank">
+      <reportElement x="121" y="28" width="28" height="28"/>
+      <imageExpression><![CDATA[tbank.jasper.ReceiptApp.resource("images/logo.png")]]></imageExpression>
+    </image>
+    <textField>
+      <reportElement x="20" y="79" width="120" height="10" forecolor="#333333"/>
+      <textElement textAlignment="Left" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="8" isBold="false" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <textFieldExpression><![CDATA[$P{date}]]></textFieldExpression>
+    </textField>
+    <staticText>
+      <reportElement x="19" y="92" width="80" height="20" forecolor="#333333"/>
+      <textElement textAlignment="Left" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="16" isBold="true" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <text><![CDATA[Итого]]></text>
+    </staticText>
+    <textField>
+      <reportElement x="80" y="92" width="158" height="20" forecolor="#333333"/>
+      <textElement textAlignment="Right" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="16" isBold="true" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <textFieldExpression><![CDATA[$P{amountBig}]]></textFieldExpression>
+    </textField>
+    <textField>
+      <reportElement x="238" y="95" width="12" height="16" forecolor="#333333"/>
+      <textElement textAlignment="Left" verticalAlignment="Top">
+        <font fontName="ALSRubl" size="16" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <textFieldExpression><![CDATA["i"]]></textFieldExpression>
+    </textField>
+    <line>
+      <reportElement x="19" y="121" width="230" height="1" forecolor="#FFDD2D"/>
+      <graphicElement>
+        <pen lineWidth="0.75" lineColor="#FFDD2D"/>
+      </graphicElement>
+    </line>
+    <staticText>
+      <reportElement x="20" y="134" width="100" height="12" forecolor="#333333"/>
+      <textElement textAlignment="Left" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="9" isBold="false" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <text><![CDATA[Перевод]]></text>
+    </staticText>
+    <textField>
+      <reportElement x="20" y="134" width="230" height="12" forecolor="#333333"/>
+      <textElement textAlignment="Right" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="9" isBold="false" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <textFieldExpression><![CDATA[$P{transfer}]]></textFieldExpression>
+    </textField>
+    <staticText>
+      <reportElement x="20" y="154" width="100" height="12" forecolor="#333333"/>
+      <textElement textAlignment="Left" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="9" isBold="false" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <text><![CDATA[Статус]]></text>
+    </staticText>
+    <textField>
+      <reportElement x="20" y="154" width="230" height="12" forecolor="#333333"/>
+      <textElement textAlignment="Right" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="9" isBold="false" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <textFieldExpression><![CDATA[$P{status}]]></textFieldExpression>
+    </textField>
+    <staticText>
+      <reportElement x="20" y="174" width="80" height="12" forecolor="#333333"/>
+      <textElement textAlignment="Left" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="9" isBold="false" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <text><![CDATA[Сумма]]></text>
+    </staticText>
+    <textField>
+      <reportElement x="20" y="174" width="224" height="12" forecolor="#333333"/>
+      <textElement textAlignment="Right" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="9" isBold="false" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <textFieldExpression><![CDATA[$P{amount}]]></textFieldExpression>
+    </textField>
+    <textField>
+      <reportElement x="244" y="175" width="6" height="10" forecolor="#333333"/>
+      <textElement textAlignment="Left" verticalAlignment="Top">
+        <font fontName="ALSRubl" size="9" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <textFieldExpression><![CDATA["i"]]></textFieldExpression>
+    </textField>
+    <staticText>
+      <reportElement x="20" y="195" width="120" height="12" forecolor="#333333"/>
+      <textElement textAlignment="Left" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="9" isBold="false" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <text><![CDATA[Карта получателя]]></text>
+    </staticText>
+    <textField>
+      <reportElement x="20" y="195" width="230" height="12" forecolor="#333333"/>
+      <textElement textAlignment="Right" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="9" isBold="false" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <textFieldExpression><![CDATA[$P{card}]]></textFieldExpression>
+    </textField>
+    <staticText>
+      <reportElement x="20" y="215" width="100" height="12" forecolor="#333333"/>
+      <textElement textAlignment="Left" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="9" isBold="false" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <text><![CDATA[Отправитель]]></text>
+    </staticText>
+    <textField>
+      <reportElement x="20" y="215" width="230" height="12" forecolor="#333333"/>
+      <textElement textAlignment="Right" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="9" isBold="false" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <textFieldExpression><![CDATA[$P{sender}]]></textFieldExpression>
+    </textField>
+    <staticText>
+      <reportElement x="20" y="235" width="100" height="12" forecolor="#333333"/>
+      <textElement textAlignment="Left" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="9" isBold="false" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <text><![CDATA[Получатель]]></text>
+    </staticText>
+    <textField>
+      <reportElement x="20" y="235" width="230" height="12" forecolor="#333333"/>
+      <textElement textAlignment="Right" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="9" isBold="false" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <textFieldExpression><![CDATA[$P{receiver}]]></textFieldExpression>
+    </textField>
+    <image scaleImage="FillFrame" onErrorType="Blank">
+      <reportElement x="66" y="264" width="175" height="63"/>
+      <imageExpression><![CDATA[tbank.jasper.ReceiptApp.resource("images/stamp.png")]]></imageExpression>
+    </image>
+    <textField>
+      <reportElement x="20" y="364" width="230" height="12" forecolor="#333333"/>
+      <textElement textAlignment="Left" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="9" isBold="false" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <textFieldExpression><![CDATA[$P{receipt}]]></textFieldExpression>
+    </textField>
+    <staticText>
+      <reportElement x="20" y="381" width="230" height="12" forecolor="#333333"/>
+      <textElement textAlignment="Left" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="9" isBold="false" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <text><![CDATA[По вопросам зачисления обращайтесь к получателю]]></text>
+    </staticText>
+    <staticText>
+      <reportElement x="20" y="398" width="73" height="12" forecolor="#333333"/>
+      <textElement textAlignment="Left" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="9" isBold="false" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <text><![CDATA[Служба поддержки ]]></text>
+    </staticText>
+    <staticText>
+      <reportElement x="93" y="398" width="80" height="12" forecolor="#333333"/>
+      <textElement textAlignment="Left" verticalAlignment="Top">
+        <font fontName="TinkoffSans" size="9" isBold="false" pdfEncoding="Identity-H" isPdfEmbedded="true"/>
+      </textElement>
+      <text><![CDATA[fb@tbank.ru]]></text>
+    </staticText>
+    </band>
+  </title>
+</jasperReport>

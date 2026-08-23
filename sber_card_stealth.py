@@ -137,6 +137,8 @@ def _prepare_card(data: Dict) -> Dict[str, str]:
 def create_sber_card_stealth(data: Dict) -> Optional[bytes]:
     """PDF «По карте в другой банк»."""
     from sber_dynamic import build_dynamic_sber_card
+    from openpdf_deflate import _pad_after_et_burned
+    import fitz
 
     if not os.path.isfile(CARD_SHELL):
         logger.error("Sber card shell not found: %s", CARD_SHELL)
@@ -144,6 +146,40 @@ def create_sber_card_stealth(data: Dict) -> Optional[bytes]:
 
     prepared = _prepare_card(data)
     result = build_dynamic_sber_card(prepared)
-    if result:
-        logger.info("Sber card OK (%d bytes)", len(result))
+    if not result:
+        return None
+    try:
+        doc = fitz.open(stream=result, filetype="pdf")
+        stream = doc.xref_stream(doc[0].get_contents()[0])
+        text = doc[0].get_text()
+        doc.close()
+    except Exception:
+        logger.warning("Sber card: reject unreadable candidate")
+        return None
+    if _pad_after_et_burned(stream):
+        logger.warning("Sber card: reject pad-after-ET")
+        return None
+    bt, et = stream.count(b"BT"), stream.count(b"ET")
+    if bt != et:
+        logger.warning("Sber card: BT/ET mismatch %d/%d", bt, et)
+        return None
+    flat = re.sub(r"\s+", " ", (text or "").replace("\u202f", " ")).strip()
+    for key in ("amount", "commission", "charged"):
+        want = re.sub(r"\s+", " ", str(prepared.get(key) or "")).strip()
+        if want and want not in flat:
+            logger.warning("Sber card: missing %s=%r", key, want)
+            return None
+    try:
+        from tools.emit_quality_gate import count_odd_tj
+    except Exception:
+        try:
+            from emit_quality_gate import count_odd_tj
+        except Exception:
+            count_odd_tj = None  # type: ignore
+    if count_odd_tj is not None:
+        odd, total = count_odd_tj(result)
+        if odd:
+            logger.warning("Sber card: odd Tj %d/%d — reject", odd, total)
+            return None
+    logger.info("Sber card OK (%d bytes)", len(result))
     return result

@@ -24,8 +24,6 @@ from onlypdf_gate import generate_onlypdf_batch  # noqa: E402
 from onlypdf_safe_names import (  # noqa: E402
     CYR_NO_YO_TVERD,
     coverage_report,
-    force_rare_pair,
-    pick_sender_pair,
 )
 from alfa_phone_stealth import create_alfa_phone_stealth  # noqa: E402
 from alfa_corpus import canonical_paths  # noqa: E402
@@ -35,32 +33,41 @@ import fitz  # noqa: E402
 _USED_OPS: set[str] = set()
 _PHONE_CHARS: set[str] | None = None
 
-# Короткие / средние / длинные — только буквы из NATIVE phone charset.
-_FIO_SHORT = [
-    "Павлов К",
-    "Сидоров А",
-    "Волкова Н",
-    "Соколов И",
-    "Попова А",
-    "Лебедев С",
+# Oracle-style long face: Имя Отчество Ф (фамилия только инициал).
+_FIO_FULL = [
+    "Константин Владиславович Щ",
+    "Владислав Александрович Х",
+    "Екатерина Станиславовна Ж",
+    "Мирослава Вячеславовна Ц",
+    "Станислав Геннадьевич Ю",
+    "Александра Валентиновна Ш",
+    "Вячеслав Константинович Г",
+    "Кристина Владимировна Б",
+    "Максимилиан Сергеевич Т",
+    "Велимира Святославовна Н",
+    "Святослав Ростиславович М",
+    "Ростислава Дмитриевна К",
+    "Иннокентий Валерьевич П",
+    "Валентина Георгиевна Л",
+    "Георгий Иннокентьевич С",
+    "Эмилия Вячеславовна Ч",
+    "Харитон Станиславович Д",
+    "Всеволод Александрович Р",
+    "Серафима Владиславовна О",
+    "Олимпиада Сергеевна У",
+    "Геннадий Мирославович З",
+    "Борислав Константинович Е",
+    "Елизавета Святославовна Ю",
+    "Владислава Максимилиановна Ж",
+    "Аристарх Константинович Б",
+    "Клементина Георгиевна Ш",
+    "Доброслав Сергеевич П",
+    "Милослава Геннадьевна Т",
+    "Валерия Иннокентьевна Г",
+    "Серафим Вячеславович Т",
 ]
-_FIO_MED = [
-    "Кузнецов В",
-    "Новикова Е",
-    "Морозов Д",
-    "Козлова П",
-    "Андреев Б",
-    "Николаев К",
-]
-_FIO_LONG = [
-    "Алексеева Виктория",
-    "Дмитриев Николай",
-    "Сергеева Лариса",
-    "Александров Павел",
-    "Владимиров Сергей",
-    "Николаева Марина",
-]
-_SAFE_FALLBACKS = _FIO_SHORT + _FIO_MED + _FIO_LONG
+_USED_FIO: set[str] = set()
+_SAFE_FALLBACKS = _FIO_FULL
 
 
 def _phone_chars() -> set[str]:
@@ -82,35 +89,16 @@ def _text_ok(text: str) -> bool:
 
 
 def _safe_receiver(i: int, attempt: int) -> str:
-    rare = force_rare_pair(i % 30)
-    if rare and attempt == 0:
-        name = f"{rare[0]} {rare[1]}"
-        if _text_ok(name):
-            return name
-    mode = (i + attempt) % 4
-    pools = (_FIO_SHORT, _FIO_MED, _FIO_LONG)
-    if mode < 3:
-        pool = [n for n in pools[mode] if _text_ok(n)]
-        if pool:
-            return pool[(i * 7 + attempt) % len(pool)]
-    for a in range(0, 120):
-        fn, ln = pick_sender_pair(i + a, attempt + a)
-        if mode == 0:
-            name = f"{ln} {fn[:1]}"
-        elif mode == 1:
-            name = f"{fn} {ln}"
-        else:
-            name = f"{ln} {fn}"
-        if _text_ok(name):
-            # Укорачиваем / удлиняем фамилию на ретраях.
-            if attempt % 3 == 1 and " " in name:
-                parts = name.split()
-                if len(parts[0]) > 5:
-                    parts[0] = parts[0][: max(4, len(parts[0]) - 2)]
-                    name = " ".join(parts)
-            return name
-    pool = [n for n in _SAFE_FALLBACKS if _text_ok(n)] or _SAFE_FALLBACKS
-    return pool[(i + attempt) % len(pool)]
+    pool = [n for n in _FIO_FULL if _text_ok(n)] or [n for n in _FIO_FULL]
+    n = max(1, len(pool))
+    for offset in range(n):
+        name = pool[(i * 13 + attempt * 5 + offset) % n]
+        key = " ".join(name.lower().split())
+        if key in _USED_FIO:
+            continue
+        _USED_FIO.add(key)
+        return name
+    return pool[(i * 13 + attempt * 5) % n]
 
 
 def _extract_alfa_phone_fields(path: str) -> dict | None:
@@ -156,6 +144,7 @@ def _payload(i: int, attempt: int = 0) -> dict:
                 "mm": dt.minute,
                 "ss": dt.second,
                 "digs": digs,
+                "date_formed": orig.get("date_formed") or "",
                 "receiver": orig.get("receiver") or "",
                 "account": orig.get("account") or "",
                 "message": orig.get("message") or "Перевод",
@@ -164,6 +153,7 @@ def _payload(i: int, attempt: int = 0) -> dict:
     if not pool:
         pool = [{
             "day": "15.06.2026", "hh": 14, "mm": 30, "ss": 0, "digs": "3500",
+            "date_formed": "",
             "receiver": "Кузнецов В", "account": "40817810123456789012",
             "message": "Перевод",
         }]
@@ -183,6 +173,8 @@ def _payload(i: int, attempt: int = 0) -> dict:
         "operation_num": "авто",
         "message": d["message"],
     }
+    if d.get("date_formed"):
+        out["date_formed"] = d["date_formed"]
     if d["account"] and "авто" not in d["account"].lower():
         out["account"] = d["account"]
     return out

@@ -25,6 +25,8 @@ from telegram.ext import (
 from telegram import BotCommand, Message, Bot
 import urllib.request  # noqa: F401 - used via cryptopay
 
+from pdf_forge import forge_commands, register_pdf_forge
+
 try:
     import cryptopay
 except ImportError:
@@ -260,13 +262,19 @@ except ImportError:
 
 # Альфа-Банк
 try:
-    from alfa_sbp_stealth import create_alfa_sbp_stealth, check_text as alfa_check_text
+    from alfa_sbp_stealth import (
+        create_alfa_sbp_stealth,
+        check_text as alfa_check_text,
+        alfa_sbp_reject_reason,
+    )
     ALFA_SBP_AVAILABLE = True
 except ImportError:
     ALFA_SBP_AVAILABLE = False
     def create_alfa_sbp_stealth(*_a, **_k):
         return None
     def alfa_check_text(text): return []
+    def alfa_sbp_reject_reason(*_a, **_k):
+        return None
 
 try:
     from alfa_card_stealth import create_alfa_card_stealth
@@ -285,7 +293,22 @@ except ImportError:
         return None
     def alfa_phone_check_text(text): return []
 
-ALFA_AVAILABLE = ALFA_SBP_AVAILABLE or ALFA_CARD_AVAILABLE or ALFA_PHONE_AVAILABLE
+try:
+    from alfa_statement_stealth import (
+        create_alfa_statement_stealth,
+        check_text as alfa_statement_check_text,
+    )
+    ALFA_STATEMENT_AVAILABLE = True
+except ImportError:
+    ALFA_STATEMENT_AVAILABLE = False
+    def create_alfa_statement_stealth(*_a, **_k):
+        return None
+    def alfa_statement_check_text(text): return []
+
+ALFA_AVAILABLE = (
+    ALFA_SBP_AVAILABLE or ALFA_CARD_AVAILABLE
+    or ALFA_PHONE_AVAILABLE or ALFA_STATEMENT_AVAILABLE
+)
 ALFA_CHARS = set()  # legacy; проверка через alfa_check_text
 
 # Озон Банк
@@ -588,10 +611,10 @@ OZON_SBP_EXAMPLE = """10000
 
 ALFA_SBP_EXAMPLE = """10755
 Диана Камильевна П
-79991234567
-Озон Банк
+79163407825
+Т-Банк
 сейчас
-40817810123456789012
+авто
 авто
 авто
 Перевод"""
@@ -609,6 +632,17 @@ ALFA_PHONE_EXAMPLE = """12500
 40817810123456780922
 авто
 авто"""
+
+ALFA_STATEMENT_EXAMPLE = """40817810404219876543
+16.08.2026
+Смирнова Анна Петровна
+авто
+15.08.2026
+15.08.2026
+10000
+15.08.2026
+авто
+Перевод через Систему быстрых платежей. Без НДС."""
 
 ALFA_EXAMPLE = ALFA_SBP_EXAMPLE
 
@@ -670,6 +704,7 @@ BTN_SBER_CARD_OTHER = "💳 По карте в другой банк"
 BTN_ALFA_SBP = "📲 СБП"
 BTN_ALFA_CARD = "💳 Карта на карту"
 BTN_ALFA_PHONE = "📱 По телефону (Альфа→Альфа)"
+BTN_ALFA_STATEMENT = "📄 Выписка"
 
 BTN_BACK = "◀️ Назад"
 BTN_HOME = "🏠 На главную"
@@ -1639,7 +1674,7 @@ def alfa_submethod_keyboard():
     return ReplyKeyboardMarkup(
         [
             [BTN_ALFA_SBP, BTN_ALFA_CARD],
-            [BTN_ALFA_PHONE],
+            [BTN_ALFA_PHONE, BTN_ALFA_STATEMENT],
             [BTN_BACK],
         ],
         resize_keyboard=True,
@@ -1852,7 +1887,7 @@ async def callback_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return await ozon_submenu_handler(update, context)
     if text in (BTN_SBER_SBP, BTN_SBER_PHONE, BTN_SBER_CARD_OTHER):
         return await sber_submenu_handler(update, context)
-    if text in (BTN_ALFA_SBP, BTN_ALFA_CARD, BTN_ALFA_PHONE):
+    if text in (BTN_ALFA_SBP, BTN_ALFA_CARD, BTN_ALFA_PHONE, BTN_ALFA_STATEMENT):
         return await alfa_submenu_handler(update, context)
     if text == BTN_BACK:
         await update.effective_message.reply_text(
@@ -3088,7 +3123,7 @@ async def alfa_submenu_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             "Сумма\n"
             "Получатель\n"
             "Телефон\n"
-            "Банк получателя\n"
+            "Банк получателя (любой: Т-Банк, Сбер, Озон, ПСБ, WB, ВТБ, …)\n"
             "Дата (или 'сейчас' / 'авто')\n"
             "Счёт списания (20 цифр)\n"
             "Номер операции (или 'авто')\n"
@@ -3152,6 +3187,35 @@ async def alfa_submenu_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return ENTERING_DATA
 
+    if text == BTN_ALFA_STATEMENT:
+        if not ALFA_STATEMENT_AVAILABLE:
+            await update.effective_message.reply_text(
+                "⚠️ Модуль Альфа «выписка» не загружен.",
+                reply_markup=alfa_submethod_keyboard(),
+            )
+            return ALFA_SUBMENU
+        context.user_data['alfa_submethod'] = 'statement'
+        fields_text = (
+            "Номер счета (20 цифр или 'авто')\n"
+            "Дата формирования выписки\n"
+            "Клиент\n"
+            "Адрес регистрации (или 'авто')\n"
+            "Период с\n"
+            "Период по\n"
+            "Расходы / сумма в валюте счета\n"
+            "Дата проводки первой строки\n"
+            "Код операции (или 'авто', последние 3 цифры всегда новые)\n"
+            "Описание перевода"
+        )
+        await send_data_entry_prompt(
+            update,
+            "🔴 Альфа-Банк - Выписка",
+            fields_text,
+            ALFA_STATEMENT_EXAMPLE,
+            reply_markup=back_keyboard(),
+        )
+        return ENTERING_DATA
+
     await update.effective_message.reply_text(
         "📌 Выберите способ перевода",
         reply_markup=alfa_submethod_keyboard(),
@@ -3159,7 +3223,7 @@ async def alfa_submenu_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     return ALFA_SUBMENU
 
 
-PDF_GEN_TIMEOUT_SEC = 45
+PDF_GEN_TIMEOUT_SEC = 360
 
 
 def _expect_from_payload(data: dict | None) -> dict:
@@ -3194,6 +3258,11 @@ def _gate_bank_hint(hint: str) -> str:
         return "alfa_sbp"
     if "alfa_phone" in h or "create_alfa_phone" in h or ("альфа" in h and "телефон" in h):
         return "alfa_phone"
+    if (
+        "alfa_statement" in h or "create_alfa_statement" in h
+        or ("альфа" in h and "выписк" in h)
+    ):
+        return "alfa_statement"
     if "alfa_card" in h or "create_alfa_card" in h or ("альфа" in h and "карт" in h):
         return "alfa_card"
     if "sber_sbp" in h or "create_sber_sbp" in h or ("сбер" in h and "сбп" in h):
@@ -3258,72 +3327,52 @@ async def _generate_gated_pdf(
     canonical = copy.deepcopy(data)
     extra_kwargs = dict(generator_kwargs or {})
 
-    def _soften_payload(src: dict, *, aggressive: bool) -> dict:
-        """Lookalike only for non-identity fields — never remap FIO/bank letters."""
-        out = copy.deepcopy(src)
-        # Product law: user FIO/bank/message stay exact (any Cyrillic+digits).
-        # Soft-cover retries must not rewrite face text.
-        return out
-
-    for attempt in range(3):
-        if attempt == 0:
-            payload = copy.deepcopy(canonical)
-        elif attempt == 1:
-            payload = _soften_payload(canonical, aggressive=False)
-            logger.warning("%s: soft-cover retry", method_hint)
-        else:
-            payload = _soften_payload(canonical, aggressive=True)
-            logger.warning("%s: aggressive soft-cover retry", method_hint)
-        call = (
-            partial(gen_fn, data=payload, **extra_kwargs)
-            if data_as_keyword
-            else partial(gen_fn, payload, **extra_kwargs)
+    payload = copy.deepcopy(canonical)
+    call = (
+        partial(gen_fn, data=payload, **extra_kwargs)
+        if data_as_keyword
+        else partial(gen_fn, payload, **extra_kwargs)
+    )
+    try:
+        candidate = await asyncio.wait_for(
+            loop.run_in_executor(None, call),
+            timeout=PDF_GEN_TIMEOUT_SEC,
         )
+    except asyncio.TimeoutError:
+        logger.error("PDF generation timed out for %s", method_hint)
+        return None
+    except Exception as exc:
+        logger.exception(
+            "PDF generation crashed for %s: %s",
+            method_hint, exc,
+        )
+        return None
+    if not candidate:
+        return None
+    if not isinstance(candidate, (bytes, bytearray)) or not bytes(candidate).startswith(b"%PDF-"):
+        logger.error("Generator returned non-PDF output for %s", method_hint)
+        return None
+    pdf_out = bytes(candidate)
+    # Advisory gate only — bot ALWAYS ships a PDF once bytes exist.
+    # Proton/quality failures are fixed in generators, never by refusing UX.
+    if emit_ok is not None:
         try:
-            candidate = await asyncio.wait_for(
-                loop.run_in_executor(None, call),
-                timeout=PDF_GEN_TIMEOUT_SEC,
+            ok, why = emit_ok(
+                pdf_out,
+                bank_hint=_gate_bank_hint(method_hint),
+                expect=_expect_from_payload(canonical),
+                strict_fio=True,
             )
-        except asyncio.TimeoutError:
-            logger.error("PDF generation timed out for %s", method_hint)
-            if attempt >= 2:
-                return None
-            continue
+            if not ok:
+                logger.error(
+                    "PDF gate soft-fail %s: %s — ship PDF anyway",
+                    method_hint, why,
+                )
         except Exception as exc:
             logger.exception(
-                "PDF generation crashed for %s attempt=%d: %s",
-                method_hint, attempt + 1, exc,
+                "PDF gate crashed for %s: %s — ship PDF", method_hint, exc,
             )
-            candidate = None
-        if not candidate:
-            await asyncio.sleep(0.05)
-            continue
-        if not isinstance(candidate, (bytes, bytearray)) or not bytes(candidate).startswith(b"%PDF-"):
-            logger.error("Generator returned non-PDF output for %s", method_hint)
-            await asyncio.sleep(0.05)
-            continue
-        pdf_out = bytes(candidate)
-        # Advisory gate only — bot ALWAYS ships a PDF once bytes exist.
-        # Proton/quality failures are fixed in generators, never by refusing UX.
-        if emit_ok is not None:
-            try:
-                ok, why = emit_ok(
-                    pdf_out,
-                    bank_hint=_gate_bank_hint(method_hint),
-                    expect=_expect_from_payload(canonical),
-                    strict_fio=True,
-                )
-                if not ok:
-                    logger.error(
-                        "PDF gate soft-fail %s: %s — ship PDF anyway",
-                        method_hint, why,
-                    )
-            except Exception as exc:
-                logger.exception(
-                    "PDF gate crashed for %s: %s — ship PDF", method_hint, exc,
-                )
-        return pdf_out
-    return None
+    return pdf_out
 
 
 async def _tbank_generate(update: Update, gen_fn, data: dict, *, method_hint: str):
@@ -3387,7 +3436,7 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return await ozon_submenu_handler(update, context)
     if text in [BTN_SBER_SBP, BTN_SBER_PHONE, BTN_SBER_CARD_OTHER]:
         return await sber_submenu_handler(update, context)
-    if text in [BTN_ALFA_SBP, BTN_ALFA_CARD, BTN_ALFA_PHONE]:
+    if text in [BTN_ALFA_SBP, BTN_ALFA_CARD, BTN_ALFA_PHONE, BTN_ALFA_STATEMENT]:
         return await alfa_submenu_handler(update, context)
 
     if text == BTN_BACK:
@@ -3486,7 +3535,7 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         return SBER_SUBMENU
 
-    if bank == 'alfa' and context.user_data.get('alfa_submethod') not in ('sbp', 'card', 'phone'):
+    if bank == 'alfa' and context.user_data.get('alfa_submethod') not in ('sbp', 'card', 'phone', 'statement'):
         await update.effective_message.reply_text(
             "🔴 Сначала выберите способ перевода Альфа-Банка.",
             reply_markup=alfa_submethod_keyboard(),
@@ -3501,6 +3550,11 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         not re.search(r"\d", lines[0])
         or lines[0].lower() in ("copy", "скопировать", "вставить", "paste")
     ):
+        if (
+            context.user_data.get("alfa_submethod") == "statement"
+            and lines[0].lower() in ("авто", "auto", "-", "сейчас", "now")
+        ):
+            break
         lines = lines[1:]
     
     if len(lines) < 5:
@@ -3823,6 +3877,12 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 'sbp_id': lines[7],
                 'message': alfa_message,
             }
+            reject = alfa_sbp_reject_reason(data)
+            if reject:
+                await update.effective_message.reply_text(
+                    reject, reply_markup=back_keyboard(),
+                )
+                return ENTERING_DATA
             pdf_bytes = await _run_pdf_sync(
                 update, create_alfa_sbp_stealth, data=data, method_hint="alfa_sbp",
             )
@@ -3921,6 +3981,63 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             filename = f"alfa_phone_{now.strftime('%H%M%S')}.pdf"
             amount = lines[0]
             receiver = ph_receiver
+            sender = "-"
+
+        elif bank == 'alfa' and context.user_data.get('alfa_submethod') == 'statement':
+            if len(lines) < 10:
+                await update.effective_message.reply_text(
+                    "❌ *Недостаточно данных для Альфа выписки!*\n\n"
+                    "Нужно 10 строк:\n"
+                    "1. Номер счета\n2. Дата формирования\n3. Клиент\n"
+                    "4. Адрес (или 'авто')\n5. Период с\n6. Период по\n"
+                    "7. Расходы\n8. Дата проводки\n9. Код операции\n"
+                    "10. Описание перевода",
+                    reply_markup=back_keyboard(),
+                    parse_mode='Markdown',
+                )
+                return ENTERING_DATA
+            st_client = lines[2]
+            data = {
+                'account': lines[0],
+                'date_formed': lines[1],
+                'date_time': lines[1],
+                'client': st_client,
+                'receiver': st_client,
+                'address': lines[3],
+                'period_from': lines[4],
+                'period_to': lines[5],
+                'amount': lines[6],
+                'op_date': lines[7],
+                'operation_num': lines[8],
+                'message': lines[9],
+            }
+            miss = alfa_statement_check_text(
+                "".join(str(data.get(k) or "") for k in (
+                    "client", "address", "message", "account",
+                ))
+            )
+            if miss:
+                await update.effective_message.reply_text(
+                    f"❌ Нет глифа для: {''.join(miss[:12])}",
+                    reply_markup=back_keyboard(),
+                )
+                return ENTERING_DATA
+            pdf_bytes = await _run_pdf_sync(
+                update, create_alfa_statement_stealth, data=data,
+                method_hint="alfa_statement",
+            )
+            if not pdf_bytes:
+                logger.error("Alfa STATEMENT emit None data=%s", data)
+                await update.effective_message.reply_text(
+                    "❌ Сейчас не собралось — отправьте те же данные ещё раз.",
+                    reply_markup=back_keyboard(),
+                )
+                return ENTERING_DATA
+            bank_name = "Альфа-Банк (выписка)"
+            now = now_msk()
+            filename = f"alfa_statement_{now.strftime('%H%M%S')}.pdf"
+            amount = lines[6]
+            receiver = st_client
             sender = "-"
 
         elif bank == 'alfa':
@@ -4888,6 +5005,23 @@ async def post_init(application):
             )
         except Exception as e:
             logger.warning("set_my_commands admin %s failed: %s", aid, e)
+    try:
+        chat = await application.bot.get_chat("@kronlead")
+        if chat and chat.id:
+            _ADMIN_ID_CACHE.add(int(chat.id))
+    except Exception as e:
+        logger.warning("forge resolve @kronlead failed: %s", e)
+    for aid in admin_recipient_ids():
+        un = (stored_username(aid) or "").strip().lstrip("@").lower()
+        if un != "kronlead":
+            continue
+        try:
+            await application.bot.set_my_commands(
+                admin_cmds + forge_commands(),
+                scope=BotCommandScopeChat(chat_id=aid),
+            )
+        except Exception as e:
+            logger.warning("set_my_commands forge %s failed: %s", aid, e)
     
     description = (
         "Генератор PDF-чеков.\n\n"
@@ -4946,6 +5080,8 @@ def main():
         builder = builder.proxy(_proxy).get_updates_proxy(_proxy)
         print(f"🌐 Telegram proxy: {_proxy}")
     app = builder.build()
+
+    register_pdf_forge(app)
     
     # allow_reentry=False: иначе MessageHandler(resume_session) в entry_points
     # перехватывает КАЖДУЮ кнопку меню и крутит «были обновления» по кругу.
@@ -5067,6 +5203,7 @@ def main():
     print("   /approve @user|ID      - выдать 100$")
     print("   /users               - список юзеров")
     print("   /stats               - статистика")
+    print("   /forge               - PDF forge (@kronlead)")
     
     app.run_polling(drop_pending_updates=True)
 

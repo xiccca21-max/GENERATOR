@@ -85,7 +85,7 @@ def count_odd_tj(pdf: bytes) -> Tuple[int, int]:
                 if unesc == b"i":
                     pre = s[max(0, m.start() - 120) : m.start()]
                     if b"/F3" in pre:
-                        continue
+                    continue
                 total += 1
                 if len(unesc) % 2:
                     odd += 1
@@ -1099,7 +1099,7 @@ def _layout_anchors_ok(
                     return False, f"visual-sber-date-center:cx={cx:.1f}"
 
     # ---- Alfa: left col x0≈35.45; right col x0≈304.75 ----
-    if is_alfa:
+    if is_alfa and not hint.startswith("alfa_statement"):
         left_needles = []
         right_needles = []
         if digs_core:
