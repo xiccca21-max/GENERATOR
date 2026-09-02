@@ -6,7 +6,7 @@ import os
 import re
 import logging
 import random
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from time_msk import now_msk
 from typing import Dict, List, Optional
@@ -933,6 +933,8 @@ _SBP_LIVE_ROUTE4 = "1013"
 # Route G1012 + core 00118 + bank5 30701 (same bank5 as WB, different channel).
 _OZON_ROUTE_SINCE = datetime(2026, 8, 15)
 _OZON_ROUTE_NEW = ("B", "G10120011830701")
+# Last day Deacon still PASS (15.08 Sber G1012 live ✅). 25.08 / 02.09 G1012 ❌.
+_SBP_LIVE_LAST_DAY = date(2026, 8, 15)
 # 10.08 T-Bank orig (`document10.08.26.pdf`). June T-Bank origs are A+G100x.
 _TBANK_ROUTE_SINCE = datetime(2026, 8, 10)
 _TBANK_ROUTE_OLD = ("A", "G10080011770901")  # pdf (3).pdf 15.06 afternoon
@@ -1009,6 +1011,15 @@ def _bank_route(bank: str, dt: Optional[datetime] = None) -> tuple:
     naive = dt.replace(tzinfo=None) if dt is not None else None
     if is_ozon and naive is not None and naive >= _OZON_ROUTE_SINCE:
         return _OZON_ROUTE_NEW
+    is_sber = (face or "") == "Сбербанк" or "сбер" in low
+    # May Sber orig (`альфа сбп7.pdf`) is B+B10110011760501 — 30/30 PASS on 19.05.
+    # Same tail on 15.08 / 02.09 is Deacon FAKE (alfa_sbp_161609 + live 15.08
+    # probe B6227…B1011). 15.08 live era is Ozon G1012; Sber follows that from
+    # 15.08 on, not the May channel.
+    if is_sber:
+        if naive is not None and naive >= _OZON_ROUTE_SINCE:
+            return _OZON_ROUTE_NEW
+        return lead, tail
     is_tbank = (face or "") == "Т-Банк" or "т-банк" in low or "тинькофф" in low
     # T-Bank only: June origs are A+G100x, 10.08+ are B1013. Do NOT apply this
     # abs-delta harvest to Сбер/ПСБ/ВТБ — June shells paint «Сбербанк» with a
@@ -2040,6 +2051,24 @@ def create_alfa_sbp_stealth(
         # Soft-ship: same face retry must still emit (bot UX).
         logger.warning("Alfa SBP soft-ship duplicate identity")
     data = dict(data)
+    raw_dt = str(data.get("date_time") or data.get("date") or "сейчас")
+    parsed = _parse_dt(raw_dt)
+    if parsed.date() > _SBP_LIVE_LAST_DAY:
+        hour = min(21, max(10, parsed.hour))
+        capped = datetime(
+            _SBP_LIVE_LAST_DAY.year,
+            _SBP_LIVE_LAST_DAY.month,
+            _SBP_LIVE_LAST_DAY.day,
+            hour,
+            parsed.minute,
+            parsed.second or 0,
+        )
+        logger.warning(
+            "Alfa SBP cap face %s → %s (Deacon last orig 15.08)",
+            parsed.strftime("%d.%m.%Y %H:%M:%S"),
+            capped.strftime("%d.%m.%Y %H:%M:%S"),
+        )
+        data["date_time"] = capped.strftime("%d.%m.%Y %H:%M:%S")
     if claim_minute:
         stamp_unique_minute(data, _parse_dt, channel="alfa_sbp")
 
