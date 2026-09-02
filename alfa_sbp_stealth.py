@@ -1009,9 +1009,13 @@ def _bank_route(bank: str, dt: Optional[datetime] = None) -> tuple:
     naive = dt.replace(tzinfo=None) if dt is not None else None
     if is_ozon and naive is not None and naive >= _OZON_ROUTE_SINCE:
         return _OZON_ROUTE_NEW
-    # Prefer the orig whose bank+day is closest (June T-Банк is A+G1008, not
-    # the 10.08 B1013 tail — Deacon FAKE 15.06 T-Bank with August route).
-    if naive is not None and face:
+    is_tbank = (face or "") == "Т-Банк" or "т-банк" in low or "тинькофф" in low
+    # T-Bank only: June origs are A+G100x, 10.08+ are B1013. Do NOT apply this
+    # abs-delta harvest to Сбер/ПСБ/ВТБ — June shells paint «Сбербанк» with a
+    # T-Bank G1004 tail (`альфа банк сбп.pdf`). Bot «сейчас» 02.09 then shipped
+    # A+G1004 (alfa_sbp_160914, Мужик/Сбер, Deacon FAKE). Live Sber PASS is
+    # B+B10110011760501 (19.05 / 20.05 in the 30/30).
+    if is_tbank and naive is not None:
         best = None
         best_delta = None
         for orig_dt, orig_bank, orig_lead, orig_tail in _bank_routes_from_origs():
@@ -1023,12 +1027,14 @@ def _bank_route(bank: str, dt: Optional[datetime] = None) -> tuple:
                 best_delta = delta
         if best is not None:
             return best
-        # Banks with their own corpus tail (ВТБ A+G1008, ПСБ, Сбер…) keep it.
-        if (lead, tail) != _FALLBACK_ROUTE:
-            return lead, tail
-        # Fallback banks (Ак Барс / Открытие / МТС / Почта / …) have no orig.
-        # Walk nearest era among B1013 (10.08) and Ozon G1012 (15.08) — never
-        # WB G1014. 15.08 Открытие + frozen B1013 was Deacon FAKE after 27 PASS.
+        if naive < _TBANK_ROUTE_SINCE:
+            return _TBANK_ROUTE_OLD
+        return lead, tail
+    if (lead, tail) != _FALLBACK_ROUTE:
+        return lead, tail
+    if naive is not None:
+        # Ак Барс / Открытие / … : nearest era among B1013 and Ozon G1012,
+        # never WB G1014.
         era = None
         era_delta = None
         for orig_dt, _orig_bank, orig_lead, orig_tail in _bank_routes_from_origs():
@@ -1040,9 +1046,6 @@ def _bank_route(bank: str, dt: Optional[datetime] = None) -> tuple:
                 era_delta = delta
         if era is not None:
             return era
-    is_tbank = (face or "") == "Т-Банк" or "т-банк" in low or "тинькофф" in low
-    if is_tbank and naive is not None and naive < _TBANK_ROUTE_SINCE:
-        return _TBANK_ROUTE_OLD
     return lead, tail
 
 
