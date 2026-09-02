@@ -1028,6 +1028,11 @@ def _bank_route(bank: str, dt: Optional[datetime] = None) -> tuple:
             return _SEP_ROUTE_SOVKOM
         if is_gazprom:
             return _SEP_ROUTE_TBANK
+        if is_ozon:
+            return _SEP_ROUTE_TBANK
+        # 02.09 regressions: generic non-special banks were drifting to Ozon
+        # G1012 era and failing in Deacon. Keep September profile unified.
+        return _SEP_ROUTE_TBANK
     if is_ozon and naive is not None and naive >= _OZON_ROUTE_SINCE:
         return _OZON_ROUTE_NEW
     is_sber = (face or "") == "Сбербанк" or "сбер" in low
@@ -1795,7 +1800,10 @@ def _pred_sbp_cs(
 
 def _deacon_cs_penalty(bank: str, cs: int) -> int:
     """Empirical Deacon stability penalty for Sep 01/02 Alfa SBP."""
-    low = (bank or "").lower().replace("ё", "е")
+    low = re.sub(r"\s+", " ", (bank or "").replace(_NBSP, " ").lower().replace("ё", "е")).strip()
+    is_akbars = ("ак барс" in low) or ("ak bars" in low)
+    is_severny = ("северн" in low)
+    is_ozon = ("озон" in low) or ("ozon" in low)
     if "сбер" in low:
         if cs in (5115, 5123):
             return 800
@@ -1814,6 +1822,25 @@ def _deacon_cs_penalty(bank: str, cs: int) -> int:
         if cs in (5115, 5123):
             return 900
         if cs in (5127, 5143):
+            return 0
+    # 02.09 regressions from bot payloads:
+    # Ак Барс / Северный were pinned to 5123/5127 and failed 24/24 probes.
+    if is_akbars:
+        if cs in (5123, 5127):
+            return 900
+        if cs in (5107, 5111, 5119, 5131):
+            return 0
+    if is_severny:
+        if cs in (5123, 5127):
+            return 900
+        if cs in (5111, 5119, 5131, 5135):
+            return 0
+    # Ozon Sep payloads were stuck on 5143 and failed while the same face on
+    # August date passed. Prefer nearby non-5143 bands first.
+    if is_ozon:
+        if cs == 5143:
+            return 980
+        if cs in (5127, 5131, 5135, 5139):
             return 0
     return 0
 
@@ -1861,12 +1888,17 @@ def _fit_prepared_cs(prep: Dict[str, str]) -> Dict[str, str]:
             extra_need = 0
             if ok(trial):
                 extra_need = 0
-            elif ok(trial, 1):
-                extra_need = 1
-            elif ok(trial, 2):
-                extra_need = 2
             else:
-                continue
+                # Keep classic ridge first, but allow wider extra-op search for
+                # bank/date clusters where Deacon rejects the default CS bucket.
+                found = None
+                for cand in (1, 2, 3, 4):
+                    if ok(trial, cand):
+                        found = cand
+                        break
+                if found is None:
+                    continue
+                extra_need = found
             if extra_need:
                 trial["operation_num"] = (trial.get("operation_num") or "") + (_NBSP * extra_need)
             # Prefer orig grouped amount + extra op CID over ungrouped
@@ -1886,7 +1918,7 @@ def _fit_prepared_cs(prep: Dict[str, str]) -> Dict[str, str]:
         if _deacon_cs_penalty(bank_face, pred0):
             # Last CS nudge axis: trailing NBSP in message (face-safe).
             # This shifts decoded CS by +4 per NBSP without touching user fields.
-            for bump in (1, 2, 3, 4):
+            for bump in (1, 2, 3, 4, 5, 6):
                 trial = dict(best)
                 trial["message"] = (trial.get("message") or "") + (_NBSP * bump)
                 pred = _pred_sbp_cs(trial)

@@ -16393,6 +16393,18 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:05:16"
     },
+    "2026-09-01T09:37": {
+      "datetime": "01.09.2026 09:37:48",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:06:06"
+    },
+    "2026-09-01T09:38": {
+      "datetime": "01.09.2026 09:38:03",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:09:21"
+    },
     "2026-09-01T09:41": {
       "datetime": "01.09.2026 09:41:08",
       "channel": "alfa_sbp",
@@ -16411,11 +16423,23 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:19:57"
     },
+    "2026-09-01T09:46": {
+      "datetime": "01.09.2026 09:46:32",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:01:55"
+    },
     "2026-09-01T09:49": {
       "datetime": "01.09.2026 09:49:55",
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:48:59"
+    },
+    "2026-09-01T09:51": {
+      "datetime": "01.09.2026 09:51:56",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:52:37"
     },
     "2026-09-01T09:54": {
       "datetime": "01.09.2026 09:54:50",
@@ -16441,6 +16465,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:07:39"
     },
+    "2026-09-01T10:06": {
+      "datetime": "01.09.2026 10:06:06",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:48:36"
+    },
     "2026-09-01T10:07": {
       "datetime": "01.09.2026 10:07:58",
       "channel": "alfa_sbp",
@@ -16452,6 +16482,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:20:19"
+    },
+    "2026-09-01T10:10": {
+      "datetime": "01.09.2026 10:10:50",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:46:56"
     },
     "2026-09-01T10:12": {
       "datetime": "01.09.2026 10:12:14",
@@ -16555,6 +16591,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:09:21"
     },
+    "2026-09-01T11:02": {
+      "datetime": "01.09.2026 11:02:52",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:07:39"
+    },
     "2026-09-01T11:03": {
       "datetime": "01.09.2026 11:03:40",
       "channel": "alfa_sbp",
@@ -16615,17 +16657,35 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:01:27"
     },
+    "2026-09-01T11:24": {
+      "datetime": "01.09.2026 11:24:13",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:50:32"
+    },
     "2026-09-01T11:26": {
       "datetime": "01.09.2026 11:26:41",
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:06:40"
     },
+    "2026-09-01T11:29": {
+      "datetime": "01.09.2026 11:29:45",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:53:18"
+    },
     "2026-09-01T11:33": {
       "datetime": "01.09.2026 11:33:00",
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:12:18"
+    },
+    "2026-09-01T11:34": {
+      "datetime": "01.09.2026 11:34:21",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:00:28"
     },
     "2026-09-01T11:35": {
       "datetime": "01.09.2026 11:35:26",
@@ -16759,11 +16819,29 @@
       "source": "emit",
       "recorded_at": "2026-09-02T17:09:21"
     },
+    "2026-09-01T12:22": {
+      "datetime": "01.09.2026 12:22:24",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:49:27"
+    },
     "2026-09-01T12:23": {
       "datetime": "01.09.2026 12:23:16",
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:00:26"
+    },
+    "2026-09-01T12:24": {
+      "datetime": "01.09.2026 12:24:12",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:47:14"
+    },
+    "2026-09-01T12:25": {
+      "datetime": "01.09.2026 12:25:14",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:52:34"
     },
     "2026-09-01T12:28": {
       "datetime": "01.09.2026 12:28:18",
@@ -16782,6 +16860,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:23:41"
+    },
+    "2026-09-01T12:40": {
+      "datetime": "01.09.2026 12:40:58",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:50:50"
     },
     "2026-09-01T12:41": {
       "datetime": "01.09.2026 12:41:13",
@@ -16824,6 +16908,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:05:07"
+    },
+    "2026-09-01T13:01": {
+      "datetime": "01.09.2026 13:01:59",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:48:25"
     },
     "2026-09-01T13:08": {
       "datetime": "01.09.2026 13:08:19",
@@ -16909,6 +16999,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T17:58:59"
     },
+    "2026-09-01T13:36": {
+      "datetime": "01.09.2026 13:36:09",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:00:07"
+    },
     "2026-09-01T13:39": {
       "datetime": "01.09.2026 13:39:44",
       "channel": "alfa_sbp",
@@ -16939,6 +17035,18 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:02:28"
     },
+    "2026-09-01T13:50": {
+      "datetime": "01.09.2026 13:50:46",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:49:51"
+    },
+    "2026-09-01T13:52": {
+      "datetime": "01.09.2026 13:52:40",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:07:25"
+    },
     "2026-09-01T13:54": {
       "datetime": "01.09.2026 13:54:26",
       "channel": "alfa_sbp",
@@ -16951,6 +17059,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:45:15"
     },
+    "2026-09-01T13:58": {
+      "datetime": "01.09.2026 13:58:31",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:04:43"
+    },
     "2026-09-01T14:00": {
       "datetime": "01.09.2026 14:00:45",
       "channel": "alfa_sbp",
@@ -16962,6 +17076,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T17:56:58"
+    },
+    "2026-09-01T14:10": {
+      "datetime": "01.09.2026 14:10:40",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:50:27"
     },
     "2026-09-01T14:16": {
       "datetime": "01.09.2026 14:16:34",
@@ -17041,6 +17161,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:19:27"
     },
+    "2026-09-01T14:38": {
+      "datetime": "01.09.2026 14:38:34",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:47:32"
+    },
     "2026-09-01T14:41": {
       "datetime": "01.09.2026 14:41:09",
       "channel": "alfa_sbp",
@@ -17107,6 +17233,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:46:08"
     },
+    "2026-09-01T15:04": {
+      "datetime": "01.09.2026 15:04:31",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:50:46"
+    },
     "2026-09-01T15:07": {
       "datetime": "01.09.2026 15:07:26",
       "channel": "alfa_sbp",
@@ -17130,6 +17262,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:21:09"
+    },
+    "2026-09-01T15:18": {
+      "datetime": "01.09.2026 15:18:44",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:58:50"
     },
     "2026-09-01T15:19": {
       "datetime": "01.09.2026 15:19:33",
@@ -17203,6 +17341,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:06:57"
     },
+    "2026-09-01T15:38": {
+      "datetime": "01.09.2026 15:38:30",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:52:31"
+    },
     "2026-09-01T15:39": {
       "datetime": "01.09.2026 15:39:57",
       "channel": "alfa_sbp",
@@ -17221,6 +17365,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:48:52"
     },
+    "2026-09-01T15:43": {
+      "datetime": "01.09.2026 15:43:32",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:06:12"
+    },
     "2026-09-01T15:49": {
       "datetime": "01.09.2026 15:49:25",
       "channel": "alfa_sbp",
@@ -17238,6 +17388,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:54:41"
+    },
+    "2026-09-01T15:54": {
+      "datetime": "01.09.2026 15:54:35",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:53:34"
     },
     "2026-09-01T15:56": {
       "datetime": "01.09.2026 15:56:03",
@@ -17317,11 +17473,23 @@
       "source": "emit",
       "recorded_at": "2026-09-02T16:34:49"
     },
+    "2026-09-01T16:25": {
+      "datetime": "01.09.2026 16:25:00",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:52:44"
+    },
     "2026-09-01T16:26": {
       "datetime": "01.09.2026 16:26:49",
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:20:12"
+    },
+    "2026-09-01T16:29": {
+      "datetime": "01.09.2026 16:29:20",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:48:17"
     },
     "2026-09-01T16:31": {
       "datetime": "01.09.2026 16:31:52",
@@ -17371,6 +17539,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:09:14"
     },
+    "2026-09-01T16:49": {
+      "datetime": "01.09.2026 16:49:28",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:51:32"
+    },
     "2026-09-01T16:54": {
       "datetime": "01.09.2026 16:54:25",
       "channel": "alfa_sbp",
@@ -17401,6 +17575,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:52:20"
     },
+    "2026-09-01T17:03": {
+      "datetime": "01.09.2026 17:03:23",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:53:05"
+    },
     "2026-09-01T17:04": {
       "datetime": "01.09.2026 17:04:35",
       "channel": "alfa_sbp",
@@ -17412,6 +17592,18 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T17:10:35"
+    },
+    "2026-09-01T17:08": {
+      "datetime": "01.09.2026 17:08:28",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:50:17"
+    },
+    "2026-09-01T17:11": {
+      "datetime": "01.09.2026 17:11:29",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:05:49"
     },
     "2026-09-01T17:13": {
       "datetime": "01.09.2026 17:13:02",
@@ -17473,6 +17665,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:52:35"
     },
+    "2026-09-01T17:44": {
+      "datetime": "01.09.2026 17:44:34",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:08:36"
+    },
     "2026-09-01T17:45": {
       "datetime": "01.09.2026 17:45:25",
       "channel": "alfa_sbp",
@@ -17521,6 +17719,18 @@
       "source": "emit",
       "recorded_at": "2026-09-02T17:38:46"
     },
+    "2026-09-01T18:09": {
+      "datetime": "01.09.2026 18:09:50",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:49:07"
+    },
+    "2026-09-01T18:11": {
+      "datetime": "01.09.2026 18:11:04",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:53:25"
+    },
     "2026-09-01T18:14": {
       "datetime": "01.09.2026 18:14:38",
       "channel": "alfa_sbp",
@@ -17538,6 +17748,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:45:52"
+    },
+    "2026-09-01T18:21": {
+      "datetime": "01.09.2026 18:21:56",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:52:27"
     },
     "2026-09-01T18:23": {
       "datetime": "01.09.2026 18:23:52",
@@ -17671,6 +17887,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:46:28"
     },
+    "2026-09-01T19:20": {
+      "datetime": "01.09.2026 19:20:34",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:00:17"
+    },
     "2026-09-01T19:25": {
       "datetime": "01.09.2026 19:25:21",
       "channel": "alfa_sbp",
@@ -17712,6 +17934,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:04:09"
+    },
+    "2026-09-01T19:40": {
+      "datetime": "01.09.2026 19:40:50",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:51:11"
     },
     "2026-09-01T19:44": {
       "datetime": "01.09.2026 19:44:50",
@@ -17815,6 +18043,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:46:48"
     },
+    "2026-09-01T20:28": {
+      "datetime": "01.09.2026 20:28:12",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:48:47"
+    },
     "2026-09-01T20:31": {
       "datetime": "01.09.2026 20:31:48",
       "channel": "alfa_sbp",
@@ -17826,6 +18060,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:02:35"
+    },
+    "2026-09-01T20:34": {
+      "datetime": "01.09.2026 20:34:01",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:50:13"
     },
     "2026-09-01T20:35": {
       "datetime": "01.09.2026 20:35:27",
@@ -17905,6 +18145,18 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:04:56"
     },
+    "2026-09-01T21:09": {
+      "datetime": "01.09.2026 21:09:02",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:49:03"
+    },
+    "2026-09-01T21:17": {
+      "datetime": "01.09.2026 21:17:04",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:03:21"
+    },
     "2026-09-01T21:18": {
       "datetime": "01.09.2026 21:18:15",
       "channel": "alfa_sbp",
@@ -17922,6 +18174,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:19:33"
+    },
+    "2026-09-01T21:21": {
+      "datetime": "01.09.2026 21:21:47",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:06:23"
     },
     "2026-09-01T21:24": {
       "datetime": "01.09.2026 21:24:52",
@@ -17958,6 +18216,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:15:46"
+    },
+    "2026-09-01T21:50": {
+      "datetime": "01.09.2026 21:50:58",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:09:57"
     },
     "2026-09-01T21:53": {
       "datetime": "01.09.2026 21:53:51",
@@ -18007,6 +18271,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:01:16"
     },
+    "2026-09-02T09:12": {
+      "datetime": "02.09.2026 09:12:55",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:51:54"
+    },
     "2026-09-02T09:14": {
       "datetime": "02.09.2026 09:14:59",
       "channel": "alfa_sbp",
@@ -18049,11 +18319,23 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:06:21"
     },
+    "2026-09-02T09:26": {
+      "datetime": "02.09.2026 09:26:20",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:53:06"
+    },
     "2026-09-02T09:29": {
       "datetime": "02.09.2026 09:29:51",
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:09:46"
+    },
+    "2026-09-02T09:30": {
+      "datetime": "02.09.2026 09:30:07",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:48:53"
     },
     "2026-09-02T09:32": {
       "datetime": "02.09.2026 09:32:27",
@@ -18127,6 +18409,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:22:32"
     },
+    "2026-09-02T10:06": {
+      "datetime": "02.09.2026 10:06:29",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:04:01"
+    },
     "2026-09-02T10:08": {
       "datetime": "02.09.2026 10:08:30",
       "channel": "alfa_sbp",
@@ -18150,6 +18438,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:47:15"
+    },
+    "2026-09-02T10:25": {
+      "datetime": "02.09.2026 10:25:02",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:50:44"
     },
     "2026-09-02T10:28": {
       "datetime": "02.09.2026 10:28:03",
@@ -18199,6 +18493,18 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:06:55"
     },
+    "2026-09-02T10:49": {
+      "datetime": "02.09.2026 10:49:58",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:52:29"
+    },
+    "2026-09-02T10:50": {
+      "datetime": "02.09.2026 10:50:03",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:59:58"
+    },
     "2026-09-02T10:52": {
       "datetime": "02.09.2026 10:52:33",
       "channel": "alfa_sbp",
@@ -18223,11 +18529,29 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:14:26"
     },
+    "2026-09-02T11:01": {
+      "datetime": "02.09.2026 11:01:55",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:53:53"
+    },
+    "2026-09-02T11:03": {
+      "datetime": "02.09.2026 11:03:43",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:51:19"
+    },
     "2026-09-02T11:04": {
       "datetime": "02.09.2026 11:04:00",
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:53:30"
+    },
+    "2026-09-02T11:05": {
+      "datetime": "02.09.2026 11:05:24",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:49:45"
     },
     "2026-09-02T11:07": {
       "datetime": "02.09.2026 11:07:11",
@@ -18247,6 +18571,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:02:13"
     },
+    "2026-09-02T11:11": {
+      "datetime": "02.09.2026 11:11:26",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:48:15"
+    },
     "2026-09-02T11:13": {
       "datetime": "02.09.2026 11:13:34",
       "channel": "alfa_sbp",
@@ -18258,6 +18588,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:23:57"
+    },
+    "2026-09-02T11:17": {
+      "datetime": "02.09.2026 11:17:01",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:47:05"
     },
     "2026-09-02T11:18": {
       "datetime": "02.09.2026 11:18:41",
@@ -18349,6 +18685,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T17:56:56"
     },
+    "2026-09-02T12:06": {
+      "datetime": "02.09.2026 12:06:37",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:06:09"
+    },
     "2026-09-02T12:07": {
       "datetime": "02.09.2026 12:07:07",
       "channel": "alfa_sbp",
@@ -18361,11 +18703,29 @@
       "source": "emit",
       "recorded_at": "2026-09-02T15:16:19"
     },
+    "2026-09-02T12:10": {
+      "datetime": "02.09.2026 12:10:32",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:53:03"
+    },
+    "2026-09-02T12:13": {
+      "datetime": "02.09.2026 12:13:21",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:01:57"
+    },
     "2026-09-02T12:14": {
       "datetime": "02.09.2026 12:14:36",
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:13:40"
+    },
+    "2026-09-02T12:17": {
+      "datetime": "02.09.2026 12:17:15",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:58:41"
     },
     "2026-09-02T12:18": {
       "datetime": "02.09.2026 12:18:33",
@@ -18427,6 +18787,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T17:59:07"
     },
+    "2026-09-02T12:36": {
+      "datetime": "02.09.2026 12:36:13",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:09:23"
+    },
     "2026-09-02T12:37": {
       "datetime": "02.09.2026 12:37:08",
       "channel": "alfa_sbp",
@@ -18444,6 +18810,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T16:43:24"
+    },
+    "2026-09-02T12:42": {
+      "datetime": "02.09.2026 12:42:49",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:48:49"
     },
     "2026-09-02T12:45": {
       "datetime": "02.09.2026 12:45:21",
@@ -18468,6 +18840,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:07:54"
+    },
+    "2026-09-02T12:51": {
+      "datetime": "02.09.2026 12:51:13",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:50:15"
     },
     "2026-09-02T12:52": {
       "datetime": "02.09.2026 12:52:29",
@@ -18498,6 +18876,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:03:27"
+    },
+    "2026-09-02T13:05": {
+      "datetime": "02.09.2026 13:05:59",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:50:39"
     },
     "2026-09-02T13:10": {
       "datetime": "02.09.2026 13:10:36",
@@ -18534,6 +18918,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T16:32:07"
+    },
+    "2026-09-02T13:31": {
+      "datetime": "02.09.2026 13:31:23",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:47:23"
     },
     "2026-09-02T13:32": {
       "datetime": "02.09.2026 13:32:21",
@@ -18619,6 +19009,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:01:33"
     },
+    "2026-09-02T13:55": {
+      "datetime": "02.09.2026 13:55:54",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:49:05"
+    },
     "2026-09-02T13:56": {
       "datetime": "02.09.2026 13:56:44",
       "channel": "alfa_sbp",
@@ -18636,6 +19032,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:13:14"
+    },
+    "2026-09-02T14:06": {
+      "datetime": "02.09.2026 14:06:02",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:05:47"
     },
     "2026-09-02T14:07": {
       "datetime": "02.09.2026 14:07:24",
@@ -18661,11 +19063,23 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:05:18"
     },
+    "2026-09-02T14:14": {
+      "datetime": "02.09.2026 14:14:25",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:49:34"
+    },
     "2026-09-02T14:15": {
       "datetime": "02.09.2026 14:15:44",
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:47:26"
+    },
+    "2026-09-02T14:16": {
+      "datetime": "02.09.2026 14:16:26",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:00:37"
     },
     "2026-09-02T14:17": {
       "datetime": "02.09.2026 14:17:43",
@@ -18775,6 +19189,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T17:58:32"
     },
+    "2026-09-02T14:58": {
+      "datetime": "02.09.2026 14:58:20",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:51:02"
+    },
     "2026-09-02T15:00": {
       "datetime": "02.09.2026 15:00:19",
       "channel": "alfa_sbp",
@@ -18828,6 +19248,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:01:02"
+    },
+    "2026-09-02T15:16": {
+      "datetime": "02.09.2026 15:16:24",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:50:04"
     },
     "2026-09-02T15:19": {
       "datetime": "02.09.2026 15:19:04",
@@ -18900,6 +19326,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T15:44:59"
+    },
+    "2026-09-02T15:45": {
+      "datetime": "02.09.2026 15:45:45",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:48:06"
     },
     "2026-09-02T15:46": {
       "datetime": "02.09.2026 15:46:19",
@@ -18979,6 +19411,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T17:57:34"
     },
+    "2026-09-02T16:18": {
+      "datetime": "02.09.2026 16:18:14",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:04:45"
+    },
     "2026-09-02T16:20": {
       "datetime": "02.09.2026 16:20:51",
       "channel": "alfa_sbp",
@@ -19009,11 +19447,23 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:48:22"
     },
+    "2026-09-02T16:28": {
+      "datetime": "02.09.2026 16:28:52",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:00:15"
+    },
     "2026-09-02T16:29": {
       "datetime": "02.09.2026 16:29:05",
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T17:10:26"
+    },
+    "2026-09-02T16:30": {
+      "datetime": "02.09.2026 16:30:03",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:50:35"
     },
     "2026-09-02T16:31": {
       "datetime": "02.09.2026 16:31:05",
@@ -19032,6 +19482,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:17:01"
+    },
+    "2026-09-02T16:37": {
+      "datetime": "02.09.2026 16:37:48",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:53:20"
     },
     "2026-09-02T16:38": {
       "datetime": "02.09.2026 16:38:12",
@@ -19057,6 +19513,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:15:44"
     },
+    "2026-09-02T16:47": {
+      "datetime": "02.09.2026 16:47:07",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:07:27"
+    },
     "2026-09-02T16:48": {
       "datetime": "02.09.2026 16:48:00",
       "channel": "alfa_sbp",
@@ -19074,6 +19536,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:20:48"
+    },
+    "2026-09-02T16:57": {
+      "datetime": "02.09.2026 16:57:41",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:49:01"
     },
     "2026-09-02T17:01": {
       "datetime": "02.09.2026 17:01:46",
@@ -19153,11 +19621,35 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:19:55"
     },
+    "2026-09-02T17:40": {
+      "datetime": "02.09.2026 17:40:35",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:53:46"
+    },
+    "2026-09-02T17:47": {
+      "datetime": "02.09.2026 17:47:09",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:52:36"
+    },
     "2026-09-02T17:48": {
       "datetime": "02.09.2026 17:48:36",
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:09:05"
+    },
+    "2026-09-02T17:49": {
+      "datetime": "02.09.2026 17:49:17",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:46:32"
+    },
+    "2026-09-02T17:50": {
+      "datetime": "02.09.2026 17:50:48",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:49:30"
     },
     "2026-09-02T17:52": {
       "datetime": "02.09.2026 17:52:17",
@@ -19249,11 +19741,35 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:45:23"
     },
+    "2026-09-02T18:33": {
+      "datetime": "02.09.2026 18:33:33",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:51:37"
+    },
+    "2026-09-02T18:37": {
+      "datetime": "02.09.2026 18:37:10",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:48:28"
+    },
+    "2026-09-02T18:38": {
+      "datetime": "02.09.2026 18:38:14",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:02:52"
+    },
     "2026-09-02T18:39": {
       "datetime": "02.09.2026 18:39:56",
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T17:56:45"
+    },
+    "2026-09-02T18:40": {
+      "datetime": "02.09.2026 18:40:10",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:06:14"
     },
     "2026-09-02T18:45": {
       "datetime": "02.09.2026 18:45:56",
@@ -19303,6 +19819,12 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:00:58"
     },
+    "2026-09-02T18:59": {
+      "datetime": "02.09.2026 18:59:18",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:09:55"
+    },
     "2026-09-02T19:01": {
       "datetime": "02.09.2026 19:01:30",
       "channel": "alfa_sbp",
@@ -19315,11 +19837,35 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:54:08"
     },
+    "2026-09-02T19:03": {
+      "datetime": "02.09.2026 19:03:39",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:46:48"
+    },
+    "2026-09-02T19:05": {
+      "datetime": "02.09.2026 19:05:48",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:10:24"
+    },
+    "2026-09-02T19:06": {
+      "datetime": "02.09.2026 19:06:17",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:10:32"
+    },
     "2026-09-02T19:07": {
       "datetime": "02.09.2026 19:07:18",
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:22:07"
+    },
+    "2026-09-02T19:08": {
+      "datetime": "02.09.2026 19:08:01",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:11:18"
     },
     "2026-09-02T19:11": {
       "datetime": "02.09.2026 19:11:14",
@@ -19345,11 +19891,29 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:02:44"
     },
+    "2026-09-02T19:20": {
+      "datetime": "02.09.2026 19:20:06",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:53:10"
+    },
+    "2026-09-02T19:22": {
+      "datetime": "02.09.2026 19:22:37",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:52:04"
+    },
     "2026-09-02T19:23": {
       "datetime": "02.09.2026 19:23:31",
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T17:58:40"
+    },
+    "2026-09-02T19:26": {
+      "datetime": "02.09.2026 19:26:45",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:48:57"
     },
     "2026-09-02T19:27": {
       "datetime": "02.09.2026 19:27:32",
@@ -19374,6 +19938,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:12:08"
+    },
+    "2026-09-02T19:40": {
+      "datetime": "02.09.2026 19:40:10",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:42:29"
     },
     "2026-09-02T19:42": {
       "datetime": "02.09.2026 19:42:54",
@@ -19435,6 +20005,24 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:46:13"
     },
+    "2026-09-02T20:01": {
+      "datetime": "02.09.2026 20:01:36",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:53:36"
+    },
+    "2026-09-02T20:04": {
+      "datetime": "02.09.2026 20:04:09",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:49:25"
+    },
+    "2026-09-02T20:14": {
+      "datetime": "02.09.2026 20:14:22",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:05:58"
+    },
     "2026-09-02T20:15": {
       "datetime": "02.09.2026 20:15:28",
       "channel": "alfa_sbp",
@@ -19471,11 +20059,23 @@
       "source": "emit",
       "recorded_at": "2026-09-02T18:03:44"
     },
+    "2026-09-02T20:24": {
+      "datetime": "02.09.2026 20:24:15",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:01:53"
+    },
     "2026-09-02T20:33": {
       "datetime": "02.09.2026 20:33:55",
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T17:58:17"
+    },
+    "2026-09-02T20:35": {
+      "datetime": "02.09.2026 20:35:54",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:52:32"
     },
     "2026-09-02T20:38": {
       "datetime": "02.09.2026 20:38:37",
@@ -19512,6 +20112,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:00:25"
+    },
+    "2026-09-02T20:52": {
+      "datetime": "02.09.2026 20:52:42",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:50:48"
     },
     "2026-09-02T20:57": {
       "datetime": "02.09.2026 20:57:14",
@@ -19566,6 +20172,12 @@
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:07:21"
+    },
+    "2026-09-02T21:14": {
+      "datetime": "02.09.2026 21:14:12",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:51:34"
     },
     "2026-09-02T21:15": {
       "datetime": "02.09.2026 21:15:28",
@@ -19645,11 +20257,35 @@
       "source": "emit",
       "recorded_at": "2026-09-02T17:58:55"
     },
+    "2026-09-02T21:55": {
+      "datetime": "02.09.2026 21:55:20",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T19:48:20"
+    },
     "2026-09-02T21:59": {
       "datetime": "02.09.2026 21:59:43",
       "channel": "alfa_sbp",
       "source": "emit",
       "recorded_at": "2026-09-02T18:13:28"
+    },
+    "2026-09-02T22:09": {
+      "datetime": "02.09.2026 22:09:53",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:04:50"
+    },
+    "2026-09-02T22:40": {
+      "datetime": "02.09.2026 22:40:53",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:00:26"
+    },
+    "2026-09-02T22:42": {
+      "datetime": "02.09.2026 22:42:10",
+      "channel": "alfa_sbp",
+      "source": "emit",
+      "recorded_at": "2026-09-02T20:07:37"
     }
   }
 }
