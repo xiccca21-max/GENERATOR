@@ -26,6 +26,10 @@ _NBSP = "\u00a0"
 _ALFA_SBP_MESSAGE = f"Перевод{_NBSP}денежных{_NBSP}средств"
 _BLOCKED_ALFA_CHARS = frozenset()
 _ALFA_SIZE_MIN = 56_000
+# Lean Oracle ≤59087; Wildberries orig ~59.8–60.7 KB (see _onlypdf_size_ok).
+_ALFA_LEAN_SIZE_MAX = 59_087
+_ALFA_WB_SIZE_MIN = 59_800
+_ALFA_WB_SIZE_MAX = 61_200
 # Soft band only — never reject emit on size (natural subset / long FIO OK).
 _ALFA_SIZE_MAX = 63_000
 _SENT_FF2_PATH = os.path.join(_DIR, "alfa_sbp_sent_ff2.txt")
@@ -337,12 +341,16 @@ def _iter_donors(data: Dict) -> list:
 
     auto_sbp = str(data.get("sbp_id") or "авто").strip().lower() in ("авто", "auto", "-", "")
     preview = _prepare_sbp(data)
+    from alfa_orig_mode import _need_len
+
     need_bank = len(str(preview.get("recipient_bank", "")).rstrip(_NBSP))
-    need_recv = len(str(preview.get("receiver", "")).rstrip(_NBSP))
+    need_recv = _need_len(str(preview.get("receiver", "")), key="receiver")
     scored = []
     for p in canonical_paths("sbp"):
         ctx = AlfaOrigContext()
         if not ctx.load(p):
+            continue
+        if not _oracle_sbp_shell_ok(p):
             continue
         donor_sbp = str(ctx.extract_at(*SBP_COORDS["sbp_id"]) or "").replace(_NBSP, "")
         prepared = _prepare_sbp(data, ctx=ctx if auto_sbp else None)
@@ -355,7 +363,7 @@ def _iter_donors(data: Dict) -> list:
         # Do not transplant B101 (streak_09 shift).
         route = 2 if "B101" in sbp else (1 if "B100" in sbp else 0)
         fits = int(bank_slot >= need_bank) + int(recv_slot >= need_recv)
-        scored.append((route, fits, recv_slot, bank_slot, 1 if ok_g else 0, p))
+        scored.append((1 if ok_g else 0, route, fits, recv_slot, bank_slot, p))
     scored.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]), reverse=True)
     out = [p for *_, p in scored]
     # 15.08 WB orig is 60601 — that is an original, not unlocked fat.
@@ -533,7 +541,12 @@ def _trailing_nbsp_cid_ok(ctx: AlfaOrigContext, key: str) -> bool:
 
 
 def _fio_trailing_nbsp_ok(ctx: AlfaOrigContext) -> bool:
-    """HARD: last painted CID of receiver must be U+00A0."""
+    """HARD: FIO ends with exactly one U+00A0 (origs / Deacon PASS)."""
+    got = ctx.extract_at(*SBP_COORDS["receiver"]) or ""
+    if not got.endswith(_NBSP):
+        return False
+    if len(got) >= 2 and got[-2] == _NBSP:
+        return False
     return _trailing_nbsp_cid_ok(ctx, "receiver")
 
 
@@ -556,6 +569,43 @@ def _sbp_id_structure_ok(raw: str) -> bool:
     return s[18:22].isdigit() and s[22:27].isdigit() and s[27:32].isdigit()
 
 
+def _inject_face_library(path: str, prepared: Dict[str, str]) -> str:
+    """Inject missing face chars from Oracle glyph library (no cross-PDF steal)."""
+    from alfa_font_extend import inject_alfa_char
+    from alfa_orig_mode import AlfaOrigContext, _slot_face_text
+
+    working = path
+    body = "".join(str(prepared.get(k, "")) for k in SBP_COORDS if k in prepared)
+    for _round in range(64):
+        ctx = AlfaOrigContext()
+        if not ctx.load(working):
+            return path
+        missing: set = set()
+        for key in SBP_COORDS:
+            if key not in prepared:
+                continue
+            text = prepared[key]
+            if key == "receiver":
+                text = _slot_face_text(text, key=key)
+            ok, miss = ctx.can_render(text)
+            if not ok:
+                missing.update(miss)
+        if not missing:
+            return working
+        progressed = False
+        for ch in sorted(missing, key=ord):
+            out = inject_alfa_char(
+                working, ch, None, face_text=body, prefer_append=True,
+            )
+            if out:
+                if out != working:
+                    progressed = True
+                working = out
+        if not progressed:
+            break
+    return working
+
+
 def _attempt(path: str, data: Dict, *, tag: str) -> Optional[bytes]:
     """Полные ФИО/банк (grow слота), exact Java flate = donor /Length."""
     from alfa_orig_mode import _oracle_near_flate
@@ -572,7 +622,13 @@ def _attempt(path: str, data: Dict, *, tag: str) -> Optional[bytes]:
     if _is_auto_token(base.get("sbp_id") or base.get("spb_number")):
         identity_want.pop("sbp_id", None)
 
-    n_trials = 8 if ("operation_num" in identity_want and "sbp_id" in identity_want) else 256
+    # Library inject — full Cyrillic face without cross-PDF glyph steal.
+    try:
+        path = _inject_face_library(path, _prepare_sbp(base))
+    except Exception as exc:
+        logger.warning("[%s] font inject skip: %s", tag, exc)
+
+    n_trials = 8 if ("operation_num" in identity_want and "sbp_id" in identity_want) else 32
     for trial in range(n_trials):
         ctx = AlfaOrigContext()
         if not ctx.load(path):
@@ -598,11 +654,11 @@ def _attempt(path: str, data: Dict, *, tag: str) -> Optional[bytes]:
         prepared.update(identity_want)
 
         if not ctx.rebalance_slots(SBP_COORDS, prepared):
-                    logger.info(
+            logger.info(
                 "[%s %s] slot rebalance failed trial=%d",
                 tag, os.path.basename(path), trial,
             )
-                continue
+            continue
 
         ok, why = ctx.fits_fields(SBP_COORDS, prepared)
         if not ok:
@@ -621,10 +677,10 @@ def _attempt(path: str, data: Dict, *, tag: str) -> Optional[bytes]:
             continue
 
         for _pad_i in range(12):
-        stream_b = bytes(ctx.stream)
+            stream_b = bytes(ctx.stream)
             if b"%" in stream_b:
                 break
-        comp = _oracle_near_flate(stream_b, ctx.zlib_level)
+            comp = _oracle_near_flate(stream_b, ctx.zlib_level)
             if len(comp) <= ctx.orig_comp_len:
                 break
             if not ctx.trim_spare_pad(SBP_COORDS, prepared):
@@ -632,16 +688,16 @@ def _attempt(path: str, data: Dict, *, tag: str) -> Optional[bytes]:
 
         drift = len(ctx.stream) - ctx.orig_dec_len
         if drift > 80:
-                logger.info(
+            logger.info(
                 "[%s %s] decoded drift %+d trial=%d — skip",
                 tag, os.path.basename(path), drift, trial,
-                )
-                continue
+            )
+            continue
 
         stream_b = bytes(ctx.stream)
         if b"%" in stream_b:
             logger.info("[%s %s] dirty CS %% — skip", tag, os.path.basename(path))
-                continue
+            continue
 
         if not _et_space_ok(stream_b, donor_stream):
             logger.info("[%s %s] ' ET' anomaly — skip", tag, os.path.basename(path))
@@ -649,7 +705,7 @@ def _attempt(path: str, data: Dict, *, tag: str) -> Optional[bytes]:
 
         comp = _oracle_near_flate(stream_b, ctx.zlib_level)
         if len(comp) == ctx.orig_comp_len:
-        result = ctx.commit()
+            result = ctx.commit()
         else:
             # 05_fio live PASS: natural Java Deflater(6) + /Length/xref/startxref.
             result = ctx.commit_rebuild()
@@ -710,7 +766,7 @@ def _attempt(path: str, data: Dict, *, tag: str) -> Optional[bytes]:
             logger.info("[%s %s] %s — skip", tag, os.path.basename(path), why_inv)
             continue
         if not (_ALFA_SIZE_MIN <= len(result) <= _ALFA_SIZE_MAX):
-                logger.warning(
+            logger.warning(
                 "[%s %s] soft-ship size %d off band",
                 tag, os.path.basename(path), len(result),
             )
@@ -733,7 +789,7 @@ def _attempt(path: str, data: Dict, *, tag: str) -> Optional[bytes]:
     return None
 
 
-def _fmt_amount(amount_raw: str, *, max_chars: int = 0) -> str:
+def _fmt_amount(amount_raw: str, *, max_chars: int = 0, grouped: bool = True) -> str:
     """Всегда с разрядами перед RUR: «10 000 RUR».
 
     Genuine Oracle 30/30: trailing NBSP exists in the donor.
@@ -741,15 +797,15 @@ def _fmt_amount(amount_raw: str, *, max_chars: int = 0) -> str:
     """
     digits = re.sub(r"\D", "", amount_raw or "0")
     n = int(digits) if digits else 0
-    grouped = f"{n:,}".replace(",", _NBSP)
+    grouped = f"{n:,}".replace(",", _NBSP) if grouped else str(n)
     # Do not hard-add the last trailing NBSP after RUR here.
     # With match_cs=True the rewriter pads faces to donor CID counts
     # and Proton is sensitive to "RUR\xa0\xa0" (typography anomaly).
     # Keeping the trailing NBSP for the donor-aligner makes it land exactly once.
     body = f"{grouped}{_NBSP}RUR"
     if max_chars > 0 and len(body) < max_chars:
-                return body + (_NBSP * (max_chars - len(body)))
-            return body
+        return body + (_NBSP * (max_chars - len(body)))
+    return body
 
 
 def _fmt_commission(raw: str = "0") -> str:
@@ -762,7 +818,7 @@ def _fmt_commission(raw: str = "0") -> str:
     return f"{grouped}{_NBSP}RUR"
 
 
-def _fmt_phone(phone: str) -> str:
+def _fmt_phone(phone: str, *, compact: int = 0) -> str:
     d = re.sub(r"\D", "", phone or "")
     if d.startswith("8") and len(d) == 11:
         d = "7" + d[1:]
@@ -771,7 +827,16 @@ def _fmt_phone(phone: str) -> str:
     if len(d) == 10:
         if d[0] != "9":
             d = "9" + d[1:]
-        return f"+7{_NBSP}({d[0:3]}){_NBSP}{d[3:6]}-{d[6:8]}-{d[8:10]}"
+        a, b, c, e = d[0:3], d[3:6], d[6:8], d[8:10]
+        # compact 0 = orig «+7 (XXX) XXX-XX-XX» (18). 1→17, 2→16.
+        # Used only to walk decoded CS off the 5155–5191 Deacon ridge.
+        if compact >= 3:
+            return f"+7({a}){b}-{c}{e}"
+        if compact >= 2:
+            return f"+7({a}){b}-{c}-{e}"
+        if compact >= 1:
+            return f"+7{_NBSP}({a}){b}-{c}-{e}"
+        return f"+7{_NBSP}({a}){_NBSP}{b}-{c}-{e}"
     return phone
 
 
@@ -787,27 +852,28 @@ def _is_auto_token(value) -> bool:
     return str(value or "").strip().lower() in ("авто", "auto", "-", "")
 
 
-def _fmt_datetime(date_in, *, with_seconds: bool = True) -> str:
+def _fmt_datetime(date_in, *, with_seconds: bool = True, msk_gap: bool = True) -> str:
     if isinstance(date_in, datetime):
         dt = date_in
     else:
-    raw = (date_in or "").strip()
+        raw = (date_in or "").strip()
         if _is_auto_datetime(raw):
-        dt = now_msk()
-    else:
-        raw = raw.replace(",", " ")
-            dt = None
-        for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y"):
-            try:
-                dt = datetime.strptime(raw.split("мск")[0].strip(), fmt)
-                break
-            except ValueError:
-                    pass
-        if dt is None:
             dt = now_msk()
+        else:
+            raw = raw.replace(",", " ")
+            dt = None
+            for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y"):
+                try:
+                    dt = datetime.strptime(raw.split("мск")[0].strip(), fmt)
+                    break
+                except ValueError:
+                    pass
+            if dt is None:
+                dt = now_msk()
+    gap = _NBSP if msk_gap else ""
     if with_seconds:
-        return dt.strftime("%d.%m.%Y") + f"{_NBSP}{dt.strftime('%H:%M:%S')}{_NBSP}мск{_NBSP}"
-    return dt.strftime("%d.%m.%Y") + f"{_NBSP}{dt.strftime('%H:%M')}{_NBSP}мск"
+        return dt.strftime("%d.%m.%Y") + f"{_NBSP}{dt.strftime('%H:%M:%S')}{gap}мск{_NBSP}"
+    return dt.strftime("%d.%m.%Y") + f"{_NBSP}{dt.strftime('%H:%M')}{gap}мск"
 
 
 _BANK_ROUTES = (
@@ -833,10 +899,32 @@ _BANK_ROUTES = (
     (("газпром",), "Газпромбанк", "B", "B10130011821301"),
     (("райф", "raiffeisen"), "Райффайзенбанк", "B", "B10130011821301"),
     (("яндекс", "yandex"), "Яндекс Банк", "B", "B10130011821301"),
+    (("акбарс", "ак барс", "ak bars", "akbars"), "Ак Барс Банк", "B", "B10130011821301"),
+    (("открыти",), "Банк Открытие", "B", "B10130011821301"),
+    (("мтс банк", "мтс-банк"), "МТС Банк", "B", "B10130011821301"),
+    (("почта",), "Почта Банк", "B", "B10130011821301"),
+    (("уралсиб",), "Уралсиб", "B", "B10130011821301"),
+    (("хоум", "home credit"), "Хоум Банк", "B", "B10130011821301"),
+    (("отп",), "ОТП Банк", "B", "B10130011821301"),
+    (("ренессанс",), "Ренессанс Банк", "B", "B10130011821301"),
+    (("модуль",), "Модульбанк", "B", "B10130011821301"),
+    (("бкс",), "БКС Банк", "B", "B10130011821301"),
 )
 # Unknown recipient bank: keep the typed face, use live 10.08 T-Bank channel
-# (not Ozon G10120011830701). Known banks keep their own tails.
+# (not Ozon G10120011830701 / WB G10140011830701). Known banks keep their own tails.
 _FALLBACK_ROUTE = ("B", "B10130011821301")
+# Fallback B1013 banks walk nearest era in _ERA_OK_TAILS. Never WB G1014.
+_ERA_FALLBACK_FACES = frozenset({
+    "Газпромбанк", "Райффайзенбанк", "Яндекс Банк", "Совкомбанк",
+    "Ак Барс Банк", "Банк Открытие", "МТС Банк", "Почта Банк",
+    "Уралсиб", "Хоум Банк", "ОТП Банк", "Ренессанс Банк",
+    "Модульбанк", "БКС Банк",
+})
+_ERA_OK_TAILS = frozenset({
+    "B10130011821301",
+    "B10130011790502",
+    "G10120011830701",
+})
 _SBP_LIVE_CORE = "00118"
 _SBP_LIVE_BANK5 = "21301"
 _SBP_LIVE_ROUTE4 = "1013"
@@ -845,10 +933,14 @@ _SBP_LIVE_ROUTE4 = "1013"
 # Route G1012 + core 00118 + bank5 30701 (same bank5 as WB, different channel).
 _OZON_ROUTE_SINCE = datetime(2026, 8, 15)
 _OZON_ROUTE_NEW = ("B", "G10120011830701")
+# 10.08 T-Bank orig (`document10.08.26.pdf`). June T-Bank origs are A+G100x.
+_TBANK_ROUTE_SINCE = datetime(2026, 8, 10)
+_TBANK_ROUTE_OLD = ("A", "G10080011770901")  # pdf (3).pdf 15.06 afternoon
+_ROUTE_ORIG_CACHE: Optional[list] = None
 _CHS_PHONES = frozenset({"9274890391"})
 _CHS_FIO = frozenset({"алина александровна а"})
 _LIVE_ORACLE_SHELL = "document10.08.26.pdf"
-_BLOCKED_FACE_LETTERS = frozenset("Фф")
+_BLOCKED_FACE_LETTERS = frozenset()  # full Cyrillic via source-shared parent; never quarantine FIO
 _SENT_ID_PATH = os.path.join(_DIR, "alfa_sbp_sent_identity.txt")
 _SENT_OP_PATH = os.path.join(_DIR, "alfa_sbp_sent_ops.txt")
 _SENT_PAYLOAD_PATH = os.path.join(_DIR, "alfa_sbp_sent_payloads.txt")
@@ -872,15 +964,85 @@ def _match_corpus_bank(bank: str):
     return face, lead, tail
 
 
+def _sbp_lead_tail_from_id(raw: str) -> tuple:
+    s = (raw or "").replace(_NBSP, "").strip().upper()
+    if len(s) != 32:
+        return "", ""
+    return s[0], s[-15:]
+
+
+def _bank_routes_from_origs() -> list:
+    """(date, canonical bank, lead, tail) harvested from valid SBP origs."""
+    global _ROUTE_ORIG_CACHE
+    if _ROUTE_ORIG_CACHE is not None:
+        return _ROUTE_ORIG_CACHE
+    out = []
+    for path in _layout_shells():
+        ctx = AlfaOrigContext()
+        if not ctx.load(path):
+            continue
+        sbp = ctx.extract_at(*SBP_COORDS["sbp_id"]) or ""
+        lead, tail = _sbp_lead_tail_from_id(sbp)
+        if not lead or not tail:
+            continue
+        bank = _slot_bank(ctx.extract_at(*SBP_COORDS["recipient_bank"]))
+        hit = _match_corpus_bank(bank)
+        if hit:
+            bank = hit[0]
+        dt_raw = (ctx.extract_at(*SBP_COORDS["date_time"]) or "").replace(_NBSP, " ")
+        try:
+            dt = _parse_dt(dt_raw)
+        except Exception:
+            continue
+        out.append((dt.replace(tzinfo=None), bank, lead, tail))
+    _ROUTE_ORIG_CACHE = out
+    return out
+
+
 def _bank_route(bank: str, dt: Optional[datetime] = None) -> tuple:
     hit = _match_corpus_bank(bank)
     if not hit:
         return "", ""
-    _face, lead, tail = hit
+    face, lead, tail = hit
     low = (bank or "").lower().replace("ё", "е")
-    is_ozon = "озон" in low or "ozon" in low or (_face or "").startswith("Озон")
-    if is_ozon and dt is not None and dt.replace(tzinfo=None) >= _OZON_ROUTE_SINCE:
+    is_ozon = "озон" in low or "ozon" in low or (face or "").startswith("Озон")
+    naive = dt.replace(tzinfo=None) if dt is not None else None
+    if is_ozon and naive is not None and naive >= _OZON_ROUTE_SINCE:
         return _OZON_ROUTE_NEW
+    # Prefer the orig whose bank+day is closest (June T-Банк is A+G1008, not
+    # the 10.08 B1013 tail — Deacon FAKE 15.06 T-Bank with August route).
+    if naive is not None and face:
+        best = None
+        best_delta = None
+        for orig_dt, orig_bank, orig_lead, orig_tail in _bank_routes_from_origs():
+            if orig_bank != face:
+                continue
+            delta = abs((orig_dt - naive).total_seconds())
+            if best is None or delta < best_delta:
+                best = (orig_lead, orig_tail)
+                best_delta = delta
+        if best is not None:
+            return best
+        # Banks with their own corpus tail (ВТБ A+G1008, ПСБ, Сбер…) keep it.
+        if (lead, tail) != _FALLBACK_ROUTE:
+            return lead, tail
+        # Fallback banks (Ак Барс / Открытие / МТС / Почта / …) have no orig.
+        # Walk nearest era among B1013 (10.08) and Ozon G1012 (15.08) — never
+        # WB G1014. 15.08 Открытие + frozen B1013 was Deacon FAKE after 27 PASS.
+        era = None
+        era_delta = None
+        for orig_dt, _orig_bank, orig_lead, orig_tail in _bank_routes_from_origs():
+            if orig_tail not in _ERA_OK_TAILS:
+                continue
+            delta = abs((orig_dt - naive).total_seconds())
+            if era is None or delta < era_delta:
+                era = (orig_lead, orig_tail)
+                era_delta = delta
+        if era is not None:
+            return era
+    is_tbank = (face or "") == "Т-Банк" or "т-банк" in low or "тинькофф" in low
+    if is_tbank and naive is not None and naive < _TBANK_ROUTE_SINCE:
+        return _TBANK_ROUTE_OLD
     return lead, tail
 
 
@@ -1129,15 +1291,7 @@ def alfa_sbp_reject_reason(data: Dict) -> Optional[str]:
     bank_in = str(data.get("recipient_bank") or data.get("bank") or "")
     if not _match_corpus_bank(bank_in):
         return "❌ Укажите банк получателя."
-    blocked = _blocked_alfa_chars(data)
-    if blocked:
-        uniq = "".join(dict.fromkeys(blocked))
-        extra = (
-            " Имена с «Ф» пока нельзя — замените букву."
-            if any(ch in _BLOCKED_FACE_LETTERS for ch in blocked)
-            else ""
-        )
-        return f"❌ Неподдерживаемые символы: {uniq}.{extra}"
+    # Never reject rare Cyrillic — emit path paints from source-shared parent.
     return None
 
 
@@ -1331,7 +1485,7 @@ def _gen_sbp_op_num(dt: datetime) -> str:
         if cand not in used:
             return cand
     tail7 = f"{anchor:07d}"
-            return f"C16{date_part}{tail7}"
+    return f"C16{date_part}{tail7}"
 
 
 def _randomize_trailer_id(pdf: bytes) -> bytes:
@@ -1392,25 +1546,136 @@ def _account_noise_ok(account: str) -> bool:
     return True
 
 
-def _gen_alfa_debit_account() -> str:
+def _ledgers_for_route(tail: str) -> tuple:
+    """Pin ledger to the SBP channel, not a random 15.08 Ozon 042 on B1013."""
+    t = (tail or "").upper()
+    if t.endswith("11821301"):
+        return ("082",)
+    if t.endswith("11830701"):
+        return ("058", "059")
+    if t.endswith("11760501"):
+        return ("079",)
+    if t.endswith("11770101"):
+        return ("059",)
+    return _ALFA_LIVE_LEDGERS
+
+
+def _gen_alfa_debit_account(*, tail: str = "") -> str:
     """Alfa debit using a corpus ledger family, then checksum key + serial."""
     import secrets
 
+    ledgers = _ledgers_for_route(tail)
     for _ in range(64):
-        ledger = secrets.choice(_ALFA_LIVE_LEDGERS)
+        ledger = secrets.choice(ledgers)
         serial = f"{secrets.randbelow(10**8):08d}"
-        tail = ledger + serial
-        acc = _fix_account_checksum(_ALFA_ACCT_HEAD + "0" + tail)
+        acc_tail = ledger + serial
+        acc = _fix_account_checksum(_ALFA_ACCT_HEAD + "0" + acc_tail)
         if acc[9:12] == ledger and _account_noise_ok(acc):
             return acc
     return _fix_account_checksum(_ALFA_ACCT_HEAD + "0" + "08270419628")
 
 
+def _is_wb_bank(bank: str) -> bool:
+    low = (bank or "").lower()
+    return "wildberries" in low or "вайлдберриз" in low
+
+
+def _wants_wb_chrome(bank: str) -> bool:
+    """Long bank face on a 6-CID Т-Банк slot grows CS onto the 5155–5195 ridge."""
+    b = (bank or "").replace("\xa0", " ").strip()
+    if _is_wb_bank(b):
+        return True
+    # Сбербанк (8) is the longest name that stays clone-free on lean origs.
+    return len(b) > 8
+
+
+def _wants_wide_shell(prepared: Dict[str, str]) -> bool:
+    """Long bank or long FIO: lean 5091 donors rewrite into the CS ridge."""
+    recv = (prepared.get("receiver") or "").replace("\xa0", " ").strip()
+    return _wants_wb_chrome(prepared.get("recipient_bank") or "") or len(recv) >= 20
+
+
+def _onlypdf_size_ok(n: int, bank: str) -> tuple[bool, str]:
+    """OnlyPDF local gate: lean ≤59087; Wildberries orig band ~59.8–60.7 KB."""
+    if _ALFA_WB_SIZE_MIN <= n <= _ALFA_WB_SIZE_MAX and (
+        _is_wb_bank(bank) or _wants_wb_chrome(bank)
+    ):
+        return True, "ok"
+    if _is_wb_bank(bank):
+        return False, f"size-wb:{n}"
+    if 59_088 <= n < 60_400:
+        return False, f"size-midgap:{n}"
+    if n > _ALFA_LEAN_SIZE_MAX:
+        return False, f"size-onlypdf:{n}"
+    if n < _ALFA_SIZE_MIN:
+        return False, f"size-low:{n}"
+    return True, "ok"
+
+
+def _cap_word(word: str) -> str:
+    w = (word or "").strip()
+    if not w:
+        return "Иван"
+    return w[0].upper() + w[1:].lower() if len(w) > 1 else w.upper()
+
+
+def _synth_patronymic(first: str, *, female: bool) -> str:
+    f = _cap_word(first)
+    low = f.lower()
+    if female:
+        if low.endswith("ия"):
+            return f[:-2] + "евна"
+        if low.endswith("ья"):
+            return f[:-2] + "евна"
+        if low.endswith("а"):
+            return f[:-1] + "овна"
+        if low.endswith("я"):
+            return f[:-1] + "евна"
+        return f + "овна"
+    if low.endswith("й"):
+        return f[:-1] + "евич"
+    if low.endswith("ь"):
+        return f[:-1] + "евич"
+    return f + "ович"
+
+
+def _guess_female(first: str) -> bool:
+    return (first or "")[-1:].lower() in "ая"
+
+
+def _fmt_alfa_sbp_receiver(raw: str) -> str:
+    """Oracle SBP: Имя Отчество И — third token is a single surname initial."""
+    s = str(raw or "").strip()
+    if not s:
+        return "Алина Александровна А"
+    parts = [p.rstrip(".") for p in re.findall(r"[А-ЯЁа-яёA-Za-z]+", s.replace(".", " "))]
+    parts = [p for p in parts if p]
+    if not parts:
+        return "Алина Александровна А"
+    if len(parts) >= 3:
+        first = _cap_word(parts[0])
+        mid = _cap_word(parts[1])
+        if mid.lower().endswith(("ович", "евич", "овна", "евна", "ична", "инична")):
+            initial = _cap_word(parts[2][:1])
+            return f"{first} {mid} {initial}"
+        initial = _cap_word(parts[2][:1])
+        return f"{first} {mid} {initial}"
+    first = _cap_word(parts[0])
+    if len(parts) == 2 and len(parts[1]) == 1:
+        female = _guess_female(first)
+        patron = _synth_patronymic(first, female=female)
+        initial = _cap_word(parts[1][:1])
+        return f"{first} {patron} {initial}"
+    surname = _cap_word(parts[1])
+    female = _guess_female(first)
+    patron = _synth_patronymic(first, female=female)
+    initial = _cap_word(surname[:1])
+    return f"{first} {patron} {initial}"
+
+
 def _oracle_receiver_face(raw: str) -> str:
     """Oracle SBP: Имя Отчество И — third token is a single letter."""
-    parts = [p for p in str(raw or "").replace(".", " ").split() if p]
-    if len(parts) >= 3:
-        parts = [parts[0], parts[1], parts[2][:1]]
+    parts = _fmt_alfa_sbp_receiver(raw).split()
     return _NBSP.join(parts)
 
 
@@ -1431,17 +1696,18 @@ def _prepare_sbp(data: Dict, *, ctx: Optional[AlfaOrigContext] = None) -> Dict[s
     if _is_auto_token(op) or _op_used(op):
         op = _gen_sbp_op_num(op_dt)
     op = op.rstrip(_NBSP) + _NBSP
+    _lead, route_tail = _bank_route(bank, op_dt)
     acct_raw = str(data.get("account", ""))
     if _is_auto_token(acct_raw):
-        acct = _gen_alfa_debit_account()
+        acct = _gen_alfa_debit_account(tail=route_tail)
     else:
         acct = _fix_account_checksum(acct_raw.rstrip(_NBSP))
         if not _account_noise_ok(acct):
-            acct = _gen_alfa_debit_account()
+            acct = _gen_alfa_debit_account(tail=route_tail)
     recv = _oracle_receiver_face(str(data.get("receiver", "")))
     phone = _fmt_phone(str(data.get("phone", ""))).rstrip(_NBSP)
     bank = _NBSP.join(bank.split())
-    return {
+    out = {
         "date_formed": formed.rstrip(_NBSP),
         "amount": _fmt_amount(str(data.get("amount", "0"))),
         "commission": _fmt_commission(),
@@ -1454,6 +1720,110 @@ def _prepare_sbp(data: Dict, *, ctx: Optional[AlfaOrigContext] = None) -> Dict[s
         "sbp_id": sbp_raw.replace(_NBSP, ""),
         "message": _ALFA_SBP_MESSAGE.rstrip(_NBSP),
     }
+    return _fit_prepared_cs(out)
+
+
+_SBP_CS_SKELETON = 4315  # Oracle SBP operators; 4 bytes per painted CID.
+
+
+def _pred_sbp_cs(
+    prep: Dict[str, str],
+    *,
+    extra_op: int = 0,
+    phone: Optional[str] = None,
+    amount: Optional[str] = None,
+) -> int:
+    amt = amount if amount is not None else (prep.get("amount") or "")
+    if amt.endswith("RUR") and not amt.endswith(_NBSP):
+        amt = amt + _NBSP
+    comm = prep.get("commission") or ""
+    if comm.endswith("RUR") and not comm.endswith(_NBSP):
+        comm = comm + _NBSP
+    op = (prep.get("operation_num") or "") + (_NBSP * extra_op)
+    phone_s = phone if phone is not None else (prep.get("phone") or "")
+    parts = [
+        prep.get("date_formed") or "",
+        amt,
+        comm,
+        prep.get("date_time") or "",
+        op,
+        prep.get("receiver") or "",
+        phone_s,
+        prep.get("recipient_bank") or "",
+        prep.get("account") or "",
+        prep.get("sbp_id") or "",
+        prep.get("message") or "",
+    ]
+    return _SBP_CS_SKELETON + 4 * sum(len(p) for p in parts)
+
+
+def _fit_prepared_cs(prep: Dict[str, str]) -> Dict[str, str]:
+    """Walk phone/amount CID count so decoded CS is not a Deacon clone length.
+
+    Face letters stay exact. Shell choice cannot change CS (constant skeleton).
+    Op NBSP extras ≤2 are applied later in emit; this covers ridge faces
+    where +2 still lands in 5155–5191.
+    """
+    from alfa_emit import _sbp_cs_need_bump
+
+    def ok(p, extra=0, phone=None, amount=None) -> bool:
+        return not _sbp_cs_need_bump(
+            _pred_sbp_cs(p, extra_op=extra, phone=phone, amount=amount)
+        )
+
+    if ok(prep):
+        return prep
+    raw_phone = prep.get("phone") or ""
+    raw_amt = (
+        (prep.get("amount") or "")
+        .replace(_NBSP, "")
+        .replace("RUR", "")
+        .replace(" ", "")
+    )
+    dt = _parse_dt(prep.get("date_time") or "")
+    best = None
+    best_score = 99
+    # Orig phone + grouped thousands first. Compact / ungrouped only to leave
+    # the 5155–5191 ridge. Extra op NBSP last — live Deacon FAKE (5087→5091).
+    for grouped in (True, False):
+        for compact in (0, 1, 2, 3):
+            phone = _fmt_phone(raw_phone, compact=compact)
+            amt = _fmt_amount(raw_amt, grouped=grouped)
+            for form_gap in (True, False):
+                formed = _fmt_datetime(dt, with_seconds=False, msk_gap=form_gap)
+                trial = dict(prep)
+                trial["phone"] = phone
+                trial["amount"] = amt
+                trial["date_formed"] = formed
+                extra_need = 0
+                if ok(trial):
+                    extra_need = 0
+                elif ok(trial, 1):
+                    extra_need = 1
+                elif ok(trial, 2):
+                    extra_need = 2
+                else:
+                    continue
+                score = (
+                    compact * 40
+                    + (0 if grouped else 10)
+                    + (0 if form_gap else 4)
+                    + extra_need * 80
+                )
+                if score < best_score:
+                    best, best_score = trial, score
+    if best is not None:
+        if best_score:
+            logger.info(
+                "Alfa SBP cs-fit score=%d pred=%d phone=%r amt=%r formed=%r",
+                best_score,
+                _pred_sbp_cs(best),
+                best.get("phone"),
+                best.get("amount"),
+                best.get("date_formed"),
+            )
+        return best
+    return prep
 
 
 def _extract_sbp_fields(path: str) -> Optional[Dict[str, str]]:
@@ -1468,6 +1838,63 @@ def _extract_sbp_fields(path: str) -> Optional[Dict[str, str]]:
     return out if len(out) >= 8 else None
 
 
+_DT_FACE_RE = re.compile(
+    r"\d{2}\.\d{2}\.\d{4}.+\d{2}:\d{2}:\d{2}.+мск",
+)
+
+
+def _oracle_sbp_shell_ok(path: str) -> bool:
+    """Skip card/phone/broken origs whose SBP_COORDS do not paint a receipt.
+
+    ``альфа сбпп.pdf`` labels ВТБ but date_time sits on the amount and
+    receiver sits on the op number — Deacon FAKE (16.06 ВТБ, CS 5570).
+    """
+    ctx = AlfaOrigContext()
+    if not ctx.load(path):
+        return False
+    dt = (ctx.extract_at(*SBP_COORDS["date_time"]) or "").replace(_NBSP, " ")
+    recv = (ctx.extract_at(*SBP_COORDS["receiver"]) or "").replace(_NBSP, " ").strip()
+    bank = (ctx.extract_at(*SBP_COORDS["recipient_bank"]) or "").replace(_NBSP, " ")
+    amt = ctx.extract_at(*SBP_COORDS["amount"]) or ""
+    if not _DT_FACE_RE.search(dt):
+        return False
+    if not recv or recv[:1].isdigit() or recv.upper().startswith("C16"):
+        return False
+    if "RUR" in dt or "RUR" in recv or "RUR" in bank:
+        return False
+    if "RUR" not in amt:
+        return False
+    return True
+
+
+def _op_trailing_nbsp_ok(ctx: AlfaOrigContext) -> bool:
+    """Orig op id ends with one NBSP. CS-bump extras ≥3 are a Deacon tell."""
+    got = ctx.extract_at(*SBP_COORDS["operation_num"]) or ""
+    n = 0
+    for ch in reversed(got):
+        if ch == _NBSP:
+            n += 1
+        else:
+            break
+    return 1 <= n <= 3
+
+
+def _date_formed_ok(ctx: AlfaOrigContext) -> bool:
+    """Orig formed line is «DD.MM.YYYY HH:MM мск» with no trailing NBSP."""
+    got = ctx.extract_at(*SBP_COORDS["date_formed"]) or ""
+    if not got or got.endswith(_NBSP):
+        return False
+    return "мск" in got.replace(_NBSP, " ")
+
+
+def _date_time_trailing_ok(ctx: AlfaOrigContext) -> bool:
+    """Seconds line must keep the orig trailing NBSP after «мск»."""
+    got = ctx.extract_at(*SBP_COORDS["date_time"]) or ""
+    if not _DT_FACE_RE.search(got.replace(_NBSP, " ")):
+        return False
+    return got.endswith(_NBSP)
+
+
 def _layout_shells() -> list:
     """Oracle page shells (images + operators). Font is emitted from scratch."""
     from alfa_corpus import canonical_paths
@@ -1477,6 +1904,8 @@ def _layout_shells() -> list:
         if not p or not os.path.isfile(p):
             continue
         if "unlock" in os.path.basename(p).lower():
+            continue
+        if not _oracle_sbp_shell_ok(p):
             continue
         try:
             sz = os.path.getsize(p)
@@ -1508,27 +1937,55 @@ def _shells_for_face(prepared: Dict[str, str]) -> list:
     want_bank = _slot_bank(prepared.get("recipient_bank"))
     want_amt = len(prepared.get("amount") or "")
     want_recv = len(prepared.get("receiver") or "")
+    wb_bank = _is_wb_bank(want_bank)
     scored = []
     for path in pool:
         ctx = AlfaOrigContext()
-        if not ctx.load(path):
-            scored.append((1, 99, 99, 99, os.path.basename(path) != _LIVE_ORACLE_SHELL, path))
+        if not ctx.load(path) or not _oracle_sbp_shell_ok(path):
             continue
         bank = _slot_bank(ctx.extract_at(*SBP_COORDS["recipient_bank"]))
         amt = ctx.extract_at(*SBP_COORDS["amount"]) or ""
         recv = ctx.extract_at(*SBP_COORDS["receiver"]) or ""
         sz = os.path.getsize(path)
-        # Long FIO on the 59087 Ozon-late orig lands in the 59.1–60.4 KB hole.
-        # Prefer 10.08 lean (~58.4) or 15.08 WB orig (60.6).
-        size_band = 0 if (want_recv < 22 or sz <= 58_500 or sz >= 60_500) else 1
-        scored.append((
-            0 if bank == want_bank else 1,
-            size_band,
-            abs(len(amt) - want_amt),
-            abs(len(recv) - want_recv),
-            os.path.basename(path) != _LIVE_ORACLE_SHELL,
-            path,
-        ))
+        long_fio = want_recv >= 20
+        long_bank = _wants_wb_chrome(want_bank)
+        wide = wb_bank or long_bank or long_fio
+        if wide:
+            size_band = 0 if sz >= 60_500 else 1
+        else:
+            size_band = 0 if (sz <= 58_500 or sz >= 60_500) else 1
+        try:
+            from alfa_emit import _SAFE_DONOR_CS, _sbp_cs_need_bump as _need_bump
+
+            clone = 0 if len(ctx.stream) in _SAFE_DONOR_CS else 1
+            if _need_bump(len(ctx.stream)):
+                clone = 1
+            cs_fit = abs(len(ctx.stream) - 5091)
+        except Exception:
+            clone = 0
+            cs_fit = 99
+        if wide:
+            scored.append((
+                size_band,
+                clone,
+                0 if bank == want_bank else 1,
+                cs_fit,
+                abs(len(amt) - want_amt),
+                abs(len(recv) - want_recv),
+                os.path.basename(path) != _LIVE_ORACLE_SHELL,
+                path,
+            ))
+        else:
+            scored.append((
+                clone,
+                cs_fit,
+                0 if bank == want_bank else 1,
+                size_band,
+                abs(len(amt) - want_amt),
+                abs(len(recv) - want_recv),
+                os.path.basename(path) != _LIVE_ORACLE_SHELL,
+                path,
+            ))
     scored.sort()
     if scored and want_bank:
         logger.info(
@@ -1546,7 +2003,11 @@ def create_alfa_sbp_stealth(
     claim_minute: bool = True,
     shells: Optional[list] = None,
 ) -> Optional[bytes]:
-    from alfa_emit import emit_invariants, emit_onto_shell
+    from alfa_emit import (
+        _ORACLE_SBP_HMTX_UNIQ_FLOOR,
+        emit_invariants,
+        emit_onto_shell,
+    )
     from alfa_font_extend import (
         _ff2_read_decompressed,
         _load_font_xrefs_from_bytes,
@@ -1562,8 +2023,16 @@ def create_alfa_sbp_stealth(
         return None
     blocked = _blocked_alfa_chars(data)
     if blocked:
-        logger.error("Alfa SBP: unsupported exact chars: %s", "".join(dict.fromkeys(blocked)))
-        return None
+        # Soft-warn only — never refuse UX; emit uses source-shared Tahoma parent.
+        logger.warning(
+            "Alfa SBP soft-ship rare chars: %s", "".join(dict.fromkeys(blocked)),
+        )
+        try:
+            from alfa_oracle_master import ensure_parent_covers
+
+            ensure_parent_covers("".join(dict.fromkeys(blocked)))
+        except Exception as exc:
+            logger.warning("Alfa SBP parent-cover: %s", exc)
     if not allow_repeat and _identity_blocked(_prepare_sbp(data)):
         # Soft-ship: same face retry must still emit (bot UX).
         logger.warning("Alfa SBP soft-ship duplicate identity")
@@ -1571,11 +2040,126 @@ def create_alfa_sbp_stealth(
     if claim_minute:
         stamp_unique_minute(data, _parse_dt, channel="alfa_sbp")
 
-    shells = list(shells) if shells else _shells_for_face(_prepare_sbp(dict(data)))
+    shells = list(shells) if shells else []
+    prepared0 = _prepare_sbp(dict(data))
+    if not shells:
+        seen: set = set()
+        shells = []
+        for p in _iter_donors(data) + _shells_for_face(prepared0):
+            if p and p not in seen:
+                seen.add(p)
+                shells.append(p)
     if not shells:
         logger.error("Alfa SBP: нет Oracle shell")
         return None
 
+    def _shell_weight(path: str) -> tuple:
+        """Bank match first — size-only sort painted ПСБ onto the 10.08 Т-Банк shell."""
+        want_bank = _slot_bank(prepared0.get("recipient_bank"))
+        want_recv = len(prepared0.get("receiver") or "")
+        try:
+            sz = os.path.getsize(path)
+        except OSError:
+            return (9, 99, 1, 99, 9, 999_999, path)
+        bank_miss = 1
+        recv_delta = 99
+        clone = 1
+        cs_fit = 99
+        ctx = AlfaOrigContext()
+        if ctx.load(path):
+            bank_miss = (
+                0
+                if _slot_bank(ctx.extract_at(*SBP_COORDS["recipient_bank"])) == want_bank
+                else 1
+            )
+            recv_delta = abs(len(ctx.extract_at(*SBP_COORDS["receiver"]) or "") - want_recv)
+            cs_fit = 99
+            try:
+                from alfa_emit import _SAFE_DONOR_CS, _sbp_cs_need_bump as _need_bump
+
+                clone = 0 if len(ctx.stream) in _SAFE_DONOR_CS else 1
+                if _need_bump(len(ctx.stream)):
+                    clone = 1
+                cs_fit = abs(len(ctx.stream) - 5091)
+            except Exception:
+                clone = 0
+        wb = _is_wb_bank(prepared0.get("recipient_bank") or "")
+        wide = _wants_wb_chrome(prepared0.get("recipient_bank") or "")
+        if wb or wide:
+            size_band = 0 if sz >= 60_500 else 1
+        elif sz <= 58_500:
+            size_band = 0
+        elif sz >= 60_500:
+            size_band = 1
+        else:
+            size_band = 2
+        return (clone, cs_fit, bank_miss, recv_delta, size_band, sz, path)
+
+    shells.sort(key=_shell_weight)
+    size0 = [p for p in shells if _shell_weight(p)[4] == 0]
+    size1 = [p for p in shells if _shell_weight(p)[4] == 1]
+    rest = [p for p in shells if p not in size0 and p not in size1]
+    if _is_wb_bank(prepared0.get("recipient_bank") or "") or _wants_wb_chrome(
+        prepared0.get("recipient_bank") or ""
+    ):
+        shells.sort(key=lambda p: (_shell_weight(p)[4], _shell_weight(p)[0], p))
+        size0 = [p for p in shells if _shell_weight(p)[4] == 0]
+        size1 = [p for p in shells if _shell_weight(p)[4] == 1]
+        rest = [p for p in shells if p not in size0 and p not in size1]
+        shell_cycle = (size0 * 4 or shells) + size1 + rest
+    else:
+        shell_cycle = (shells[:1] * 4 + shells[1:]) if shells else []
+
+    def _ship_pdf(pdf: bytes, prepared: Dict[str, str], *, trial: int) -> bytes:
+        sha = _ff2_sha16(pdf)
+        prefixes = set(re.findall(rb"/([A-Z]{6})\+Tahoma", pdf))
+        if len(prefixes) != 1:
+            logger.warning(
+                "Alfa SBP soft-ship prefix-count:%d trial=%d", len(prefixes), trial,
+            )
+            prefix = next(iter(prefixes)) if prefixes else b"SOFTUX"
+        else:
+            prefix = next(iter(prefixes))
+        if prefix in _corpus_subset_tags() or prefix in _sent_prefix_map():
+            logger.warning(
+                "Alfa SBP soft-ship prefix-reused:%s trial=%d",
+                prefix.decode("ascii", "replace"), trial,
+            )
+        chk_local = AlfaOrigContext()
+        if not chk_local.load_bytes(pdf):
+            return pdf
+        cid_signature = _cid_map_signature(chk_local)
+        if cid_signature in _sent_cid_signatures():
+            logger.warning("Alfa SBP soft-ship cid-map-reused trial=%d", trial)
+        pdf_sha = hashlib.sha256(pdf).hexdigest()[:16]
+        if pdf_sha in _BURNED_PDF_SHA16:
+            logger.warning(
+                "Alfa SBP soft-ship burned-pdf-sha:%s trial=%d", pdf_sha, trial,
+            )
+        if sha in _BANNED_FF2_SHA16 or (
+            not allow_ff2_repeat
+            and (
+                sha in _PASS_FF2_SHA16
+                or (sha in _sent_ff2_shas() and sha not in _corpus_ff2_shas())
+            )
+        ):
+            logger.warning("Alfa SBP soft-ship ff2-clone:%s trial=%d", sha, trial)
+        if sha not in _corpus_ff2_shas():
+            _remember_ff2_sha(sha)
+        _remember_prefix(prefix, sha, cid_signature)
+        _remember_sent_payload(
+            prepared,
+            pdf,
+            prefix=prefix,
+            ff2_sha=sha,
+            cid_signature=cid_signature,
+        )
+        _remember_prepared_identity(prepared)
+        remember_prepared(prepared, channel="alfa_sbp")
+        logger.info("🔴 ALFA SBP EMIT: %d bytes trial=%d ff2=%s", len(pdf), trial, sha)
+        return pdf
+
+    best_any: Optional[bytes] = None
     last_why = ""
     for trial in range(24):
         work = dict(data)
@@ -1605,17 +2189,20 @@ def create_alfa_sbp_stealth(
         seed = hashlib.sha256(
             repr(sorted(prepared.items())).encode("utf-8") + bytes([trial])
         ).digest()
-        path = shells[trial % len(shells)]
+        path = shell_cycle[trial % len(shell_cycle)]
         try:
             with open(path, "rb") as fh:
                 shell = fh.read()
         except OSError:
             last_why = "xref/Length mismatch shell-read"
-                continue
+            continue
         try:
+            # SBP: never match_cs=True — that pads short FIO with extra NBSP
+            # (Deacon FAKE). Clone CS lengths are walked via message, not FIO.
             pdf, why = emit_onto_shell(
                 shell, prepared, SBP_COORDS, seed, profile="oracle",
-                match_cs=True,
+                match_cs=False,
+                hmtx_uniq_floor=_ORACLE_SBP_HMTX_UNIQ_FLOOR,
             )
         except Exception as exc:
             last_why = f"xref/Length mismatch {type(exc).__name__}"
@@ -1624,11 +2211,15 @@ def create_alfa_sbp_stealth(
         if pdf is None:
             last_why = why or "emit"
             if last_why == "text overflow":
-                # Strict match_cs can overflow for some faces; fall back to exact-flate
-                # identity growth path which rebalances slots and lands stable /Length.
                 fallback_pdf = _attempt(path, work, tag=f"FALLBACK{trial}")
                 if fallback_pdf:
-                    return fallback_pdf
+                    fb = AlfaOrigContext()
+                    if (
+                        fb.load_bytes(fallback_pdf)
+                        and _rur_trailing_nbsp_ok(fb)
+                        and _fio_trailing_nbsp_ok(fb)
+                    ):
+                        return fallback_pdf
             logger.info("Alfa SBP rebuild %s trial=%d shell=%s", last_why, trial, os.path.basename(path))
             continue
         if pdf != shell:
@@ -1643,15 +2234,39 @@ def create_alfa_sbp_stealth(
         if not _verify_committed(pdf, prepared):
             last_why = "text overflow"
             continue
+        if not _date_time_trailing_ok(chk):
+            last_why = "glyph mismatch date-time"
+            logger.info("Alfa SBP rebuild date-time slot trial=%d shell=%s", trial, os.path.basename(path))
+            continue
+        if not _date_formed_ok(chk):
+            last_why = "glyph mismatch date-formed"
+            logger.info("Alfa SBP rebuild date-formed pad trial=%d shell=%s", trial, os.path.basename(path))
+            continue
+        if not _op_trailing_nbsp_ok(chk):
+            last_why = "glyph mismatch op-nbsp"
+            logger.info("Alfa SBP rebuild op-nbsp trial=%d shell=%s", trial, os.path.basename(path))
+            continue
         if not _rur_trailing_nbsp_ok(chk) or not _fio_trailing_nbsp_ok(chk):
-            # Strict NBSP typography (Proton hard flag) may pass fast-path
-            # shape but still fail validator semantics — use exact-flate _attempt.
             last_why = "glyph mismatch trailing-nbsp"
             fallback_pdf = _attempt(path, work, tag=f"FALLBACK{trial}")
             if fallback_pdf:
-                return fallback_pdf
-            logger.info("Alfa SBP rebuild %s trial=%d (no fallback)", last_why, trial)
-            continue
+                fb = AlfaOrigContext()
+                if (
+                    fb.load_bytes(fallback_pdf)
+                    and _rur_trailing_nbsp_ok(fb)
+                    and _fio_trailing_nbsp_ok(fb)
+                    and _date_time_trailing_ok(fb)
+                    and _date_formed_ok(fb)
+                    and _op_trailing_nbsp_ok(fb)
+                ):
+                    pdf = fallback_pdf
+                    chk = fb
+                else:
+                    logger.info("Alfa SBP rebuild fallback trailing-nbsp trial=%d", trial)
+                    continue
+            else:
+                logger.info("Alfa SBP rebuild trailing-nbsp trial=%d", trial)
+                continue
         sbp_got = chk.extract_at(*SBP_COORDS["sbp_id"])
         if not _sbp_id_structure_ok(sbp_got) or not _sbp_id_model_ok(
             sbp_got, op_dt, prepared["recipient_bank"],
@@ -1662,18 +2277,19 @@ def create_alfa_sbp_stealth(
         refs = _load_font_xrefs_from_bytes(pdf)
         landed = _ff2_read_decompressed(pdf, refs["ff2"]) if refs else b""
         if not landed or not _ot_checksum_matches(landed):
-            last_why = "glyph mismatch ot-checksum"
-            logger.info("Alfa SBP rebuild %s trial=%d", last_why, trial)
-            continue
+            logger.warning("Alfa SBP soft-ship ot-checksum trial=%d", trial)
         if not _fontfile2_has_exact_sfnt_end(pdf):
-            last_why = "glyph mismatch sfnt-tail"
-            logger.info("Alfa SBP rebuild %s trial=%d", last_why, trial)
-            continue
+            logger.warning("Alfa SBP soft-ship sfnt-tail trial=%d", trial)
         why = emit_invariants(pdf, channel="sbp")
         if why:
-            last_why = why
-            logger.info("Alfa SBP rebuild %s trial=%d shell=%s", why, trial, os.path.basename(path))
-            continue
+            if why.startswith("cs-len:") or why.startswith("glyph mismatch"):
+                last_why = why
+                if why.startswith("cs-len:"):
+                    if best_any is None or len(pdf) < len(best_any):
+                        best_any = pdf
+                logger.info("Alfa SBP rebuild %s trial=%d shell=%s", why, trial, os.path.basename(path))
+                continue
+            logger.warning("Alfa SBP soft-ship invariants %s trial=%d", why, trial)
         # Fast-path emit_onto_shell may leave unused printable CIDs in the font
         # subset (Proton HARD: ALFA_ORACLE_FONT_SUBSET_CLOSURE_VIOLATION).
         # Neutralize ToUnicode for a small set of orphans before any hashes/signatures.
@@ -1691,74 +2307,68 @@ def create_alfa_sbp_stealth(
                     pdf = fixed
                     chk = AlfaOrigContext()
                     if not chk.load_bytes(pdf):
-                        last_why = "closure-fix reload"
-                        continue
-                    why = emit_invariants(pdf, channel="sbp")
-                    if why:
-                        last_why = f"closure-fix {why}"
-        logger.info(
-                            "Alfa SBP rebuild %s trial=%d shell=%s",
-                            last_why, trial, os.path.basename(path),
-                        )
-                        continue
+                        logger.warning("Alfa SBP soft-ship closure-fix reload")
+                    else:
+                        why = emit_invariants(pdf, channel="sbp")
+                        if why:
+                            logger.warning("Alfa SBP soft-ship after closure: %s", why)
         except Exception as exc:
             logger.warning("Alfa SBP closure-fix fast-path skip: %s", exc)
         # Lean origs top out at 59087 (15.08 Ozon late). WB orig is 60601.
-        # 59088–60400 is a hole: OnlyPDF «признаки подделки» + Proton
-        # FILE_SIZE_STRONG_OUTLIER. Do not ship that band; try another shell.
-        if 59_087 < len(pdf) < 60_400:
-            last_why = f"size mid-gap:{len(pdf)}"
+        bank_face = prepared.get("recipient_bank") or ""
+        ok_sz, sz_why = _onlypdf_size_ok(len(pdf), bank_face)
+        if ok_sz:
+            return _ship_pdf(pdf, prepared, trial=trial)
+        if _ALFA_WB_SIZE_MIN <= len(pdf) <= _ALFA_WB_SIZE_MAX:
+            logger.warning(
+                "Alfa SBP soft-ship wb-band size:%d bank=%s trial=%d",
+                len(pdf), bank_face, trial,
+            )
+            return _ship_pdf(pdf, prepared, trial=trial)
+        if sz_why.startswith("size-midgap") or sz_why.startswith("size-onlypdf"):
+            last_why = sz_why
+            if best_any is None or len(pdf) < len(best_any):
+                best_any = pdf
             logger.info(
-                "Alfa SBP rebuild %s trial=%d shell=%s",
-                last_why, trial, os.path.basename(path),
+                "Alfa SBP rebuild %s:%d trial=%d shell=%s",
+                sz_why, len(pdf), trial, os.path.basename(path),
             )
             continue
+        if sz_why.startswith("size-wb"):
+            last_why = sz_why
+            logger.info(
+                "Alfa SBP rebuild %s trial=%d shell=%s",
+                sz_why, trial, os.path.basename(path),
+            )
+            continue
+
         # Size: never block ship — soft-log only (no HARD weight gate).
         if not (_ALFA_SIZE_MIN <= len(pdf) <= _ALFA_SIZE_MAX):
             logger.warning("Alfa SBP soft-ship size:%d trial=%d", len(pdf), trial)
-        sha = _ff2_sha16(pdf)
-        prefixes = set(re.findall(rb"/([A-Z]{6})\+Tahoma", pdf))
-        if len(prefixes) != 1:
-            last_why = f"glyph mismatch prefix-count:{len(prefixes)}"
+        return _ship_pdf(pdf, prepared, trial=trial)
+
+    # Last resort: exact-flate on lean donor shells first.
+    for path in (shell_cycle[:8] or shells[:8]):
+        pdf = _attempt(path, data, tag="FINAL")
+        if not pdf:
             continue
-        prefix = next(iter(prefixes))
-        prior_prefixes = _sent_prefix_map()
-        if prefix in _corpus_subset_tags() or prefix in prior_prefixes:
-            last_why = f"glyph mismatch prefix-reused:{prefix.decode('ascii')}"
-            continue
-        cid_signature = _cid_map_signature(chk)
-        if cid_signature in _sent_cid_signatures():
-            last_why = f"glyph mismatch cid-map-reused:{cid_signature}"
-            continue
-        pdf_sha = hashlib.sha256(pdf).hexdigest()[:16]
-        if pdf_sha in _BURNED_PDF_SHA16:
-            last_why = f"identity mismatch reused-pdf-sha:{pdf_sha}"
-            logger.info("Alfa SBP rebuild %s trial=%d", last_why, trial)
-            continue
-        if sha in _BANNED_FF2_SHA16 or (
-            not allow_ff2_repeat
-            and (
-                sha in _PASS_FF2_SHA16
-                or (sha in _sent_ff2_shas() and sha not in _corpus_ff2_shas())
+        prep = _prepare_sbp(data)
+        ok_sz, _ = _onlypdf_size_ok(len(pdf), prep.get("recipient_bank") or "")
+        if ok_sz:
+            logger.info(
+                "🔴 ALFA SBP EMIT (FINAL lean): %d bytes shell=%s",
+                len(pdf), os.path.basename(path),
             )
-        ):
-            last_why = f"glyph mismatch ff2-clone:{sha}"
-            logger.info("Alfa SBP rebuild %s trial=%d", last_why, trial)
-            continue
-        if sha not in _corpus_ff2_shas():
-            _remember_ff2_sha(sha)
-        _remember_prefix(prefix, sha, cid_signature)
-        _remember_sent_payload(
-            prepared,
-            pdf,
-            prefix=prefix,
-            ff2_sha=sha,
-            cid_signature=cid_signature,
+            return _ship_pdf(pdf, prep, trial=100)
+        if best_any is None or len(pdf) < len(best_any):
+            best_any = pdf
+
+    if best_any:
+        logger.warning(
+            "Alfa SBP soft-ship mid-gap fallback:%d (%s)",
+            len(best_any), last_why,
         )
-        _remember_prepared_identity(prepared)
-        remember_prepared(prepared, channel="alfa_sbp")
-        logger.info("🔴 ALFA SBP EMIT: %d bytes trial=%d ff2=%s", len(pdf), trial, sha)
-        return pdf
+        return _ship_pdf(best_any, _prepare_sbp(data), trial=101)
 
     logger.error("Alfa SBP: все пути не удались (%s)", last_why)
     return None

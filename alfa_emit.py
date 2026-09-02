@@ -231,12 +231,103 @@ def _inject_subset_payload(
     return _oracle_sfnt_from_tables(tables)
 
 
+# Proton ALFA_ORACLE_SBP_HMTX_UNIQ_ADVANCES: Oracle SBP Tahoma n=14 is 42–45
+# unique positive hmtx advances when FontFile2 ≥ 20570. Card stays 30–32.
+_ORACLE_SBP_HMTX_UNIQ_FLOOR = 42
+_ORACLE_SBP_HMTX_UNIQ_MIN_FF2 = 20570
+
+
+def _hmtx_uniq_positive(metrics: Iterable[Tuple[int, int]]) -> int:
+    return len({int(aw) for aw, _lsb in metrics if int(aw) > 0})
+
+
+def _ensure_hmtx_uniq_floor(
+    metrics: List[Tuple[int, int]],
+    painted: Set[int],
+    floor: int,
+    parent_vocab: Optional[Iterable[int]] = None,
+    upem: int = 2048,
+) -> List[Tuple[int, int]]:
+    """Split duplicate unused advances until unique positive AWs ≥ floor.
+
+    Painted CIDs keep their source Tahoma advance (layout). New AWs prefer
+    widths already present on parent Tahoma so the vocabulary is restored,
+    not invented. Same `_pdf_w` first so /W tokens stay stable.
+    """
+    if floor <= 0:
+        return metrics
+    pos = {int(aw) for aw, _lsb in metrics if int(aw) > 0}
+    if len(pos) >= floor:
+        return metrics
+    from collections import Counter
+
+    counts = Counter(int(aw) for aw, _lsb in metrics if int(aw) > 0)
+    out = [(int(aw), int(lsb)) for aw, lsb in metrics]
+    unused = [
+        i
+        for i in range(len(out))
+        if i not in painted and int(out[i][0]) > 0 and counts[int(out[i][0])] > 1
+    ]
+    taken = set(pos)
+    parent_pool: List[int] = []
+    seen_parent: Set[int] = set()
+    for aw in parent_vocab or ():
+        v = int(aw)
+        if v <= 0 or v in taken or v in seen_parent:
+            continue
+        seen_parent.add(v)
+        parent_pool.append(v)
+
+    def _pick(aw: int) -> Optional[int]:
+        want_w = _pdf_w(aw, upem)
+        for v in parent_pool:
+            if v not in taken and _pdf_w(v, upem) == want_w:
+                return v
+        for delta in range(1, 80):
+            for v in (aw + delta, aw - delta):
+                if v > 0 and v not in taken and _pdf_w(v, upem) == want_w:
+                    return v
+        for v in parent_pool:
+            if v not in taken:
+                return v
+        for delta in range(1, 500):
+            for v in (aw + delta, max(1, aw - delta)):
+                if v not in taken:
+                    return v
+        return None
+
+    for i in unused:
+        if len(taken) >= floor:
+            break
+        aw, lsb = out[i]
+        cand = _pick(aw)
+        if cand is None:
+            continue
+        counts[aw] -= 1
+        counts[cand] += 1
+        taken.add(cand)
+        out[i] = (cand, lsb)
+        parent_pool = [v for v in parent_pool if v != cand]
+    if len(taken) < floor:
+        logger.warning(
+            "Alfa SBP hmtx uniq still %d < %d (unused-dup=%d)",
+            len(taken), floor, len(unused),
+        )
+    else:
+        logger.info("Alfa SBP hmtx uniq → %d (floor %d)", len(taken), floor)
+    return out
+
+
 def _pack_oracle_raw(
     rec_of_gid: Dict[int, dict],
     occ_of: Dict[int, List[int]],
     uni_to_cid: Dict[int, int],
     cid_to_uni: Dict[int, int],
     template_ff2: bytes,
+    *,
+    hmtx_uniq_floor: int = 0,
+    painted_gids: Optional[Set[int]] = None,
+    parent_vocab: Optional[Iterable[int]] = None,
 ) -> Tuple[bytes, Dict[int, int], Dict[int, int], Dict[int, int]]:
     n_total = max(rec_of_gid) + 1
     records: List[bytes] = []
@@ -246,6 +337,14 @@ def _pack_oracle_raw(
         raw = rec.get("glyf_raw") or b""
         records.append(raw)
         metrics.append((int(rec["aw"]), int(rec["lsb"])))
+    if hmtx_uniq_floor > 0:
+        painted = set(painted_gids or ())
+        metrics = _ensure_hmtx_uniq_floor(
+            metrics, painted, hmtx_uniq_floor, parent_vocab=parent_vocab,
+        )
+        for gid, (aw, lsb) in enumerate(metrics):
+            rec_of_gid[gid]["aw"] = aw
+            rec_of_gid[gid]["lsb"] = lsb
     glyf, loca = _assemble_glyf_loca(records, occ_of)
     ttf = _inject_subset_payload(
         template_ff2, glyf, loca, _hmtx_payload(metrics), n_total,
@@ -770,6 +869,7 @@ def build_tight_from_raw(
     ordered_cps: Iterable[int],
     *,
     uni_to_gid: Optional[Dict[int, int]] = None,
+    hmtx_uniq_floor: int = 0,
 ) -> Tuple[bytes, Dict[int, int], Dict[int, int], Dict[int, int]]:
     """Subset source Tahoma (or a genuine orig) by copying loca slices.
 
@@ -818,7 +918,6 @@ def build_tight_from_raw(
 
     painted_old: List[int] = []
     painted_uni: List[int] = []
-    seen: Set[int] = set()
     for cp in ordered_cps:
         if cp == 0x20:
             cp = 0x00A0
@@ -827,9 +926,10 @@ def build_tight_from_raw(
         old_cid = old_u2c.get(cp)
         if old_cid is None:
             raise RuntimeError(f"glyph mismatch missing-U+{cp:04X}")
-        if old_cid in seen or old_cid >= n_avail:
+        if old_cid >= n_avail:
             continue
-        seen.add(old_cid)
+        # Same outline GID may back multiple Unicodes (uppercase aliased to
+        # lowercase in PARENT_CMAP). Emit a painted CID per CP — never skip.
         painted_old.append(old_cid)
         painted_uni.append(cp)
     if not painted_old:
@@ -870,11 +970,20 @@ def build_tight_from_raw(
             "aw": int(aw),
             "lsb": int(lsb),
         }
-    return _pack_oracle_raw(rec_of_gid, occ_of, new_u2c, new_c2u, ttf)
+    parent_vocab = [int(hmtx_of(gid)[0]) for gid in range(n_avail)]
+    painted = set(range(1, n_mapped + 1))
+    return _pack_oracle_raw(
+        rec_of_gid, occ_of, new_u2c, new_c2u, ttf,
+        hmtx_uniq_floor=hmtx_uniq_floor,
+        painted_gids=painted,
+        parent_vocab=parent_vocab,
+    )
 
 
 def subset_from_parent(
     ordered_cps: Iterable[int],
+    *,
+    hmtx_uniq_floor: int = 0,
 ) -> Tuple[bytes, Dict[int, int], Dict[int, int], Dict[int, int]]:
     """Subset(source Oracle Tahoma, first-paint) — same function as the bank."""
     import json
@@ -903,14 +1012,19 @@ def subset_from_parent(
     }
     if not uni_to_gid:
         raise RuntimeError("Oracle source Tahoma cmap empty")
-    return build_tight_from_raw(parent, {}, ordered_cps, uni_to_gid=uni_to_gid)
+    return build_tight_from_raw(
+        parent, {}, ordered_cps, uni_to_gid=uni_to_gid,
+        hmtx_uniq_floor=hmtx_uniq_floor,
+    )
 
 
 def subset_from_origs(
     ordered_cps: Iterable[int],
+    *,
+    hmtx_uniq_floor: int = 0,
 ) -> Tuple[bytes, Dict[int, int], Dict[int, int], Dict[int, int]]:
     """Alfa emit = Subset(source Tahoma, first-paint). Not a covering-orig copy."""
-    return subset_from_parent(ordered_cps)
+    return subset_from_parent(ordered_cps, hmtx_uniq_floor=hmtx_uniq_floor)
 
 
 def enc_text(text: str, uni_to_cid: Dict[int, int]) -> bytes:
@@ -1182,42 +1296,90 @@ def subset_cps_pinned(keyed: List[Tuple[Optional[str], str]]) -> List[int]:
 
 
 _CS_PAD_KEYS = frozenset({
-    "amount", "commission", "receiver", "operation_num",
+    "amount", "commission", "operation_num",
     "date_time", "date_formed",
+    # Card orig sender has a spare trailing NBSP vs a 16-char MIR mask.
+    # Steal it so 5-digit amounts («87 900 RUR ») keep match_cs.
+    "sender_card",
 })
 # Trailing NBSP here is a visual tell (origs do not pad these).
+# receiver: genuine Oracle FIO ends with exactly one NBSP. Extra FIO NBSP
+# (match_cs / CS-bump) is a Deacon Detect FAKE tell even when Proton is ЧИСТО.
 _CS_NO_PAD_KEYS = frozenset({
     "sbp_id", "phone", "account", "recipient_bank", "message",
-    "sender_card", "receiver_card",
+    "receiver_card", "receiver",
 })
+# FIO / message / date_formed extras are Deacon FAKE tells.
+# operation_num already has the orig trailing NBSP; extra CIDs here walk
+# clone CS (5111) without touching FIO. Empty bump → GEN_NONE on 5111.
+_CS_BUMP_KEYS = ("operation_num",)
 # Live OnlyPDF: rewritten CS of exactly 5111 (10.08 donor length) → FAKE.
-# 5115 = 5111 + one receiver NBSP; same T-Bank face still ❌ (220105/220229).
-# Natural PASS band starts at 5091 (5087 = ALFA_ORACLE_CONTENT_MIDGAP).
-# Clone tells: 5111 (10.08 donor) and 5115 (5111+1 NBSP).
+# Natural PASS lengths include 5087 (PSB OnlyPDF `alfa_sbp_215038.pdf`) and
+# 5091 / 5107 / 5123. Extra operation_num NBSP to walk 5087→5091 is a
+# Deacon tell (Платон / 990, 02.09.2026 live ❌).
+# Clone tells: 5111 (10.08 donor). 5115 is natural Ак Барс + orig phone — ship it.
 # 5151: June Ozon orig CS (`pdf.pdf` / `pdf (1).pdf`); РСХБ rewrite landed here.
 # 5135: Сбербанк rewrite (June Sber orig 5115 + long FIO) — OnlyPDF FAKE,
 # Proton ЧИСТО (Борислав / 6897).
 # 5183: first slot after the old 5155..5182 walk; every Ozon gen landed here,
 # then FAKE (Велимира / Иннокентий, Proton ЧИСТО).
 _SBP_CS_CLONE_LEN = frozenset({
-    5111, 5115, 5119, 5135, 5151,
+    5111, 5119, 5135, 5151,
     5155, 5159, 5163, 5167, 5171, 5175, 5179, 5183,
+    # 5187: bump used to stop at <5187; Raiffeisen 16.08 landed here → Deacon FAKE.
+    5187, 5191, 5203,
 })
-_SBP_CS_MIN = 5091
+# 5115 used to be treated as 5111+1 FIO NBSP. Natural 5115 (Ак Барс + orig
+# phone, FIO pad=1) must ship with orig «+7 (XXX) XXX-XX-XX»; compacting
+# the phone to dodge 5115 is itself a Deacon tell.
+_SBP_CS_MIN = 5087
+# Donor CS lengths that Deacon PASS gens actually used (not Ozon-late 5155 ridge).
+_SAFE_DONOR_CS = frozenset({5087, 5091, 5095, 5099, 5103, 5107, 5115, 5123, 5127, 5131})
+# Proton HARD ALFA_ORACLE_CONTENT_MIDGAP: card decoded /Contents
+# must be an Oracle card body, not the 4140/4212 gap before SBP 5091.
+_CARD_CS_HARD = frozenset({3413, 4152})
 
 
 def _sbp_cs_need_bump(n: int) -> bool:
     if n < _SBP_CS_MIN or n in _SBP_CS_CLONE_LEN:
         return True
-    # 15.08 Ozon-late orig is 5155; walk off that ridge, stop before WB orig 5203.
-    return 5155 <= n < 5187
+    # 15.08 Ozon-late orig is 5155; walk that ridge through 5187 (Deacon FAKE
+    # landing). 5195 is a live WB PASS; WB orig CS 5203 is a clone tell.
+    return 5155 <= n <= 5191
+
+
+def _sync_rur_trailing_nbsp(
+    faces: List[str],
+    keys: List[Optional[str]],
+    donor_faces: List[str],
+) -> List[str]:
+    """Donor Oracle amount/commission ends with RUR + NBSP in the same CID width.
+
+    Formatter faces may land ``867 546 RUR`` (11) while the shell paints
+    ``14 000 RUR\\xa0`` (11) — equal length, missing typography NBSP →
+    rur-nbsp-asymmetry vs commission and Proton HARD.
+    """
+    out = list(faces)
+    for i, key in enumerate(keys):
+        if key not in ("amount", "commission"):
+            continue
+        donor = (donor_faces[i] if i < len(donor_faces) else "") or ""
+        if not donor.endswith(_NBSP):
+            continue
+        if not donor.rstrip(_NBSP).endswith("RUR"):
+            continue
+        face = out[i] or ""
+        core = face.rstrip(_NBSP)
+        if core.endswith("RUR") and not face.endswith(_NBSP):
+            out[i] = core + _NBSP
+    return out
 
 
 def _trim_face_to_orig_cids(face: str, key: Optional[str], orig_n: int) -> str:
     """Drop formatter-only trailing NBSP so the slot can stay donor-sized.
 
-    Never eat the required RUR/FIO trailing NBSP when the donor itself
-    painted it (orig_n already includes it).
+    Never eat the required RUR trailing NBSP. FIO keeps exactly one trailing
+    NBSP — extras are a live FAKE tell, not a CS-matching tool.
     """
     t = face or ""
     while len(t) > orig_n and t.endswith(_NBSP):
@@ -1225,9 +1387,23 @@ def _trim_face_to_orig_cids(face: str, key: Optional[str], orig_n: int) -> str:
         if key in ("amount", "commission") and core.endswith("RUR"):
             break
         if key == "receiver":
-            break
+            # Keep the semantic trailing NBSP; drop match_cs extras.
+            if not core.endswith(_NBSP):
+                break
         t = core
     return t
+
+
+def _cap_receiver_one_nbsp(faces: List[str], keys: List[Optional[str]]) -> List[str]:
+    """Oracle FIO: exactly one trailing NBSP (origs / Deacon PASS gens)."""
+    out = list(faces)
+    for i, key in enumerate(keys):
+        if key != "receiver" or i >= len(out):
+            continue
+        core = (out[i] or "").rstrip(_NBSP)
+        if core:
+            out[i] = core + _NBSP
+    return out
 
 
 def _pad_faces_to_donor_cids(
@@ -1316,6 +1492,8 @@ def rewrite_stream(
     if rows and all(row[3] == "tj" for row in rows):
         orig_cids = [len(row[2]) // 4 for row in rows]
         keys = [row[4] for row in rows]
+        donor_faces = [dec_hex(row[2], old_cid_to_uni) for row in rows]
+        faces = _sync_rur_trailing_nbsp(faces, keys, donor_faces)
         if match_cs:
             padded = _pad_faces_to_donor_cids(faces, orig_cids, keys)
             if padded is None:
@@ -1326,6 +1504,7 @@ def rewrite_stream(
                 _trim_face_to_orig_cids(face, key, orig_n)
                 for face, key, orig_n in zip(faces, keys, orig_cids)
             ]
+        faces = _cap_receiver_one_nbsp(faces, keys)
     def _apply(face_list: List[str]) -> Optional[str]:
         edits: List[Tuple[int, int, bytes]] = []
         for (start, end, _old_hx, kind, _key, _face), face in zip(rows, face_list):
@@ -1355,23 +1534,48 @@ def rewrite_stream(
         and _sbp_cs_need_bump(len(stream))
     ):
         bump_at = None
-        for i, (_s, _e, _hx, kind, key, _face) in enumerate(rows):
-            if key == "receiver" and kind == "tj":
-                bump_at = i
+        for bump_key in _CS_BUMP_KEYS:
+            bump_at = next(
+                (
+                    i
+                    for i, (_s, _e, _hx, kind, key, _face) in enumerate(rows)
+                    if key == bump_key and kind == "tj"
+                ),
+                None,
+            )
+            if bump_at is not None:
                 break
-        if bump_at is None:
-            for i, (_s, _e, _hx, kind, key, _face) in enumerate(rows):
-                if key in _CS_PAD_KEYS and kind == "tj":
-                    bump_at = i
-                    break
+        keys = [row[4] for row in rows]
         extra = 0
-        while bump_at is not None and _sbp_cs_need_bump(len(stream)) and extra < 16:
+        while bump_at is not None and _sbp_cs_need_bump(len(stream)) and extra < 2:
             extra += 1
-            bumped = list(faces)
+            bumped = _cap_receiver_one_nbsp(list(faces), keys)
             bumped[bump_at] = bumped[bump_at] + (_NBSP * extra)
             why = _apply(bumped)
             if why:
                 return why
+        if _sbp_cs_need_bump(len(stream)):
+            for alt_key in _CS_BUMP_KEYS:
+                alt_at = next(
+                    (
+                        i
+                        for i, (_s, _e, _hx, kind, key, _face) in enumerate(rows)
+                        if key == alt_key and kind == "tj"
+                    ),
+                    None,
+                )
+                if alt_at is None:
+                    continue
+                for extra2 in range(1, 3):
+                    bumped = _cap_receiver_one_nbsp(list(faces), keys)
+                    bumped[alt_at] = bumped[alt_at] + (_NBSP * extra2)
+                    why = _apply(bumped)
+                    if why:
+                        break
+                    if not _sbp_cs_need_bump(len(stream)):
+                        break
+                if not _sbp_cs_need_bump(len(stream)):
+                    break
     return None
 
 
@@ -1807,6 +2011,7 @@ def emit_onto_shell(
     *,
     profile: str = "oracle",
     match_cs: bool = True,
+    hmtx_uniq_floor: int = 0,
 ) -> Tuple[Optional[bytes], str]:
     """Full font subset + semantic text rewrite on an Oracle page shell.
 
@@ -1830,6 +2035,16 @@ def emit_onto_shell(
             continue
         need.append(0x00A0 if ch in (" ", _NBSP) else ord(ch))
     miss = missing_chars("".join(chr(cp) if cp != 0x00A0 else _NBSP for cp in need))
+    if miss:
+        try:
+            from alfa_oracle_master import ensure_parent_covers
+
+            ensure_parent_covers("".join(miss))
+            miss = missing_chars(
+                "".join(chr(cp) if cp != 0x00A0 else _NBSP for cp in need)
+            )
+        except Exception as exc:
+            logger.warning("Alfa emit parent-cover failed: %s", exc)
     if miss:
         return None, f"glyph mismatch {''.join(dict.fromkeys(miss))}"
 
@@ -1855,7 +2070,9 @@ def emit_onto_shell(
                     cps, seed + bytes([pass_i]), profile=subset_profile,
                 )
             else:
-                ttf, u2c, c2u, widths = subset_from_origs(cps)
+                ttf, u2c, c2u, widths = subset_from_origs(
+                    cps, hmtx_uniq_floor=hmtx_uniq_floor,
+                )
         except Exception as exc:
             return None, f"glyph mismatch {exc}"
         stream = bytearray(orig_stream)
@@ -1973,7 +2190,9 @@ def _face_spec_invariants(pdf: bytes, ctx: AlfaOrigContext, chan: str) -> str:
     if chan == "card":
         compact = re.sub(r"[\s\u00a0]", "", raw)
         for bin6, last4 in re.findall(r"(?<!\d)(\d{6})\*{4,8}(\d{4})(?!\d)", compact):
-            if not (220_000 <= int(bin6) <= 220_499):
+            # V1 MIR shells stay 220xxx; V2 «карта в другой банк» (Документ 6)
+            # uses foreign BINs (e.g. T-Bank 437772). Accept any 6-digit BIN.
+            if not bin6.isdigit():
                 return f"card bin:{bin6}"
             if (
                 last4[0] == last4[2]
@@ -2063,19 +2282,24 @@ def emit_invariants(pdf: bytes, *, channel: str = "sbp") -> str:
     if not ctx.load_bytes(pdf):
         return "xref/Length mismatch invariants"
     chan = (channel or "sbp").strip().lower()
+    if chan == "card":
+        n = len(bytes(ctx.stream))
+        if n not in _CARD_CS_HARD:
+            return f"glyph mismatch card-cs-midgap:{n}"
     # Quartz phone shells keep donor image Flate (7 streams); Oracle SBP/card = 6.
     if chan != "phone":
         why_java = java6_streams_invariant(pdf)
         if why_java:
             return why_java
     why_fo = fo_cid_1_to_n(bytes(ctx.stream), ctx.cid_to_uni)
-    if why_fo:
+    if why_fo and chan != "phone":
         return why_fo
     cmap_cids = sorted(ctx.cid_to_uni)
-    if not cmap_cids or cmap_cids[0] != 0 or cmap_cids != list(range(cmap_cids[-1] + 1)):
-        return f"glyph mismatch sparse-cid:{cmap_cids[:16]}"
-    if ctx.cid_to_uni.get(0) != 0x003F:
-        return f"glyph mismatch cid0:{ctx.cid_to_uni.get(0)!r}"
+    if chan != "phone":
+        if not cmap_cids or cmap_cids[0] != 0 or cmap_cids != list(range(cmap_cids[-1] + 1)):
+            return f"glyph mismatch sparse-cid:{cmap_cids[:16]}"
+        if ctx.cid_to_uni.get(0) != 0x003F:
+            return f"glyph mismatch cid0:{ctx.cid_to_uni.get(0)!r}"
     formed_bad = False
     title_nbsp = False
     title_seen = False
@@ -2146,7 +2370,12 @@ def emit_invariants(pdf: bytes, *, channel: str = "sbp") -> str:
     if chan != "phone":
         fo_cps = first_appearance_cps(bytes(ctx.stream), ctx.cid_to_uni)
         try:
-            rebuilt, _, _, _ = subset_from_origs(fo_cps)
+            rebuilt, _, _, _ = subset_from_origs(
+                fo_cps,
+                hmtx_uniq_floor=(
+                    _ORACLE_SBP_HMTX_UNIQ_FLOOR if chan == "sbp" else 0
+                ),
+            )
         except Exception as exc:
             return f"glyph mismatch rebuild:{type(exc).__name__}"
         if rebuilt != ff2:
@@ -2227,6 +2456,12 @@ def emit_invariants(pdf: bytes, *, channel: str = "sbp") -> str:
             got = int(ctx.widths[cid])
             if got != want:
                 return f"width mismatch trunc:{cid}:{got}!={want}"
+        if chan == "sbp" and len(ff2) >= _ORACLE_SBP_HMTX_UNIQ_MIN_FF2:
+            uniq = _hmtx_uniq_positive(tt["hmtx"].metrics.values())
+            if uniq < _ORACLE_SBP_HMTX_UNIQ_FLOOR:
+                return (
+                    f"glyph mismatch hmtx-uniq:{uniq}<{_ORACLE_SBP_HMTX_UNIQ_FLOOR}"
+                )
     finally:
         tt.close()
     if _ORACLE_FONTBBOX_PDF.encode("ascii") not in pdf:
