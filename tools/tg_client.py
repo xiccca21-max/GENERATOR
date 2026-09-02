@@ -217,7 +217,11 @@ async def ensure_login(client, cfg: Optional[Dict[str, str]] = None) -> None:
     for attempt in range(8):
         try:
             me = await client.get_me()
-            print(f"OK: {me.first_name} (@{me.username or '-'})\n")
+            un = me.username or "-"
+            try:
+                print(f"OK: {me.first_name} (@{un})\n")
+            except UnicodeEncodeError:
+                print(f"OK: @{un}\n")
             return
         except sqlite3.OperationalError:
             await asyncio.sleep(1.0 + attempt * 0.5)

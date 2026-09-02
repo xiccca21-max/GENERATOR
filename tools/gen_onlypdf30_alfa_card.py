@@ -22,6 +22,7 @@ sys.path.insert(0, str(_DIR))
 logging.basicConfig(level=logging.ERROR)
 
 from onlypdf_gate import generate_onlypdf_batch  # noqa: E402
+from orig_match_gate import wrap_validate  # noqa: E402
 from onlypdf_safe_names import CYR_NO_YO_TVERD, coverage_report  # noqa: E402
 from alfa_card_stealth import create_alfa_card_stealth  # noqa: E402
 import fitz  # noqa: E402
@@ -51,14 +52,14 @@ def _load_bad_face_once() -> set[tuple[str, str, str]]:
 
 
 def _extract_alfa_card_fields(path: str) -> dict | None:
-    from alfa_card_stealth import CARD_COORDS
+    from alfa_card_stealth import _coords_for
     from alfa_orig_mode import AlfaOrigContext
 
     ctx = AlfaOrigContext()
     if not ctx.load(path):
         return None
     out: dict[str, str] = {}
-    for k, (y, x) in CARD_COORDS.items():
+    for k, (y, x) in _coords_for(ctx).items():
         v = ctx.extract_at(y, x).replace("\xa0", " ").strip()
         if v:
             out[k] = ctx.extract_at(y, x)
@@ -188,9 +189,9 @@ def _local_ok(pdf: bytes) -> tuple[bool, str]:
     from alfa_emit import emit_invariants
     from alfa_orig_mode import AlfaOrigContext
     from alfa_card_stealth import (
-        CARD_COORDS,
         _ALFA_SENDER_BIN,
-        _MIR_RECV_BINS,
+        _RECV_BINS,
+        _coords_for,
         _last4_ok,
     )
 
@@ -208,7 +209,8 @@ def _local_ok(pdf: bytes) -> tuple[bool, str]:
     ctx = AlfaOrigContext()
     if not ctx.load_bytes(pdf):
         return False, "load"
-    face_dt = (ctx.extract_at(*CARD_COORDS["date_time"]) or "").replace("\xa0", " ")
+    coords = _coords_for(ctx)
+    face_dt = (ctx.extract_at(*coords["date_time"]) or "").replace("\xa0", " ")
     mday = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", face_dt)
     if mday:
         face = datetime(int(mday.group(3)), int(mday.group(2)), int(mday.group(1)))
@@ -222,17 +224,17 @@ def _local_ok(pdf: bytes) -> tuple[bool, str]:
     m = re.search(r"[A-Z]\d{14,}", text.replace("\xa0", ""))
     if m and m.group(0) in _USED_OPS:
         return False, f"op-used:{m.group(0)}"
-    sender = (ctx.extract_at(*CARD_COORDS["sender_card"]) or "").replace("\xa0", "")
-    recv = (ctx.extract_at(*CARD_COORDS["receiver_card"]) or "").replace("\xa0", "")
+    sender = (ctx.extract_at(*coords["sender_card"]) or "").replace("\xa0", "")
+    recv = (ctx.extract_at(*coords["receiver_card"]) or "").replace("\xa0", "")
     sm = re.fullmatch(r"(\d{6})\*{4,8}(\d{4})", sender)
     rm = re.fullmatch(r"(\d{6})\*{4,8}(\d{4})", recv)
     if not sm or sm.group(1) != _ALFA_SENDER_BIN:
         return False, f"sender-bin:{sender}"
-    if not rm or rm.group(1) not in _MIR_RECV_BINS:
+    if not rm or not rm.group(1).isdigit() or len(rm.group(1)) != 6:
         return False, f"recv-bin:{recv}"
     if not _last4_ok(sm.group(2)) or not _last4_ok(rm.group(2)):
         return False, f"last4:{sm.group(2)}/{rm.group(2)}"
-    formed = (ctx.extract_at(*CARD_COORDS["date_formed"]) or "").replace("\xa0", " ")
+    formed = (ctx.extract_at(*coords["date_formed"]) or "").replace("\xa0", " ")
 
     def _hm(s: str):
         mm = re.search(r"(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})", s)
@@ -249,9 +251,16 @@ def _local_ok(pdf: bytes) -> tuple[bool, str]:
             return False, f"formed-same-day:{formed}/{face_dt}"
         if ft <= ot:
             return False, f"formed-not-after:{formed}/{face_dt}"
-    digs = "".join(c for c in (ctx.extract_at(*CARD_COORDS["amount"]) or "") if c.isdigit())
+    digs = "".join(c for c in (ctx.extract_at(*coords["amount"]) or "") if c.isdigit())
     if digs.isdigit() and (int(digs) % 100 == 0 or int(digs) % 1000 >= 990):
         return False, f"amt-round:{digs}"
+    if "auth_code" in coords:
+        auth = re.sub(r"[\s\u00a0]", "", ctx.extract_at(*coords["auth_code"]) or "")
+        if not re.fullmatch(r"[A-Za-z0-9]{4,8}", auth):
+            return False, f"auth:{auth!r}"
+        term = re.sub(r"[\s\u00a0]", "", ctx.extract_at(*coords["terminal_code"]) or "")
+        if not re.fullmatch(r"\d{5,8}", term):
+            return False, f"terminal:{term!r}"
     return True, "ok"
 
 
@@ -297,7 +306,7 @@ async def main() -> int:
         n=n,
         payload_fn=_payload,
         gen_fn=_gen,
-        validate_fn=_local_ok,
+        validate_fn=wrap_validate("alfa_card", _local_ok),
         prefix="alfa_card",
         max_attempts=28,
         fresh=not args.keep,

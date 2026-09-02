@@ -355,8 +355,14 @@ def _local_ok(pdf: bytes) -> tuple[bool, str]:
     why = emit_invariants(pdf)
     if why:
         return False, why
-    if len(pdf) > 59_087:
-        return False, f"size-onlypdf:{len(pdf)}"
+    ctx = AlfaOrigContext()
+    if not ctx.load_bytes(pdf):
+        return False, "load"
+    bank = (ctx.extract_at(*SBP_COORDS["recipient_bank"]) or "").replace("\xa0", " ")
+    from alfa_sbp_stealth import _onlypdf_size_ok
+    ok_sz, sz_why = _onlypdf_size_ok(len(pdf), bank)
+    if not ok_sz:
+        return False, sz_why
     try:
         doc = fitz.open(stream=pdf, filetype="pdf")
         text = doc[0].get_text()
@@ -367,9 +373,6 @@ def _local_ok(pdf: bytes) -> tuple[bool, str]:
     if "сбп" not in low and "sbp" not in low and "альфа" not in low:
         if "RUR" not in text and "rur" not in low:
             return False, "no-alfa-markers"
-    ctx = AlfaOrigContext()
-    if not ctx.load_bytes(pdf):
-        return False, "load"
     recv = (ctx.extract_at(*SBP_COORDS["receiver"]) or "").replace("\xa0", " ").strip()
     if len(recv.split()) < 3:
         return False, f"fio-short:{recv}"

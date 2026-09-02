@@ -18,8 +18,8 @@ tail: G10170011770101
 - `_BANK_ROUTES` ПСБ = `("B", "G10170011770101")`. **Never** lead `G`.
 - Prefer that orig via `_shells_for_face` (3-CID `ПСБ` already on the shell).
 - Do **not** paint ПСБ onto the 10.08 `Т-Банк` shell as the first choice — CID math lands decoded `/Contents` on **5111**.
-- After rewrite, decoded CS must **not** be **5111** or **5115** (10.08 donor clone tell; 5115 is 5111+1 NBSP). Natural PASS lengths were 5087 / 5091 / 5107 / 5123. Bump trailing NBSP on receiver until off those lengths.
-- Card emit stays `match_cs=True`. SBP stays `match_cs=False`.
+- After rewrite, decoded CS must **not** be **5111** or **5115** (10.08 donor clone tell; 5115 is 5111+1 NBSP). Natural PASS lengths were 5087 / 5091 / 5107 / 5123. Walk off those lengths by bumping **message** (or date_formed), **never** extra FIO NBSP — Deacon treats `receiver` pad ≥ 2 as FAKE.
+- Card emit stays `match_cs=True`. SBP stays `match_cs=False`. FIO keeps **exactly one** trailing NBSP.
 
 Live `@onlypdf_robot` ✅ 18.08.2026, **direct**:
 `output/alfa_sbp_215038.pdf` (58134, CS **5087**, SHA `9837d697…`).

@@ -9,6 +9,7 @@ Usage:
 """
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
@@ -78,12 +79,14 @@ def _log(msg: str) -> None:
         fp.write(line + "\n")
 
 
-def _run_one(label: str, script: str, out_name: str, attempt: int) -> int:
+def _run_one(label: str, script: str, out_name: str, attempt: int, *, n: int, strict: bool) -> int:
     script_path = _DIR / script
     out = _ROOT / out_name
     log_path = _LOG_DIR / f"{label}_a{attempt}.log"
-    _log(f"START {label} attempt={attempt} → {out} (log {log_path.name})")
-    cmd = [_PY, "-u", str(script_path), "-n", "30", "--out", str(out)]
+    _log(f"START {label} attempt={attempt} n={n} strict={strict} → {out} (log {log_path.name})")
+    cmd = [_PY, "-u", str(script_path), "-n", str(n), "--out", str(out)]
+    if strict:
+        cmd.append("--strict")
     t0 = time.time()
     with log_path.open("w", encoding="utf-8", errors="replace") as logf:
         proc = subprocess.Popen(
@@ -111,9 +114,15 @@ def _run_one(label: str, script: str, out_name: str, attempt: int) -> int:
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser(description="Run all live channels through OnlyPDF")
+    ap.add_argument("-n", type=int, default=10, help="PASS PDFs per channel (default 10)")
+    ap.add_argument("--strict", action="store_true", default=True, help="strict streak (default on)")
+    ap.add_argument("--no-strict", action="store_false", dest="strict")
+    args = ap.parse_args()
+
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
     _log("=" * 60)
-    _log(f"FULL Dual OnlyPDF+Proton 30/30 — {len(CHANNELS)} channels")
+    _log(f"FULL OnlyPDF n={args.n} strict={args.strict} — {len(CHANNELS)} channels")
     _log("Skip: sber_card (blocked)")
     _log("=" * 60)
 
@@ -146,7 +155,7 @@ def main() -> int:
         ok = False
         last_rc = 1
         for attempt in range(1, max_retries + 1):
-            last_rc = _run_one(label, script, out_name, attempt)
+            last_rc = _run_one(label, script, out_name, attempt, n=args.n, strict=args.strict)
             if last_rc == 0:
                 ok = True
                 break

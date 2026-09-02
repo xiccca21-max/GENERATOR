@@ -310,7 +310,10 @@ class OrigContext:
         table = self.uni_to_cid_med if medium else self.uni_to_cid_reg
         out = bytearray()
         for ch in text:
-            cid = table.get(ord(ch))
+            if ch in (" ", "\u00a0"):
+                cid = 3
+            else:
+                cid = table.get(ord(ch))
             if cid is None:
                 return b""  # caller must check can_render first
             for byte in ((cid >> 8) & 0xFF, cid & 0xFF):
@@ -324,7 +327,10 @@ class OrigContext:
         dw = self.dw_med if medium else self.dw_reg
         total = 0
         for ch in text:
-            cid = table_c.get(ord(ch))
+            if ch in (" ", "\u00a0"):
+                cid = 3
+            else:
+                cid = table_c.get(ord(ch))
             if cid is None:
                 return 0.0
             total += table_w.get(cid, dw)

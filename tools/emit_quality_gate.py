@@ -85,7 +85,7 @@ def count_odd_tj(pdf: bytes) -> Tuple[int, int]:
                 if unesc == b"i":
                     pre = s[max(0, m.start() - 120) : m.start()]
                     if b"/F3" in pre:
-                    continue
+                        continue
                 total += 1
                 if len(unesc) % 2:
                     odd += 1

@@ -1,0 +1,33 @@
+---
+description: LAW #1 — receipt always ships with the exact letters the user typed
+alwaysApply: true
+---
+
+# LAW #1 — always ship, always exact face (K-ALWAYS-SHIP-EXACT-001)
+
+This is the first law of the live bot. It outranks size bands, twin SHA, cmap cards, and Proton soft flags.
+
+## Must
+
+1. A filled payload **always** produces a PDF the bot sends. Never «не собралось» as the intended UX.
+2. Every letter/digit the user typed is on the face **exactly**. `Андреев` stays `Андреев`.
+3. Missing glyphs are **hydrated** from the multi-PDF glyph library. Do not swap unique FIO letters onto another CID.
+
+## Forbidden
+
+- Shipping `Ендреев` / `Зладислав` / `Анастасия ,.` when the user typed `Андреев` / `Владислав` / `Анастасия Д.`
+- `create_*_stealth` → `None` for a valid payload (bot GEN_NONE)
+- Soft-remap FIO (`А→Е`, `В→З`, `Д→,`, lookalikes) as the primary fix
+- Empty-unpaint / freq-grow / orphan-swap that steals a unique user letter
+- Saving `last_pdf` before the face matches `_user_sender` / `_user_receiver` / `_user_bank`
+
+## When they conflict
+
+Wrong FIO must not ship. GEN_NONE must not be the answer either. Hydrate + rewrite the face TJs until both hold, then ship. Retry the generator. Do not “fix” by cloning a PASS identity or by substituting letters.
+
+## Code
+
+- SBP: `create_tbank_sbp_stealth` + `_sbp_force_correct_face`
+- Structure: `_sbp_enforce_structure_gate` repairs Proton HARD axes; never GEN_NONE
+- Bot: `_generate_gated_pdf` retries; advisory gate never blocks send
+- After generator/bot changes: `python deploy/deploy.py` (always-deploy)

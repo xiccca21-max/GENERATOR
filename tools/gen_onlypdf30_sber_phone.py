@@ -24,9 +24,14 @@ logging.getLogger("sber_stealth_v3").setLevel(logging.CRITICAL)
 logging.getLogger("sber_dynamic").setLevel(logging.CRITICAL)
 
 from onlypdf_gate import generate_onlypdf_batch  # noqa: E402
+from orig_match_gate import wrap_validate  # noqa: E402
 from onlypdf_safe_names import (  # noqa: E402
     CYR_NO_YO_TVERD,
     coverage_report,
+    diverse_amount,
+    diverse_mobile_phone,
+    pick_diverse_sber_face,
+    strip_yo,
 )
 from sber_phone_stealth import create_sber_phone_stealth  # noqa: E402
 import fitz  # noqa: E402
@@ -155,21 +160,22 @@ def _load_banned_faces() -> None:
 
 
 def _payload(i: int, attempt: int = 0) -> dict:
-    """Unique face/amount/date — not a donor clone, not a prior PASS identity."""
+    """Unique face/amount/date — short, long, mash; без ё."""
     rng = random.Random(23082026 + i * 409 + attempt * 1103)
     _load_banned_faces()
-    sender = _PHONE_SENDERS[(i - 1 + attempt) % len(_PHONE_SENDERS)]
-    receiver = _PHONE_RECV[(i - 1 + attempt * 3) % len(_PHONE_RECV)]
+    sender = strip_yo(pick_diverse_sber_face(i, attempt, role="sender"))
+    receiver = strip_yo(pick_diverse_sber_face(i, attempt, role="recv"))
     for _ in range(40):
         if (
             _norm_face(sender) not in _USED_FACES
             and _norm_face(receiver) not in _USED_FACES
             and _norm_face(sender) != _norm_face(receiver)
-            and not (set(sender + receiver) & _EXCL)
+            and "ё" not in sender.lower()
+            and "ё" not in receiver.lower()
         ):
             break
-        sender = _PHONE_SENDERS[rng.randrange(len(_PHONE_SENDERS))]
-        receiver = _PHONE_RECV[rng.randrange(len(_PHONE_RECV))]
+        sender = strip_yo(pick_diverse_sber_face(i + _, attempt + _, role="sender"))
+        receiver = strip_yo(pick_diverse_sber_face(i + _, attempt + _, role="recv"))
     base = datetime(2026, 8, 22, 16, 0, 0) - timedelta(hours=(i * 7 + attempt * 3) % 280)
     if base < datetime(2026, 7, 11, 0, 0, 0):
         base = datetime(2026, 7, 11, 13, 0, 0) + timedelta(minutes=i * 17 + attempt * 5)
@@ -177,11 +183,8 @@ def _payload(i: int, attempt: int = 0) -> dict:
         minute=rng.randint(0, 59),
         second=(rng.randint(0, 59) + attempt + i) % 60,
     )
-    amount = _AMOUNTS[(i - 1 + attempt * 5) % len(_AMOUNTS)]
-    phone = (
-        f"+7 ({rng.randint(900, 999)}) {rng.randint(100, 999)}-"
-        f"{rng.randint(10, 99)}-{rng.randint(10, 99)}"
-    )
+    amount = int(diverse_amount(i, attempt))
+    phone = diverse_mobile_phone(i, attempt)
     return {
         "amount": str(amount),
         "sender_name": sender,
@@ -286,7 +289,7 @@ async def main() -> int:
         n=n,
         payload_fn=_payload,
         gen_fn=_gen,
-        validate_fn=_local_ok,
+        validate_fn=wrap_validate("sber_phone", _local_ok),
         prefix="sber_phone",
         max_attempts=20,
         fresh=not args.keep,

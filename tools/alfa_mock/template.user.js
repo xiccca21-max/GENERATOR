@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Alfa-Bank Mock (local test)
 // @namespace    alfa-mock-local
-// @version      1.3.36
+// @version      1.3.50
 // @description  Подмена ФИО, баланса, операций и чеков PDF в кабинете Альфа
 // @match        *://web.alfabank.ru/*
 // @match        *://www.web.alfabank.ru/*
@@ -23,7 +23,7 @@
   function alfaMockRun(CFG, win) {
     win = win || window;
     if (win.__alfaMockRun) return;
-    win.__alfaMockRun = '1.3.36';
+    win.__alfaMockRun = '1.3.50';
 
     const CONFIG = CFG;
     const nativeParse = JSON.parse;
@@ -66,6 +66,8 @@
       'на', 'от', 'до', 'по', 'из', 'за', 'все', 'расходы', 'доходы',
       'сегодня', 'вчера', 'переводы', 'игра', 'шаблон', 'категория',
       'аналитика', 'квитанция', 'операция', 'фильтр', 'счета', 'карты',
+      'справки', 'выписки', 'справка', 'выписка', 'получить', 'период',
+      'выбрать', 'документы', 'документ', 'сегодня',
     ]);
 
     function profilePhoneE164() {
@@ -91,6 +93,43 @@
       return !NAME_STOP.has(t.toLowerCase());
     }
 
+    // Live dump first names seen in cabinet / chat («Инесса»).
+    const LIVE_CLIENT_FIRST = new Set(['инесса']);
+
+    function forgeFirstName() {
+      return String((CONFIG.profile && CONFIG.profile.firstName) || '').trim();
+    }
+
+    function rewriteClientFirstInText(text) {
+      const first = forgeFirstName();
+      if (!first || typeof text !== 'string' || !text) return text;
+      let out = text;
+      // «Приветствую, Инесса!» / «Здравствуйте, Инесса.»
+      out = out.replace(
+        /(Приветствую|Здравствуй(?:те)?|Добрый\s+(?:день|вечер|утро)|Привет)(,\s*)([А-ЯЁ][а-яё]{1,20})/g,
+        (_, greet, sep) => `${greet}${sep}${first}`,
+      );
+      // Bare live dump first name (word boundary).
+      LIVE_CLIENT_FIRST.forEach((live) => {
+        if (live === first.toLowerCase()) return;
+        const re = new RegExp(
+          `(^|[^А-Яа-яЁё])(${live[0].toUpperCase()}${live.slice(1)}|${live})(?=$|[^А-Яа-яЁё])`,
+          'g',
+        );
+        out = out.replace(re, (_, pre) => `${pre}${first}`);
+      });
+      return out;
+    }
+
+    function isChatView() {
+      try {
+        const t = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ');
+        if (/Чат с банком|Альфа-Помощник|На связи Альфа/i.test(t)) return true;
+        if (/\/chat|\/chats|support-chat|messenger|помощник/i.test(String(location.href || ''))) return true;
+      } catch (_) { /* ignore */ }
+      return false;
+    }
+
     function formatAlfaNumber(rubles) {
       const [int, frac] = Math.abs(Number(rubles)).toFixed(2).split('.');
       return `${int.replace(/\B(?=(\d{3})+(?!\d))/g, '\u00a0')},${frac}`;
@@ -100,6 +139,119 @@
       const n = Number(rubles);
       const sign = signed && n < 0 ? '−' : '';
       return `${sign}${formatAlfaNumber(Math.abs(n))}\u00a0₽`;
+    }
+
+    function accountLast4() {
+      const raw = String((CONFIG.account && CONFIG.account.last4) || '').replace(/\D/g, '');
+      return raw.slice(-4);
+    }
+
+    function applyAccountMask(obj) {
+      const last4 = accountLast4();
+      if (!last4 || !obj || typeof obj !== 'object') return;
+      Object.keys(obj).forEach((key) => {
+        const val = obj[key];
+        if (typeof val !== 'string') return;
+        if (/[·•*]{1,2}\s*\d{4}/.test(val) || /masked|shortnumber|last4|tail|subtitle|displaynumber/i.test(key)) {
+          obj[key] = val.replace(/([·•*]{1,2}\s*)\d{4}/g, '$1' + last4);
+        }
+        if ((key === 'last4' || key === 'lastFour' || key === 'accountLast4') && /^\d{4}$/.test(val)) {
+          obj[key] = last4;
+        }
+      });
+    }
+
+    function patchAccountDom(root) {
+      const last4 = accountLast4();
+      if (!last4 || !root) return;
+      const walker = root.createTreeWalker
+        ? root.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+        : document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        const parent = node.parentElement;
+        if (!parent || parent.closest('input,textarea,[contenteditable="true"]')) continue;
+        const raw = node.textContent || '';
+        if (!/[·•*]{1,2}\s*\d{4}/.test(raw)) continue;
+        const around = ((parent.closest('a,button,div,li,section,article') || parent).innerText || '');
+        if (!/текущ|сч[её]т|получить|период|выписк/i.test(around) && !isStatementFormView()) continue;
+        const next = raw.replace(/([·•*]{1,2}\s*)\d{4}/g, '$1' + last4);
+        if (next !== raw) node.textContent = next;
+      }
+    }
+
+    function isStatementsListView() {
+      try {
+        if (isReceiptView()) return false;
+        const t = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ');
+        return /Справки и выписки/i.test(t) && /Выписка по сч[её]ту/i.test(t);
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function isStatementFormView() {
+      try {
+        if (isReceiptView()) return false;
+        const t = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ');
+        if (/получить квитанцию/i.test(t)) return false;
+        if (!/Выписка по сч[её]ту/i.test(t)) return false;
+        if (!/\bПолучить\b/i.test(t)) return false;
+        return /Период|Подтверждает операции/i.test(t);
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function urlLooksLikeReceipt(url) {
+      const u = String(url || '');
+      if (/квитан|receipt|cheque|payment_receipt/i.test(u)) return true;
+      return /operation-info.*documents\/pdf|operations\/[^/?#]+\/documents\/pdf/i.test(u);
+    }
+
+    function urlLooksLikeStatement(url) {
+      const u = String(url || '');
+      if (urlLooksLikeReceipt(u)) return false;
+      return /statement|выписк|справк|certificate/i.test(u);
+    }
+
+    function statementPdfBytes() {
+      const b64 = CONFIG.statement && CONFIG.statement.pdfBase64;
+      if (!b64) return null;
+      try {
+        const bin = atob(b64);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+        return out;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function openMockStatement() {
+      if (!statementPdfBytes()) {
+        alert('В userscript нет PDF выписки.\n/forge alfa: после чеков операций пришли PDF выписки → замени скрипт → перезапусти Safari.');
+        return false;
+      }
+      showReceiptViewer('st');
+      return true;
+    }
+
+    function isStatementListRow(el) {
+      if (!isStatementsListView() || !el) return false;
+      let n = el;
+      for (let i = 0; i < 14 && n && n !== document.body; i++) {
+        const t = (n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim();
+        if (/Выписка по сч[её]ту/i.test(t) && /сегодня/i.test(t) && t.length < 100) {
+          if (/Справки и выписки/i.test(t)) {
+            n = n.parentElement;
+            continue;
+          }
+          return true;
+        }
+        n = n.parentElement;
+      }
+      return false;
     }
 
     function rublesToField(current, rubles) {
@@ -293,12 +445,42 @@
     }
 
     function pdfBytesForIndex(index) {
+      if (index === 'st' || index === 'statement') return statementPdfBytes();
+      const nOps = (CONFIG.operations || []).length;
+      if (typeof index === 'number' && nOps && index >= nOps) return null;
       const b64 = CONFIG.receipts?.[index]?.pdfBase64;
       if (!b64) return null;
-      const bin = atob(b64);
-      const out = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-      return out;
+      const stB64 = CONFIG.statement && CONFIG.statement.pdfBase64;
+      if (stB64 && b64 === stB64) return null;
+      try {
+        const bin = atob(b64);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+        return out;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function firstReceiptIndexWithPdf() {
+      const n = Math.min(3, (CONFIG.operations || []).length || 0);
+      for (let i = 0; i < n; i++) {
+        if (pdfBytesForIndex(i)) return i;
+      }
+      return null;
+    }
+
+    function resolveReceiptIndex() {
+      const ops = CONFIG.operations || [];
+      const body = (document.body && document.body.innerText) || '';
+      for (let i = 0; i < ops.length; i++) {
+        const title = ops[i] && ops[i].description;
+        if (title && body.indexOf(String(title)) >= 0 && pdfBytesForIndex(i)) return i;
+      }
+      for (let i = 0; i < ops.length; i++) {
+        if (pdfBytesForIndex(i)) return i;
+      }
+      return firstReceiptIndexWithPdf();
     }
 
     function receiptBlobUrl(index) {
@@ -315,17 +497,21 @@
       const ct = String(contentType || '').toLowerCase();
       if (/\.(png|jpe?g|gif|svg|webp|ico|js|css|woff2?|ttf|map)(\?|$)/i.test(u)) return false;
       if (/logo|icon|static\/|servicecdn|\/image/i.test(u) && !/\/receipt|квитан/i.test(u)) return false;
-      if (/operations-history\/operations\/[^/?#]+\/?(\?|$)/i.test(u) && !/receipt|cheque|квитан/i.test(u)) return false;
-      const pathOk = /\/receipts?(?:\/|\?|$)|\/cheques?(?:\/|\?|$)|квитанц|payment_receipt|document-pdf|receipt\.pdf|cheque\.pdf/i.test(u);
+      if (/operations-history\/operations\/[^/?#]+\/?(\?|$)/i.test(u) && !/receipt|cheque|квитан|document/i.test(u)) return false;
+      // Alfa often serves HTML «Перевод по СБП» — swap every documents/pdf hit.
+      const pathOk = /\/receipts?(?:\/|\?|$)|\/cheques?(?:\/|\?|$)|квитанц|payment_receipt|document-pdf|receipt\.pdf|cheque\.pdf|documents\/pdf|operation-info-api.*pdf|pdf_viewer/i.test(u);
       const ctOk = /application\/pdf/.test(ct);
-      return pathOk || (ctOk && /receipt|cheque|квитан|operation/i.test(u));
+      return pathOk || (ctOk && /receipt|cheque|квитан|operation|document/i.test(u));
     }
 
     function applyNameToObject(obj) {
       if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return;
+      // Chat support / operator cards — never overwrite with client forge face.
+      if (looksLikeStaffPersonObject(obj)) return;
       const hasGiven = 'firstName' in obj || 'firstname' in obj || 'first_name' in obj || 'givenName' in obj;
       const hasFamily = 'lastName' in obj || 'lastname' in obj || 'last_name' in obj || 'surname' in obj || 'familyName' in obj;
-      const hasFull = typeof obj.fullName === 'string' || typeof obj.displayName === 'string' || typeof obj.fio === 'string';
+      const hasFull = typeof obj.fullName === 'string' || typeof obj.displayName === 'string' || typeof obj.fio === 'string'
+        || typeof obj.name === 'string' || typeof obj.userName === 'string' || typeof obj.clientName === 'string';
       if (!hasGiven && !hasFamily && !hasFull) return;
       if ('firstName' in obj) obj.firstName = CONFIG.profile.firstName;
       if ('firstname' in obj) obj.firstname = CONFIG.profile.firstName;
@@ -338,10 +524,106 @@
       if ('familyName' in obj) obj.familyName = CONFIG.profile.lastName;
       if ('patronymic' in obj) obj.patronymic = CONFIG.profile.patronymic;
       if ('middleName' in obj) obj.middleName = CONFIG.profile.patronymic;
-      if (typeof obj.fullName === 'string') obj.fullName = CONFIG.profile.displayName;
-      if (typeof obj.displayName === 'string') obj.displayName = CONFIG.profile.displayName;
-      if (typeof obj.display_name === 'string') obj.display_name = CONFIG.profile.displayName;
-      if (typeof obj.fio === 'string') obj.fio = CONFIG.profile.displayName;
+      const face = profileFaceName();
+      if (typeof obj.fullName === 'string') obj.fullName = face;
+      if (typeof obj.displayName === 'string') obj.displayName = face;
+      if (typeof obj.display_name === 'string') obj.display_name = face;
+      if (typeof obj.fio === 'string') obj.fio = CONFIG.profile.displayName || face;
+      if (typeof obj.name === 'string' && looksLikePersonTitle(obj.name)) obj.name = face;
+      if (typeof obj.userName === 'string' && looksLikePersonTitle(obj.userName)) obj.userName = face;
+      if (typeof obj.clientName === 'string' && looksLikePersonTitle(obj.clientName)) obj.clientName = face;
+    }
+
+    function looksLikeStaffPersonObject(obj) {
+      if (!obj || typeof obj !== 'object') return false;
+      const keys = Object.keys(obj).join(' ').toLowerCase();
+      const role = String(obj.role || obj.type || obj.kind || obj.position || obj.title || obj.jobTitle || '').toLowerCase();
+      if (/operator|employee|agent|manager|support|advisor|author|helper|staff|bot|оператор|сотрудник|менеджер|помощник|консультант/.test(role)) {
+        return true;
+      }
+      if ('operatorId' in obj || 'employeeId' in obj || 'agentId' in obj || 'supportId' in obj) return true;
+      if ('isOperator' in obj || 'isEmployee' in obj || 'isAgent' in obj || 'isBot' in obj) return true;
+      if (/operator|employee|agent|manager|support|advisor|author|sender|helper|сотрудник|оператор|менеджер|помощник|консультант/.test(keys)) {
+        if ('operatorId' in obj || 'employeeId' in obj || 'agentId' in obj || 'authorId' in obj || 'senderId' in obj) {
+          return true;
+        }
+      }
+      // Message bubbles / authors: body text + author, or avatar without client phone.
+      const hasBody = typeof obj.text === 'string' || typeof obj.message === 'string' || typeof obj.body === 'string'
+        || typeof obj.content === 'string';
+      const hasAuthor = typeof obj.author === 'string' || typeof obj.authorName === 'string'
+        || typeof obj.senderName === 'string' || typeof obj.operatorName === 'string'
+        || (obj.author && typeof obj.author === 'object') || (obj.sender && typeof obj.sender === 'object');
+      if (hasBody && hasAuthor) return true;
+      const hasAvatar = 'avatar' in obj || 'photo' in obj || 'photoUrl' in obj || 'imageUrl' in obj
+        || 'avatarUrl' in obj || 'iconUrl' in obj;
+      const hasClientBits = 'mobilePhoneNumber' in obj || 'phone' in obj || 'accounts' in obj
+        || 'inn' in obj || 'clientId' in obj || 'customerId' in obj || 'passport' in obj;
+      const hasPerson = 'firstName' in obj || 'lastName' in obj || 'fullName' in obj || 'displayName' in obj
+        || (typeof obj.name === 'string' && looksLikePersonTitle(obj.name));
+      if (hasPerson && hasAvatar && !hasClientBits) return true;
+      return false;
+    }
+
+    function profileFaceName() {
+      const first = (CONFIG.profile.firstName || '').trim();
+      const last = (CONFIG.profile.lastName || '').trim();
+      // Profile screen shows «Имя Фамилия» (as live dump).
+      if (first && last) return `${first} ${last}`;
+      return (CONFIG.profile.displayName || first || last || '').trim();
+    }
+
+    function mockDocs() {
+      if (win.__ALFA_MOCK_DOCS) return win.__ALFA_MOCK_DOCS;
+      let h = 2166136261;
+      const seed = String(mockFingerprint() || CONFIG.profile.displayName || 'docs');
+      for (let i = 0; i < seed.length; i++) {
+        h ^= seed.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+      }
+      const rnd = () => {
+        h = (Math.imul(h, 1664525) + 1013904223) >>> 0;
+        return h;
+      };
+      let series = String(1000 + (rnd() % 9000));
+      let number = String(100000 + (rnd() % 900000));
+      // Never echo known live values from dumps / screenshots.
+      if (series === '9219') series = String(1000 + ((rnd() + 17) % 9000));
+      if (number === '652102') number = String(100000 + ((rnd() + 91) % 900000));
+      let inn = '';
+      for (let i = 0; i < 12; i++) inn += String(rnd() % 10);
+      if (inn.startsWith('1650') || inn.startsWith('0')) {
+        inn = String(2 + (rnd() % 7)) + inn.slice(1);
+      }
+      win.__ALFA_MOCK_DOCS = {
+        passport: `${series} ${number}`,
+        passportSeries: series,
+        passportNumber: number,
+        inn,
+      };
+      return win.__ALFA_MOCK_DOCS;
+    }
+
+    function applyDocsToObject(obj) {
+      if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return;
+      const docs = mockDocs();
+      Object.keys(obj).forEach((key) => {
+        const lk = String(key).toLowerCase();
+        const val = obj[key];
+        if (typeof val !== 'string') return;
+        const compact = val.replace(/\s/g, '');
+        if (/passportseries|seriespassport|docseries/.test(lk) && /^\d{4}$/.test(compact)) {
+          obj[key] = docs.passportSeries;
+        } else if (/passportnumber|numberpassport|docnumber/.test(lk) && /^\d{6}$/.test(compact)) {
+          obj[key] = docs.passportNumber;
+        } else if (/passport|паспорт/.test(lk) && /^\d{4}\d{6}$/.test(compact)) {
+          obj[key] = docs.passport;
+        } else if ((/^inn$|innnumber|taxpayer|taxid|инн/.test(lk) || lk === 'inn') && /^\d{10,12}$/.test(compact)) {
+          obj[key] = docs.inn;
+        } else if (/^\d{4}\s+\d{6}$/.test(val.trim())) {
+          obj[key] = docs.passport;
+        }
+      });
     }
 
     function cloneJson(value) {
@@ -389,9 +671,19 @@
       return n.split('(')[0].trim();
     }
 
+    const logoBlobs = {};
+
     function svgLogo(bg, inner) {
       const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="${bg}"/>${inner}</svg>`;
-      return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+      const cacheKey = bg + '|' + inner;
+      if (logoBlobs[cacheKey]) return logoBlobs[cacheKey];
+      try {
+        const blob = new Blob([svg], { type: 'image/svg+xml' });
+        logoBlobs[cacheKey] = URL.createObjectURL(blob);
+        return logoBlobs[cacheKey];
+      } catch (_) {
+        return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+      }
     }
 
     const BANK_LOGOS = {
@@ -402,11 +694,32 @@
       'Райффайзен': svgLogo('#FFE600', '<text x="32" y="43" text-anchor="middle" font-size="26" font-family="Arial,sans-serif" font-weight="700" fill="#000">R</text>'),
       'ВТБ': svgLogo('#0A2896', '<text x="32" y="42" text-anchor="middle" font-size="18" font-family="Arial,sans-serif" font-weight="700" fill="#fff">ВТБ</text>'),
     };
-    const logoBlobs = {};
+
+    function bankLogoKey(bank) {
+      if (!bank) return '';
+      const n = [
+        bank.short, bank.categoryName, bank.name, bank.key,
+        Array.isArray(bank.needles) ? bank.needles.join(' ') : '',
+      ].map((x) => String(x || '')).join(' ');
+      if (/сбер|sber/i.test(n)) return 'Сбер';
+      if (/ozon|озон/i.test(n)) return 'Ozon';
+      if (/альфа|alfa/i.test(n)) return 'Альфа';
+      if (/т-?банк|t-?bank|тинькоф/i.test(n)) return 'Т-Банк';
+      if (/райф/i.test(n)) return 'Райффайзен';
+      if (/втб|vtb/i.test(n)) return 'ВТБ';
+      if (/псб|promsvyaz|промсвяз/i.test(n)) return 'ПСБ';
+      return '';
+    }
 
     function bankLogoSrc(bank) {
       if (!bank) return '';
-      return bank.logoUrl || bank.iconUrl || bank.logo || bank.fileLink || '';
+      const key = typeof bankLogoKey === 'function' ? bankLogoKey(bank) : '';
+      const packed = (CONFIG.bankLogos && key && CONFIG.bankLogos[key]) || '';
+      if (packed) return packed;
+      if (key && BANK_LOGOS[key]) return BANK_LOGOS[key];
+      const url = bank.logoUrl || bank.iconUrl || bank.logo || bank.fileLink || '';
+      if (url && !/not_found|placeholder|missing/i.test(url)) return url;
+      return '';
     }
 
     function bankNeedles(bank) {
@@ -420,6 +733,22 @@
     function looksLikeSbpTransfer(op) {
       const cat = String((op && op.category && (op.category.name || op.category)) || '');
       return /сбп/i.test(cat);
+    }
+
+    function isCardKind(item) {
+      const k = String((item && item.transferKind) || '').toLowerCase();
+      return k === 'card' || k === 'карта';
+    }
+
+    function looksLikeCardTransfer(op) {
+      if (!op || looksLikeSbpTransfer(op)) return false;
+      const cat = String((op.category && (op.category.name || op.category)) || '');
+      const name = String(op.name || op.title || '');
+      if (/альфа-?карта/i.test(name)) return true;
+      if (/^Переводы\s*·/i.test(cat) && !/сбп/i.test(cat) && (op.mcc != null || op.status || op.smartVistaFrontReference)) {
+        return true;
+      }
+      return false;
     }
 
     function rememberSbpDonors(list) {
@@ -447,6 +776,48 @@
         const cat = String((op.category && (op.category.name || op.category)) || '');
         return /перевод/i.test(cat) && !/кэшбэк|cashback|аналитик/i.test(cat);
       }) || null;
+    }
+
+
+    function findCardTemplate(list) {
+      return (list || []).find((op) => op && !isMockOp(op) && looksLikeCardTransfer(op)) || null;
+    }
+
+    function findAnyHistoryDonor(list) {
+      return findSbpTemplate(list)
+        || findCardTemplate(list)
+        || (list || []).find((op) => op && !isMockOp(op) && looksLikeOperation(op))
+        || null;
+    }
+
+    function syntheticHistoryOp(item) {
+      const nid = newOpId();
+      const logo = bankLogoSrc(item && item.bank) || '';
+      const rub = Math.abs(Number(item && item.amount) || 0);
+      const kopecks = Math.round(rub * 100);
+      const neg = Number(item && item.amount) < 0;
+      const iso = (item && item.dateTime) || formatAlfaIso((item && item.atMs) || Date.now());
+      const title = (item && item.description) || 'Альфа-карта МИР';
+      const bankName = (item && item.bank && (item.bank.categoryName || item.bank.short)) || shortBank(item && item.bank);
+      let catLine;
+      if (isCardKind(item)) catLine = bankName ? ('Переводы \u00b7 ' + bankName) : 'Переводы';
+      else catLine = bankName ? ('Переводы \u00b7 СБП \u00b7 ' + bankName) : 'Переводы \u00b7 СБП';
+      return {
+        id: nid,
+        operationId: newUuid(),
+        clickReference: nid,
+        reference: nid,
+        title: title,
+        name: title,
+        direction: neg ? 'EXPENSE' : 'INCOME',
+        dateTime: iso,
+        amount: { value: neg ? -kopecks : kopecks, currency: 'RUR', minorUnits: 100 },
+        category: { name: catLine },
+        logoUrl: logo,
+        iconUrl: logo,
+        status: 'SUCCESS',
+        subtitle: '',
+      };
     }
 
     function findBrandDonor(list, bank) {
@@ -582,14 +953,20 @@
 
     function applyBankBrand(op, bank) {
       if (!bank || !op) return;
-      const logo = bank.logoUrl || bank.iconUrl || bankLogoSrc(bank);
+      const logo = bankLogoSrc(bank);
       if (logo) op.logoUrl = logo;
     }
 
     function setCategoryLine(op, item) {
       const cat = item.category || 'Переводы';
       const bankName = (item.bank && (item.bank.categoryName || item.bank.short)) || shortBank(item.bank);
-      const line = bankName ? `${cat} · СБП · ${bankName}` : `${cat} · СБП`;
+      // Live dump: card→other = «Переводы · Т-Банк»; SBP = «Переводы · СБП · Банк».
+      let line;
+      if (isCardKind(item)) {
+        line = bankName ? `${cat} · ${bankName}` : cat;
+      } else {
+        line = bankName ? `${cat} · СБП · ${bankName}` : `${cat} · СБП`;
+      }
       if (op.category && typeof op.category === 'object') {
         if (typeof op.category.name === 'string') op.category.name = line;
       } else {
@@ -761,6 +1138,12 @@
       patchOperationAmount(op, donor, item);
       if (item.phone && typeof op.phone === 'string') op.phone = item.phone;
       setCategoryLine(op, item);
+      if (isCardKind(item)) {
+        // Live card→other history has no SBP bottomBadge; has status/mcc.
+        delete op.bottomBadge;
+        if (op.status == null) op.status = 'SUCCESS';
+        if (op.subtitle == null) op.subtitle = '';
+      }
       return op;
     }
 
@@ -923,7 +1306,7 @@
     }
 
     function mockFingerprint() {
-      return 'v21||' + (CONFIG.operations || []).map((item) => String(item.description || '') + '|' + String(item.amount) + '|' + String(item.dateTime || '')).join('||');
+      return 'v22||' + (CONFIG.operations || []).map((item) => String(item.description || '') + '|' + String(item.amount) + '|' + String(item.dateTime || '')).join('||');
     }
 
     function savedMocksForConfig() {
@@ -1001,6 +1384,8 @@
       if (!CONFIG.operations?.length) return;
       const fp = mockFingerprint();
       const wanted = (CONFIG.operations || []).map((item) => item.description);
+      const liveSnapshot = (list || []).filter((op) => op && !isMockOp(op));
+      const template = findAnyHistoryDonor(liveSnapshot);
       for (let i = list.length - 1; i >= 0; i--) {
         const op = list[i];
         if (!op) continue;
@@ -1009,7 +1394,12 @@
         }
       }
       stripReplacedDonors(list);
-      const saved = savedMocksForConfig().filter((op) => op && op.__alfaMockOp && !op.__alfaMockNid && (op.bottomBadge || looksLikeSbpTransfer(op) || /перевод/i.test(String((op.category && (op.category.name || op.category)) || ''))));
+      const saved = savedMocksForConfig().filter((op) => {
+        if (!op || !op.__alfaMockOp || op.__alfaMockNid) return false;
+        const item = op.__alfaMockItem;
+        if (item && isCardKind(item)) return !looksLikeSbpTransfer(op);
+        return op.bottomBadge || looksLikeSbpTransfer(op) || /перевод/i.test(String((op.category && (op.category.name || op.category)) || ''));
+      });
       if (saved.length >= CONFIG.operations.length) {
         saved.forEach((op, i) => {
           registerReceiptIds(op, i);
@@ -1018,41 +1408,57 @@
         prependOps(list, saved);
         return;
       }
-      const template = findSbpTemplate(list);
-      if (!template) return;
-      const newest = list[0];
+      const newest = liveSnapshot[0] || list[0];
       const inserts = [];
       Object.keys(MOCK_OPS).forEach((id) => {
         if (MOCK_OPS[id] && MOCK_OPS[id].__alfaMockFp !== fp) delete MOCK_OPS[id];
       });
       const usedDonors = new Set();
+      const donorList = liveSnapshot.length ? liveSnapshot : (list || []);
       for (let i = 0; i < CONFIG.operations.length; i++) {
         const item = CONFIG.operations[i];
-        let donor = findBrandDonor(list, item.bank);
+        let donor = findBrandDonor(donorList, item.bank);
         if (donor && usedDonors.has(String(donor.id))) donor = null;
-        if (!donor) {
-          donor = list.find((op) => op && !op.__alfaMockOp && looksLikeSbpTransfer(op) && !usedDonors.has(String(op.id))) || template;
+        if (isCardKind(item)) {
+          if (!donor || looksLikeSbpTransfer(donor) || !looksLikeCardTransfer(donor)) {
+            donor = donorList.find((op) => op && !op.__alfaMockOp && looksLikeCardTransfer(op) && !usedDonors.has(String(op.id))) || donor;
+          }
+          if (!donor || looksLikeSbpTransfer(donor)) {
+            donor = donorList.find((op) => op && !op.__alfaMockOp && looksLikeCardTransfer(op)) || donor;
+          }
+        } else if (!donor) {
+          donor = donorList.find((op) => op && !op.__alfaMockOp && looksLikeSbpTransfer(op) && !usedDonors.has(String(op.id))) || template;
         }
-        const clone = cloneJson(donor || template);
-        patchOneOperation(clone, donor || template, item);
+        const base = donor || template || syntheticHistoryOp(item);
+        const clone = cloneJson(base);
+        patchOneOperation(clone, base, item);
         applyBankBrand(clone, item.bank);
-        const logo = (item.bank && (item.bank.logoUrl || item.bank.iconUrl)) || bankLogoSrc(item.bank);
-        if (logo) replaceLogoUrls(clone, logo);
-        if (!clone.bottomBadge) {
-          const badgeDonor = list.find((op) => op && op.bottomBadge && looksLikeSbpTransfer(op));
+        const logo = bankLogoSrc(item.bank);
+        if (logo) {
+          clone.logoUrl = logo;
+          if ('iconUrl' in clone || clone.iconUrl) clone.iconUrl = logo;
+          replaceLogoUrls(clone, logo);
+        }
+        if (isCardKind(item)) {
+          delete clone.bottomBadge;
+        } else if (!clone.bottomBadge) {
+          const badgeDonor = donorList.find((op) => op && op.bottomBadge && looksLikeSbpTransfer(op));
           if (badgeDonor) clone.bottomBadge = cloneJson(badgeDonor.bottomBadge);
         }
         stampOpTime(clone, newest, item);
         clone.__alfaMockOp = true;
         clone.__alfaMockFp = fp;
         clone.__alfaMockIndex = i;
-        clone.__alfaDonorId = String((donor || template).id || clone.id || '');
+        clone.__alfaDonorId = String((donor || template || clone).id || clone.id || '');
         clone.__alfaKeepDonorId = true;
         clone.__alfaMockItem = {
           description: item.description,
           amount: item.amount,
           phone: item.phone,
           bank: item.bank,
+          category: item.category,
+          transferKind: item.transferKind || 'sbp',
+          cardLast4: item.cardLast4 || '',
           dateTime: item.dateTime || clone.dateTime,
           atMs: item.atMs,
         };
@@ -1061,7 +1467,7 @@
         rememberMock(clone);
         if (clone.__alfaDonorId) usedDonors.add(String(clone.__alfaDonorId));
         inserts.push(clone);
-        ensureSkeleton(donor || template);
+        if (donor || template) ensureSkeleton(donor || template);
       }
       persistMocks();
       stripReplacedDonors(list);
@@ -1101,6 +1507,7 @@
         if (/^(id|date|time|number|pan|status|type|currency|code|iban|eqId)/i.test(key)) return;
         if (isMoneyObject(obj[key])) setMoney(obj[key], rub);
       });
+      applyAccountMask(obj);
     }
 
     let patchedCurrentAccount = false;
@@ -1169,7 +1576,10 @@
         return;
       }
       const op = inOp || looksLikeOperation(node);
-      if (!op) applyNameToObject(node);
+      if (!op) {
+        applyNameToObject(node);
+        applyDocsToObject(node);
+      }
       if (!op && isCurrentAccountProduct(node)) {
         if (!patchedCurrentAccount) {
           patchProduct(node);
@@ -1178,9 +1588,15 @@
         return;
       }
       if (!op) patchSpending(node);
-      for (const val of Object.values(node)) {
-        if (val && typeof val === 'object') patchTree(val, depth + 1, op);
-      }
+      // Chat / helper copy: rewrite client first name inside greeting strings.
+      Object.keys(node).forEach((key) => {
+        const val = node[key];
+        if (typeof val === 'string' && /Приветств|Здравств|Альфа-Помощник|Инесса/i.test(val)) {
+          node[key] = rewriteClientFirstInText(val);
+        } else if (val && typeof val === 'object') {
+          patchTree(val, depth + 1, op);
+        }
+      });
     }
 
     function unwrapDetail(data) {
@@ -1223,7 +1639,10 @@
       return actions.some((a) => a && /квитанц|receipt|cheque/i.test(String((a && (a.label || a.type || a.deeplink || a.mobileApiPath)) || '')));
     }
 
-    function detailNeedsSbpOverlay(inner) {
+    function detailNeedsSbpOverlay(inner, mock) {
+      const item = (mock && mock.__alfaMockItem) || {};
+      // Card→other dump has no bottomBadge; do not force SBP skeleton over it.
+      if (isCardKind(item)) return false;
       if (!inner) return true;
       const cat = String((inner.category && (inner.category.name || inner.category)) || '');
       if (/кэшбэк|cashback|аналитик/i.test(cat)) return true;
@@ -1282,11 +1701,11 @@
     function applyMockFace(inner, mock) {
       const item = mock.__alfaMockItem || {};
       if (item.description) inner.title = item.description;
-      const bankLogo = (item.bank && (item.bank.logoUrl || item.bank.iconUrl))
-        || bankLogoSrc(item.bank)
-        || mock.logoUrl
-        || mock.iconUrl;
-      if (bankLogo) inner.logoUrl = bankLogo;
+      const bankLogo = bankLogoSrc(item.bank) || bankLogoSrc(mock && mock.bank) || '';
+      if (bankLogo) {
+        inner.logoUrl = bankLogo;
+        if ('iconUrl' in inner) inner.iconUrl = bankLogo;
+      }
       const rub = Math.abs(Number(item.amount != null ? item.amount : 0));
       if (rub) {
         if (inner.amount && typeof inner.amount === 'object') setAlfaAmountField(inner.amount, rub);
@@ -1298,17 +1717,22 @@
       stampOpTime(inner, inner, item);
       if (item.dateTime) inner.dateTime = item.dateTime;
       else if (mock.dateTime) inner.dateTime = mock.dateTime;
-      const line = typeof mock.category === 'string' ? mock.category : (mock.category && mock.category.name);
+      // Detail category object stays short «Переводы» (dump); list uses long line.
+      const shortCat = item.category || 'Переводы';
       if (inner.category && typeof inner.category === 'object') {
-        if (line) inner.category.name = line;
-      } else if (line) {
-        inner.category = line;
+        if (typeof inner.category.name === 'string') inner.category.name = shortCat;
       }
       inner.loyaltyDetails = { cashbackStatusTitle: null };
-      inner.comment = 'Перевод денежных средств';
-      inner.status = inner.status || 'SUCCESS';
+      if (isCardKind(item)) {
+        inner.comment = null;
+        delete inner.bottomBadge;
+        inner.status = inner.status || 'SUCCESS';
+      } else {
+        inner.comment = 'Перевод денежных средств';
+        inner.status = inner.status || 'SUCCESS';
+      }
       const sk = win.__ALFA_DETAIL_SKELETON__;
-      if (!inner.bottomBadge && (mock.bottomBadge || (sk && sk.bottomBadge))) {
+      if (!isCardKind(item) && !inner.bottomBadge && (mock.bottomBadge || (sk && sk.bottomBadge))) {
         inner.bottomBadge = cloneJson(mock.bottomBadge || sk.bottomBadge);
       }
       if (sk && Array.isArray(sk.fields) && (!Array.isArray(inner.fields) || !inner.fields.length)) {
@@ -1324,7 +1748,7 @@
       if (!inner) return;
       const mock = findMockForDetail(url, inner);
       if (!mock || !mock.__alfaMockOp) return;
-      if (detailNeedsSbpOverlay(inner) && win.__ALFA_DETAIL_SKELETON__ && Array.isArray(win.__ALFA_DETAIL_SKELETON__.fields)) {
+      if (detailNeedsSbpOverlay(inner, mock) && win.__ALFA_DETAIL_SKELETON__ && Array.isArray(win.__ALFA_DETAIL_SKELETON__.fields)) {
         const overlay = buildMockDetail(mock);
         Object.keys(inner).forEach((k) => { delete inner[k]; });
         Object.assign(inner, overlay);
@@ -1376,7 +1800,7 @@
       if (typeof text !== 'string' || text.length < 2 || text.length > 8e6) return false;
       const c = text.trim()[0];
       if (c !== '{' && c !== '[') return false;
-      return /amount|balance|operations|accounts|firstName|layoutData|currency|products|transactions/i.test(text);
+      return /amount|balance|operations|accounts|firstName|layoutData|currency|products|transactions|приветств|помощник|message|chat|messages/i.test(text);
     }
 
     function cloneHeaders(res, contentType) {
@@ -1388,10 +1812,29 @@
     }
 
     function swapPdfResponse(url, res) {
-      if (!isReceiptPdfRequest(url, res.headers?.get?.('content-type') || '')) return null;
+      const ct = res.headers?.get?.('content-type') || '';
+      const u = String(url || '').toLowerCase();
+      // Operation «Получить квитанцию» must never get the statement PDF.
+      // documents/pdf is shared; pick by screen + URL, not by leftover SPA text.
+      if (
+        !isReceiptView()
+        && !urlLooksLikeReceipt(u)
+        && (isStatementsListView() || isStatementFormView() || urlLooksLikeStatement(u))
+        && statementPdfBytes()
+      ) {
+        if (urlLooksLikeStatement(u) || /documents\/pdf|pdf_viewer/i.test(u)) {
+          return new Response(statementPdfBytes(), {
+            status: 200,
+            statusText: 'OK',
+            headers: cloneHeaders(res, 'application/pdf'),
+          });
+        }
+      }
+      if (!isReceiptPdfRequest(url, ct)) return null;
       const id = idFromUrl(url) || mockIdFromUrl(url);
       let idx = receiptIndexForId(id);
       if (idx === null && id && MOCK_OPS[String(id)]) idx = MOCK_OPS[String(id)].__alfaMockIndex || 0;
+      if (idx === null) idx = resolveReceiptIndex();
       if (idx === null) return null;
       const bytes = pdfBytesForIndex(idx);
       if (!bytes) return null;
@@ -1460,6 +1903,43 @@
       const analyticsAmountText = Number.isInteger(analyticsAmount)
         ? `${String(analyticsAmount).replace(/\B(?=(\d{3})+(?!\d))/g, '\u00a0')}\u00a0₽`
         : formatAlfaMoney(analyticsAmount, false);
+      const last4 = String(item.cardLast4 || '').replace(/\D/g, '').slice(-4);
+      const paymentSub = bank
+        ? (last4 ? `Перевод в ${bank} на карту ··${last4}` : `Перевод в ${bank} на карту`)
+        : '';
+
+      function setSduiByTitle(node, wantTitle, patch, depth) {
+        if (!node || typeof node !== 'object' || depth > 14) return false;
+        if (Array.isArray(node)) {
+          return node.some((v) => setSduiByTitle(v, wantTitle, patch, depth + 1));
+        }
+        const t = node.title && typeof node.title === 'object' ? node.title.value : node.title;
+        if (typeof t === 'string' && t.trim() === wantTitle) {
+          if (patch.subtitle != null) {
+            if (node.subtitle && typeof node.subtitle === 'object' && 'value' in node.subtitle) {
+              node.subtitle.value = patch.subtitle;
+            } else if ('subtitle' in node || node.dataContent) {
+              if (node.dataContent && node.dataContent.subtitle && typeof node.dataContent.subtitle === 'object') {
+                node.dataContent.subtitle.value = patch.subtitle;
+              } else {
+                node.subtitle = patch.subtitle;
+              }
+            }
+            if (node.dataContent && typeof node.dataContent === 'object') {
+              if (node.dataContent.subtitle && typeof node.dataContent.subtitle === 'object' && 'value' in node.dataContent.subtitle) {
+                node.dataContent.subtitle.value = patch.subtitle;
+              } else if ('subtitle' in node.dataContent) {
+                node.dataContent.subtitle = typeof node.dataContent.subtitle === 'object'
+                  ? Object.assign({}, node.dataContent.subtitle, { value: patch.subtitle })
+                  : patch.subtitle;
+              }
+            }
+          }
+          return true;
+        }
+        return Object.keys(node).some((key) => setSduiByTitle(node[key], wantTitle, patch, depth + 1));
+      }
+
       function patchAnalyticsMoney(node, depth) {
         if (!node || typeof node !== 'object' || depth > 12) return;
         if (Array.isArray(node)) {
@@ -1489,12 +1969,20 @@
         else if (/банк/i.test(label) && !/сбп|nspk/i.test(label) && bank) setViewText(field, bank);
         else if (/сумм/i.test(label) && amountText) setViewText(field, amountText);
       });
-      fields.forEach((field) => {
-        const cur = viewText(field);
-        if (title && looksLikePersonTitle(cur) && cur !== title) {
-          setViewText(field, title);
-        }
-      });
+      if (isCardKind(item)) {
+        fields.forEach((field) => {
+          if (!field) return;
+          setSduiByTitle(field, 'Карта списания', { subtitle: title || 'Альфа-карта МИР' }, 0);
+          if (paymentSub) setSduiByTitle(field, 'Детали платежа', { subtitle: paymentSub }, 0);
+        });
+      } else {
+        fields.forEach((field) => {
+          const cur = viewText(field);
+          if (title && looksLikePersonTitle(cur) && cur !== title) {
+            setViewText(field, title);
+          }
+        });
+      }
     }
 
     function isOpDetailRequest(url) {
@@ -1674,8 +2162,18 @@
         } catch (_) { /* ignore */ }
       }
       const ct = res.headers.get('content-type') || '';
-      if (isReceiptPdfRequest(url, ct)) {
-        return swapPdfResponse(url, res) || res;
+      if (isReceiptPdfRequest(url, ct) || /documents\/pdf|pdf_viewer/i.test(url)) {
+        const swapped = swapPdfResponse(url, res);
+        if (swapped) return swapped;
+        // Block Alfa HTML stamp receipt when our PDF is missing — empty 404
+        // is better than showing «Перевод по СБП / ИСПОЛНЕНО».
+        if (/documents\/pdf|pdf_viewer|квитан|receipt/i.test(url)) {
+          return new Response('PDF not embedded in userscript', {
+            status: 404,
+            statusText: 'Not Found',
+            headers: { 'content-type': 'text/plain; charset=utf-8' },
+          });
+        }
       }
       const looksJson = !ct || /json|javascript|text\/plain/i.test(ct) || /alfabank\.ru/i.test(url);
       if (!looksJson) return res;
@@ -1749,6 +2247,51 @@
       const url = this.__alfaMockUrl || '';
       const bodyArg = args[0];
       this.__alfaMockBody = typeof bodyArg === 'string' ? bodyArg : '';
+      // Short-circuit native receipt XHR → embedded Oracle PDF (blocks HTML stamp).
+      if (isReceiptPdfRequest(url, '') || /documents\/pdf|pdf_viewer/i.test(url)) {
+        const wantSt = (
+          !isReceiptView()
+          && !urlLooksLikeReceipt(url)
+          && (isStatementsListView() || isStatementFormView() || urlLooksLikeStatement(url))
+        );
+        const idx = wantSt ? 'st' : resolveReceiptIndex();
+        const bytes = idx != null ? pdfBytesForIndex(idx) : (wantSt ? statementPdfBytes() : null);
+        if (bytes) {
+          const xhr = this;
+          const blob = new Blob([bytes], { type: 'application/pdf' });
+          const finish = () => {
+            try {
+              Object.defineProperty(xhr, 'readyState', { configurable: true, get() { return 4; } });
+              Object.defineProperty(xhr, 'status', { configurable: true, get() { return 200; } });
+              Object.defineProperty(xhr, 'statusText', { configurable: true, get() { return 'OK'; } });
+              Object.defineProperty(xhr, 'response', {
+                configurable: true,
+                get() {
+                  if (xhr.responseType === 'arraybuffer') {
+                    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+                  }
+                  return blob;
+                },
+              });
+              Object.defineProperty(xhr, 'responseText', { configurable: true, get() { return ''; } });
+              xhr.getResponseHeader = function (name) {
+                if (String(name || '').toLowerCase() === 'content-type') return 'application/pdf';
+                return null;
+              };
+              xhr.getAllResponseHeaders = function () {
+                return 'content-type: application/pdf\r\n';
+              };
+            } catch (_) { /* ignore */ }
+            try { if (typeof xhr.onreadystatechange === 'function') xhr.onreadystatechange(); } catch (_) { /* ignore */ }
+            try { if (typeof xhr.onload === 'function') xhr.onload(); } catch (_) { /* ignore */ }
+            try { xhr.dispatchEvent(new Event('readystatechange')); } catch (_) { /* ignore */ }
+            try { xhr.dispatchEvent(new Event('load')); } catch (_) { /* ignore */ }
+            try { xhr.dispatchEvent(new Event('loadend')); } catch (_) { /* ignore */ }
+          };
+          setTimeout(finish, 0);
+          return;
+        }
+      }
       if (isOpsListRequest(url)) {
         win.__ALFA_LAST_OPS_URL = url;
         win.__ALFA_LAST_OPS_INIT = {
@@ -1939,9 +2482,6 @@
 
     function patchOpDetailDom(root) {
       if (!root || !isOpDetailView()) return;
-      // Native Alfa renderer now receives the exact four-action API schema.
-      // Do not add/reposition HTML rows manually.
-      return;
       const body = root.innerText || '';
       let item = null;
       let idx = null;
@@ -1953,83 +2493,68 @@
         }
         return false;
       });
-      if (!item || root.querySelector('[data-alfa-mock-actions="native"]')) return;
+      if (!item) {
+        (CONFIG.operations || []).some((op, i) => {
+          if (op && pdfBytesForIndex(i)) {
+            item = op;
+            idx = i;
+            return true;
+          }
+          return false;
+        });
+      }
+      if (!item) return;
+      if (root.querySelector('[data-alfa-mock-actions="receipt"]')) return;
+      // Already on screen (native SBP) — click-guard opens our PDF.
+      if (/получить квитанцию/i.test(body)) return;
 
-      // Hide an incomplete native "Repeat" row when this web response provides
-      // only one action instead of the four-row Alfa transfer action block.
+      const wrap = document.createElement('div');
+      wrap.setAttribute('data-alfa-mock-actions', 'receipt');
+      wrap.style.cssText = 'box-sizing:border-box;width:calc(100% - 38px);margin:8px 19px 0;border-top:1px solid rgba(255,255,255,.10);padding:8px 0 0;background:transparent;';
+      const row = document.createElement('div');
+      row.setAttribute('role', 'button');
+      row.setAttribute('data-alfa-mock-action', 'receipt');
+      row.style.cssText = 'box-sizing:border-box;height:58px;display:flex;align-items:center;gap:16px;padding:0 8px;color:#f5f5f7;font:400 16px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;cursor:pointer;';
+      row.innerHTML = '<span style="width:24px;height:24px;display:block;flex:0 0 24px;color:#f5f5f7;">'
+        + '<svg viewBox="0 0 28 28"><path d="M7 3.5h14v21l-3-2-4 2-4-2-3 2z"/><path d="M10 9h8M10 14h8"/></svg>'
+        + '</span><span>Получить квитанцию</span>';
+      const svg = row.querySelector('svg');
+      if (svg) svg.style.cssText = 'width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;';
+      const open = (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+        openMockReceipt(idx);
+      };
+      row.addEventListener('click', open, true);
+      row.addEventListener('touchend', open, true);
+      wrap.appendChild(row);
+
+      let anchor = null;
       try {
         root.querySelectorAll('button,a,[role="button"],div,span,p').forEach((el) => {
-          if ((el.textContent || '').replace(/\s+/g, ' ').trim() !== 'Повторить операцию') return;
-          let row = el.closest('button,a,[role="button"]') || el;
-          for (let i = 0; i < 3 && row.parentElement; i++) {
-            const text = (row.parentElement.textContent || '').replace(/\s+/g, ' ').trim();
-            if (text !== 'Повторить операцию') break;
-            row = row.parentElement;
-          }
-          row.style.display = 'none';
+          if (anchor) return;
+          const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+          if (t === 'Повторить операцию' || t === 'Финансовая аналитика') anchor = el;
         });
       } catch (_) { /* ignore */ }
-
-      const icons = {
-        receipt: '<svg viewBox="0 0 28 28"><path d="M7 3.5h14v21l-3-2-4 2-4-2-3 2z"/><path d="M10 9h8M10 14h8"/></svg>',
-        repeat: '<svg viewBox="0 0 28 28"><path d="M5 13a9 9 0 0 1 15-5l2 2M22 5v5h-5M23 15a9 9 0 0 1-15 5l-2-2M6 23v-5h5"/></svg>',
-        template: '<svg viewBox="0 0 28 28"><path d="m14 3 3.3 6.7 7.4 1.1-5.4 5.2 1.3 7.4-6.6-3.5-6.6 3.5 1.3-7.4-5.4-5.2 7.4-1.1z"/></svg>',
-        autopay: '<svg viewBox="0 0 28 28"><circle cx="14" cy="14" r="10.5"/><path d="M14 8v6l4 3"/></svg>',
-      };
-      const wrap = document.createElement('div');
-      wrap.setAttribute('data-alfa-mock-actions', 'native');
-      wrap.style.cssText = 'box-sizing:border-box;width:calc(100% - 38px);margin:0 19px;border-top:1px solid rgba(255,255,255,.10);border-bottom:1px solid rgba(255,255,255,.10);padding:8px 0;background:transparent;';
-      [
-        ['Получить квитанцию', 'receipt'],
-        ['Повторить операцию', 'repeat'],
-        ['Создать шаблон', 'template'],
-        ['Создать автоплатёж', 'autopay'],
-      ].forEach(([label, kind]) => {
-        const row = document.createElement('div');
-        row.setAttribute('role', 'button');
-        row.setAttribute('data-alfa-mock-action', kind);
-        row.style.cssText = 'box-sizing:border-box;height:58px;display:flex;align-items:center;gap:16px;padding:0 8px;color:#f5f5f7;font:400 16px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;cursor:pointer;';
-        row.innerHTML = '<span style="width:24px;height:24px;display:block;flex:0 0 24px;color:#f5f5f7;">'
-          + icons[kind] + '</span><span>' + label + '</span>';
-        const svg = row.querySelector('svg');
-        if (svg) svg.style.cssText = 'width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;';
-        if (kind === 'receipt') {
-          row.addEventListener('click', (ev) => {
-            ev.preventDefault();
-            ev.stopPropagation();
-            showReceiptViewer(idx);
-          });
-        }
-        wrap.appendChild(row);
-      });
-
-      let analytics = null;
-      try {
-        root.querySelectorAll('h1,h2,h3,div,span,p').forEach((el) => {
-          if (!analytics && (el.textContent || '').replace(/\s+/g, ' ').trim() === 'Финансовая аналитика') {
-            analytics = el;
+      if (anchor) {
+        let section = anchor;
+        for (let i = 0; i < 6 && section.parentElement; i++) {
+          const p = section.parentElement;
+          const text = (p.textContent || '').replace(/\s+/g, ' ').trim();
+          if (/Повторить операцию|Финансовая аналитика/.test(text) && text.length < 500) {
+            section = p;
+            break;
           }
-        });
-      } catch (_) { /* ignore */ }
-      if (!analytics) return;
-
-      // Smallest component that contains the analytics controls, but not the
-      // operation face. Insert before it: exactly after the transfer divider.
-      let section = analytics;
-      for (let i = 0; i < 8 && section.parentElement; i++) {
-        const p = section.parentElement;
-        const text = (p.textContent || '').replace(/\s+/g, ' ').trim();
-        if (
-          /Финансовая аналитика/.test(text) &&
-          /Добавить категорию|Учитывать в аналитике|Категория/.test(text) &&
-          !/Перевод денежных средств/.test(text)
-        ) {
           section = p;
-          break;
         }
-        section = p;
+        if (section.parentElement) {
+          section.parentElement.insertBefore(wrap, section);
+          return;
+        }
       }
-      if (section.parentElement) section.parentElement.insertBefore(wrap, section);
+      root.appendChild(wrap);
     }
 
     function patchSpendingDom(root) {
@@ -2091,9 +2616,132 @@
       return false;
     }
 
+    function isProfileView() {
+      try {
+        const p = (location.pathname + location.hash + location.search).toLowerCase();
+        if (/user.?profile|\/profile|personal|мои.?данные|documents/i.test(p)) return true;
+      } catch (_) { /* ignore */ }
+      const t = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ');
+      return /Мои документы/i.test(t) && (/Паспорт/i.test(t) || /Базовый уровень/i.test(t) || /\bИНН\b/i.test(t));
+    }
+
+    function patchProfileDom(root) {
+      if (!root || !isProfileView()) return;
+      const face = profileFaceName();
+      const docs = mockDocs();
+      if (!face) return;
+      const walker = root.createTreeWalker
+        ? root.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+        : document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        const parent = node.parentElement;
+        if (!parent || parent.closest('input,textarea,[contenteditable="true"]')) continue;
+        const raw = node.textContent || '';
+        const trimmed = raw.trim();
+        if (!trimmed) continue;
+
+        // Full name on profile header: «Инесса Тугова» → forge Имя+Фамилия.
+        if (
+          looksLikePersonTitle(trimmed)
+          && trimmed !== face
+          && trimmed.indexOf('₽') < 0
+          && !/паспорт|инн|базовый|документ|уровень/i.test(trimmed)
+        ) {
+          try {
+            const rect = parent.getBoundingClientRect();
+            if (rect.top >= 0 && rect.top < 420 && trimmed.split(/\s+/).length >= 2) {
+              node.textContent = raw.replace(trimmed, face);
+              continue;
+            }
+          } catch (_) { /* ignore */ }
+        }
+
+        // Passport card: 9219 652102
+        if (/^\d{4}\s+\d{6}$/.test(trimmed) && trimmed !== docs.passport) {
+          const around = ((parent.closest('a,div,li,section,article') || parent).innerText || '');
+          if (/паспорт/i.test(around) || !/\bИНН\b/i.test(around)) {
+            node.textContent = raw.replace(trimmed, docs.passport);
+            continue;
+          }
+        }
+
+        // INN card: 10–12 digits
+        if (/^\d{10,12}$/.test(trimmed.replace(/\s/g, '')) && trimmed.replace(/\s/g, '') !== docs.inn) {
+          const around = ((parent.closest('a,div,li,section,article') || parent).innerText || '');
+          if (/\bИНН\b/i.test(around)) {
+            node.textContent = raw.replace(trimmed, docs.inn);
+          }
+        }
+      }
+
+      // Also rewrite by card blocks if text split across nodes.
+      try {
+        root.querySelectorAll('a,div,li,section,article').forEach((el) => {
+          const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+          if (t.length > 80 || t.length < 8) return;
+          if (/^Паспорт/i.test(t) || /\bПаспорт\b/i.test(t)) {
+            const m = t.match(/\d{4}\s+\d{6}/);
+            if (m && m[0] !== docs.passport) {
+              el.querySelectorAll('*').forEach((child) => {
+                if (child.children.length) return;
+                const ct = (child.textContent || '').trim();
+                if (/^\d{4}\s+\d{6}$/.test(ct)) child.textContent = docs.passport;
+              });
+            }
+          }
+          if (/\bИНН\b/i.test(t)) {
+            el.querySelectorAll('*').forEach((child) => {
+              if (child.children.length) return;
+              const ct = (child.textContent || '').replace(/\s/g, '').trim();
+              if (/^\d{10,12}$/.test(ct) && ct !== docs.inn) child.textContent = docs.inn;
+            });
+          }
+        });
+      } catch (_) { /* ignore */ }
+    }
+
+    function patchChatNameDom(root) {
+      const first = forgeFirstName();
+      if (!first || !root) return;
+      const walker = root.createTreeWalker
+        ? root.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+        : document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        const parent = node.parentElement;
+        if (!parent || parent.closest('input,textarea,[contenteditable="true"]')) continue;
+        const raw = node.textContent || '';
+        const trimmed = raw.trim();
+        if (!raw) continue;
+        // Agent label above bubble («Имя Фамилия») — never touch.
+        if (
+          looksLikePersonTitle(trimmed)
+          && !/Приветств|Здравств|Помощник|Чем могу|тему|вопрос/i.test(raw)
+        ) {
+          continue;
+        }
+        if (!/Инесса|Приветств|Здравств|Помощник|Чем могу/i.test(raw)
+          && !LIVE_CLIENT_FIRST.has(trimmed.toLowerCase())) {
+          continue;
+        }
+        const next = rewriteClientFirstInText(raw);
+        if (next !== raw) node.textContent = next;
+      }
+    }
+
     function patchNameDom(root) {
       if (isHistoryView() || isReceiptView()) return;
-      const first = CONFIG.profile.firstName;
+      if (isChatView()) {
+        patchChatNameDom(root);
+        return;
+      }
+      if (isProfileView()) {
+        patchProfileDom(root);
+        return;
+      }
+      const first = forgeFirstName();
+      if (!first) return;
       const walker = root.createTreeWalker
         ? root.createTreeWalker(root, NodeFilter.SHOW_TEXT)
         : document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
@@ -2107,17 +2755,31 @@
           const rect = parent.getBoundingClientRect();
           if (rect.bottom < 0 || rect.top > 160) continue;
         } catch (_) { continue; }
-        const trimmed = (node.textContent || '').trim();
-        if (looksLikeFirstName(trimmed) && trimmed !== first) {
-          node.textContent = (node.textContent || '').replace(trimmed, first);
+        const raw = node.textContent || '';
+        const trimmed = raw.trim();
+        if (
+          looksLikeFirstName(trimmed)
+          && trimmed !== first
+          && LIVE_CLIENT_FIRST.has(trimmed.toLowerCase())
+        ) {
+          node.textContent = raw.replace(trimmed, first);
+          continue;
+        }
+        // Greeting fragments that leaked into header strips.
+        if (/Приветств|Здравств/i.test(raw)) {
+          const next = rewriteClientFirstInText(raw);
+          if (next !== raw) node.textContent = next;
         }
       }
     }
 
     function paint(root) {
       if (!root) return;
+      showForgeBadge();
+      killNativeStampReceipt();
       walkShadows(root, (r) => {
         patchNameDom(r);
+        patchAccountDom(r);
         if (isOpDetailView()) {
           patchOpDetailDom(r);
           return;
@@ -2204,10 +2866,24 @@
       });
       let pageText = '';
       try { pageText = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 4000); } catch (_) { /* ignore */ }
+      const topChips = [];
+      walkShadows(document, (root) => {
+        try {
+          root.querySelectorAll('button,a,[role="tab"],[role="button"]').forEach((el) => {
+            if (topChips.length >= 24) return;
+            const r = el.getBoundingClientRect();
+            if (r.top < 0 || r.top > 240 || r.height < 20) return;
+            const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+            if (!t || t.length > 80) return;
+            topChips.push({ text: t, top: Math.round(r.top), html: String(el.outerHTML || '').slice(0, 800) });
+          });
+        } catch (_) { /* ignore */ }
+      });
       return {
         scriptVersion: win.__alfaMockRun,
         pageUrl: String(location.href || ''),
         pageText,
+        topChips,
         configuredSpending: CONFIG.spending?.monthTotal,
         historyCount: dump.history.length,
         uniqueIcons: icons.length,
@@ -2276,24 +2952,67 @@
     }
 
     function receiptIndexForOpenView() {
-      const ops = CONFIG.operations || [];
-      const body = (document.body && document.body.innerText) || '';
-      for (let i = 0; i < ops.length; i++) {
-        const title = ops[i] && ops[i].description;
-        if (title && body.indexOf(title) >= 0) return i;
+      return resolveReceiptIndex();
+    }
+
+    function openMockReceipt(preferredIdx) {
+      let idx = preferredIdx;
+      if (idx == null || !pdfBytesForIndex(idx)) idx = resolveReceiptIndex();
+      if (idx == null || !pdfBytesForIndex(idx)) {
+        alert(
+          'В userscript нет вложенного PDF (v' + (win.__alfaMockRun || '?') + ').\n'
+          + 'Пересобери /forge alfa: данные → приложи документ.pdf → дождись «PDF вшито: 1» → замени скрипт → перезапусти Safari.'
+        );
+        return false;
       }
-      return null;
+      showReceiptViewer(idx);
+      return true;
+    }
+
+    function hideNativeGetReceipt(root) {
+      // no-op: card ops need an injected receipt button; do not hide native rows.
+      return;
+    }
+
+    function looksLikeNativeStampReceipt() {
+      if (document.getElementById('alfa-mock-receipt-viewer')) return false;
+      const t = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ');
+      if (!/Перевод по СБП/i.test(t)) return false;
+      return /ИСПОЛНЕНО|Референс|Дата отправки перевода/i.test(t);
+    }
+
+    function killNativeStampReceipt() {
+      if (!looksLikeNativeStampReceipt()) return;
+      if (win.__alfaKillingStamp) return;
+      win.__alfaKillingStamp = true;
+      try {
+        openMockReceipt(resolveReceiptIndex());
+      } finally {
+        setTimeout(() => { win.__alfaKillingStamp = false; }, 1200);
+      }
+    }
+
+    function showForgeBadge() {
+      // removed — was debug-only
+      const old = document.getElementById('alfa-mock-badge');
+      if (old) old.remove();
+    }
+
+    function sharePdfFilename(index) {
+      if (index === 'st' || index === 'statement') return 'Выписка по\u00a0счёту.pdf';
+      return 'документ.pdf';
     }
 
     async function shareOrSavePdf(index) {
       const bytes = pdfBytesForIndex(index);
       if (!bytes) return;
       const blob = new Blob([bytes], { type: 'application/pdf' });
-      const filename = 'Документ.pdf';
+      const filename = sharePdfFilename(index);
       try {
         if (typeof File === 'function' && navigator.share) {
           const file = new File([blob], filename, { type: 'application/pdf' });
-          const shareData = { files: [file], title: 'Квитанция' };
+          // Files only — no title/text, otherwise Telegram sends a second «Квитанция» bubble.
+          const shareData = { files: [file] };
           if (!navigator.canShare || navigator.canShare(shareData)) {
             await navigator.share(shareData);
             return;
@@ -2317,7 +3036,9 @@
     function showReceiptViewer(index) {
       const url = receiptBlobUrl(index);
       if (!url) return;
-      const preview = CONFIG.receipts?.[index]?.previewBase64 || '';
+      const preview = (index === 'st' || index === 'statement')
+        ? (CONFIG.statement && CONFIG.statement.previewBase64) || ''
+        : (CONFIG.receipts?.[index]?.previewBase64 || '');
       const old = document.getElementById('alfa-mock-receipt-viewer');
       if (old) old.remove();
       const host = document.createElement('div');
@@ -2351,10 +3072,12 @@
     }
 
     function isGetReceiptNode(el) {
-      let n = el;
-      for (let i = 0; i < 12 && n && n !== document.body; i++) {
+      if (!el) return false;
+      const start = (el.closest && el.closest('button,a,[role="button"],[data-alfa-mock-action="receipt"]')) || el;
+      let n = start;
+      for (let i = 0; i < 10 && n && n !== document.body; i++) {
         const t = (n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim();
-        if (/получить квитанцию/i.test(t) && t.length < 80) return true;
+        if (/получить квитанцию/i.test(t) && !/выписка по сч/i.test(t) && t.length < 240) return true;
         n = n.parentElement;
       }
       return false;
@@ -2381,42 +3104,60 @@
       win.__alfaReceiptGuard = true;
       let lastOpen = 0;
       const onTap = (ev) => {
-        if (!isReceiptView()) return;
         const t = ev.target;
-        if (isCloseControl(t)) {
-          const a = t.closest && t.closest('a[href]');
-          if (a && /^blob:|\.pdf($|\?)|receipt|квитан/i.test(String(a.href || ''))) {
-            ev.preventDefault();
-            ev.stopImmediatePropagation();
-            try { win.history.back(); } catch (_) { /* ignore */ }
-          }
-          return;
-        }
-        if (isGetReceiptNode(t)) {
-          const idx = receiptIndexForOpenView();
-          const url = idx != null ? receiptBlobUrl(idx) : null;
-          if (!url) return;
+        if (!t) return;
+        // Receipt first — «Получить квитанцию» is never the statement.
+        if (isGetReceiptNode(t) || (t.closest && t.closest('[data-alfa-mock-action="receipt"]'))) {
           const now = Date.now();
           if (now - lastOpen < 900) {
             ev.preventDefault();
             ev.stopPropagation();
+            if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
             return;
           }
           lastOpen = now;
           ev.preventDefault();
-          ev.stopImmediatePropagation();
-          showReceiptViewer(idx);
+          ev.stopPropagation();
+          if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+          openMockReceipt(resolveReceiptIndex());
+          return;
+        }
+        if (isStatementsListView() && isStatementListRow(t)) {
+          const now = Date.now();
+          if (now - lastOpen < 900) {
+            ev.preventDefault();
+            ev.stopPropagation();
+            if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+            return;
+          }
+          lastOpen = now;
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+          openMockStatement();
+          return;
+        }
+        if (!isReceiptView() && !looksLikeNativeStampReceipt()) return;
+        if (isCloseControl(t)) {
+          const a = t.closest && t.closest('a[href]');
+          if (a && /^blob:|\.pdf($|\?)|receipt|квитан/i.test(String(a.href || ''))) {
+            ev.preventDefault();
+            if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+            try { win.history.back(); } catch (_) { /* ignore */ }
+          }
           return;
         }
         const a = t.closest && t.closest('a[href],area[href]');
         if (!a) return;
         const href = String(a.href || '');
-        if (/^blob:|\.pdf($|\?)/i.test(href)) {
+        if (/^blob:|\.pdf($|\?)|documents\/pdf|pdf_viewer|квитан|receipt/i.test(href)) {
           ev.preventDefault();
-          ev.stopPropagation();
+          if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+          openMockReceipt(resolveReceiptIndex());
         }
       };
       document.addEventListener('click', onTap, true);
+      document.addEventListener('touchend', onTap, true);
     }
 
     function startDumpGesture() {
@@ -2480,7 +3221,7 @@
     try {
       const s = document.createElement('script');
       s.textContent = code;
-      s.setAttribute('data-alfa-mock', '1.3.36');
+      s.setAttribute('data-alfa-mock', '1.3.50');
       const host = document.documentElement || document.head;
       if (host) {
         host.appendChild(s);

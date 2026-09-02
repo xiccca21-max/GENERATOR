@@ -41,13 +41,8 @@ def pdf_face_matches_user(
     def _visible(want: str) -> bool:
         if not want:
             return True
-        if want in flat:
-            return True
-        rem = want.translate(_map) if _map else want
-        if rem and rem in flat:
-            return True
-        toks = [t for t in (rem or want).split() if len(t) >= 2]
-        return bool(toks) and all(t in flat for t in toks)
+        # Exact face only — never accept lookalike remaps as «present».
+        return want in flat
 
     for ds in donor_senders:
         if ds and sender and sender != ds and ds in text:
@@ -213,15 +208,24 @@ def prepare_donor_for_orig(
 
 
 def compress_orig_stream(stream: bytes, orig_comp_len: int) -> Optional[bytes]:
-    """Exact OpenPDF flate size only. None on miss — never Length-rebuild."""
+    """Equal-face like SBP: prefer donor flate size, else natural OpenPDF.
+
+    Caller must Length-rebuild when ``len(hit) != orig_comp_len``.
+    """
     from tbank_stealth_v3 import _pad_to_compressed_size
+    from openpdf_deflate import openpdf_deflate
 
     hit = _pad_to_compressed_size(stream, orig_comp_len)
     if hit is not None and len(hit) == orig_comp_len:
         return hit
-    logger.warning(
-        "cs exact flate miss: need=%d — reject (no Length rebuild)", orig_comp_len
-    )
+    for level in (6, 5, 7, 4, 8, 9):
+        nat = openpdf_deflate(bytes(stream), level)
+        if nat:
+            logger.info(
+                "cs equal-face flate %d (donor was %d)", len(nat), orig_comp_len,
+            )
+            return nat
+    logger.warning("cs equal-face flate miss donor=%d", orig_comp_len)
     return None
 
 
@@ -261,6 +265,7 @@ def finalize_orig_result(
     ctx=None,
     stream: Optional[bytes] = None,
     prune: bool = False,
+    channel: str = "",
 ) -> bytes:
     """Финализация orig/donor-orig: metadata, separators, exact size."""
     from tbank_sbp_stealth import (
@@ -280,6 +285,12 @@ def finalize_orig_result(
     result = _fix_stream_separators(result)
     if len(result) != len(before):
         result = before
+    try:
+        from tbank_emit import polish_layout_pdf
+
+        result = polish_layout_pdf(result, channel=channel or "generic")
+    except Exception as exc:
+        logger.warning("T-Bank layout polish skip: %s", exc)
     if preserve_donor and donor_size and not skip_size_pad:
         if len(result) > donor_size:
             return result

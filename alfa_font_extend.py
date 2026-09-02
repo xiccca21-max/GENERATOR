@@ -1247,7 +1247,7 @@ def _copy_glyf_slot(dst_ff2: bytes, src_ff2: bytes, src_cid: int, dst_cid: int) 
         dst["glyf"][dst_name] = simple
         dst["hmtx"].metrics[dst_name] = src_aw_lsb
 
-    return _save_oracle_ttf(dst, template)
+    return _save_oracle_ttf(dst, template, oracle_native=True)
 
 
 def append_alfa_orphan_clone(base_path: str, src_cid: int = 62) -> Optional[str]:
@@ -1559,7 +1559,7 @@ def _install_simple_glyph(
         name = dst_go[dst_cid]
         dst["glyf"][name] = deepcopy(simple)
         dst["hmtx"].metrics[name] = (aw_i, lsb_i)
-    return _save_oracle_ttf(dst, template)
+    return _save_oracle_ttf(dst, template, oracle_native=True)
 
 
 def _pdf_width_from_font_aw(aw_font: int, upem: int) -> int:

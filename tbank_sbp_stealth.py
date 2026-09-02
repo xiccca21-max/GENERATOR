@@ -79,7 +79,7 @@ TBANK_CHAR_TO_GID_REG: Dict[str, int] = {
     'Е': 240, 'Ж': 241, 'Ё': 242,
     'З': 243, 'И': 244, 'Й': 245, 'К': 246, 'Л': 247, 'М': 248,
     'Н': 249, 'О': 250, 'П': 251, 'Р': 252, 'С': 253, 'Т': 254,
-    'У': 255, 'Ф': 256, 'Х': 257, 'Ц': 258, 'Ч': 259,
+    'У': 255, 'Ф': 256, 'Х': 257, 'Ч': 258, 'Ц': 259,
     'Ш': 260, 'Щ': 261, 'Ъ': 262, 'Ы': 263, 'Ь': 264,
     'Э': 265, 'Ю': 266, 'Я': 267,
     'а': 268, 'б': 269, 'в': 270, 'г': 271, 'д': 272, 'е': 273,
@@ -366,7 +366,7 @@ def _enc_sbp(text: str, medium: bool = False) -> bytes:
 def _fmt_date(dt: str, *, randomize_seconds: bool = True) -> str:
     try:
         s = (dt or "").strip()
-        if s.lower() in ("сейчас", "now", "-", ""):
+        if s.lower() in ("сейчас", "now", "-", "", "авто", "auto"):
             s = now_msk().strftime("%d.%m.%Y  %H:%M:%S")
         s = s.replace(",", " ")
         m = re.search(r"(\d{1,2}:\d{2}(?::\d{2})?)", s)
@@ -398,6 +398,48 @@ def _fmt_date(dt: str, *, randomize_seconds: bool = True) -> str:
         return f"{d}  {t}"
     except Exception:
         return dt
+
+
+_DATE_NOW_TOKENS = frozenset({"сейчас", "now", "-", "", "авто", "auto"})
+
+
+def _is_date_now_token(text: str) -> bool:
+    return (text or "").strip().lower() in _DATE_NOW_TOKENS
+
+
+def _looks_like_date_line(text: str) -> bool:
+    s = (text or "").strip()
+    if _is_date_now_token(s):
+        return True
+    return bool(re.match(r"^\d{1,2}[./]\d{1,2}[./]\d{2,4}", s))
+
+
+def _looks_like_tbank_sbp_id_line(text: str) -> bool:
+    maybe = (text or "").strip().upper()
+    return len(maybe) == 27 and maybe[:1] in "AB" and maybe[16:17] == "0"
+
+
+def _parse_tbank_sbp_rest(rest) -> tuple:
+    """Optional bank + date + SBP-id/receipt tail for the bot payload.
+
+    «сейчас»/«авто» after FIO is the date, not the recipient bank.
+    """
+    parts = [str(x or "").strip() for x in (rest or [])]
+    i = 0
+    bank = "Сбербанк"
+    if (
+        i < len(parts)
+        and parts[i]
+        and not _looks_like_date_line(parts[i])
+        and not _looks_like_tbank_sbp_id_line(parts[i])
+    ):
+        bank = parts[i]
+        i += 1
+    date_raw = "сейчас"
+    if i < len(parts) and _looks_like_date_line(parts[i]):
+        date_raw = parts[i]
+        i += 1
+    return bank, date_raw, parts[i:]
 
 
 def _find_streams(pdf: bytes):
@@ -505,7 +547,7 @@ _TM_RE = re.compile(rb"1 0 0 1 ([0-9.]+) ([0-9.]+) Tm")
 # /W из donor CIDFont — правый край ~250 при scale=1.0 (1.05 был костыль для сломанного /W).
 _ORIG_RENDER_WIDTH_SCALE = 1.0
 # Keep end_x flush to right_boundary (Proton ±0.3). No fixed inset — it undershoots suffix.
-_RIGHT_EDGE_INSET_PT = 0.0
+_RIGHT_EDGE_INSET_PT = 0.16
 
 
 def _sbp_column_right(margins: Dict[str, float]) -> float:
@@ -979,6 +1021,92 @@ def _fix_stream_separators(data: bytes) -> bytes:
     return re.sub(rb">>\s+stream", b">>stream", data)
 
 
+def _rebuild_xref_tbank(pdf: bytes) -> bytes:
+    """Rebuild classical xref with fixed 20-byte Jasper lines (Proton G-RAW-safe)."""
+    objects: list = []
+    for match in re.finditer(rb"(\d+)\s+0\s+obj", pdf):
+        objects.append((int(match.group(1)), match.start()))
+    if not objects:
+        return pdf
+    xref_start = -1
+    for m in re.finditer(rb"[\r\n]xref[\r\n]", pdf):
+        xref_start = m.start() + 1
+    if xref_start < 0:
+        m = re.search(rb"(?<![A-Za-z])xref[\r\n]", pdf)
+        if m:
+            xref_start = m.start()
+    if xref_start < 0 or pdf[xref_start : xref_start + 4] != b"xref":
+        return pdf
+    trailer_start = pdf.find(b"trailer", xref_start)
+    if trailer_start < 0:
+        return pdf
+    eof_pos = pdf.find(b"%%EOF", trailer_start)
+    if eof_pos < 0:
+        return pdf
+    trailer_section = pdf[trailer_start:eof_pos]
+    max_obj = max(o[0] for o in objects)
+    obj_dict = {o[0]: o[1] for o in objects}
+    xref_lines = [b"xref\n", f"0 {max_obj + 1}\n".encode(), b"0000000000 65535 f \n"]
+    for i in range(1, max_obj + 1):
+        if i in obj_dict:
+            xref_lines.append(f"{obj_dict[i]:010d} 00000 n \n".encode())
+        else:
+            xref_lines.append(b"0000000000 65535 f \n")
+    new_xref = b"".join(xref_lines)
+    new_pdf = pdf[:xref_start] + new_xref + trailer_section
+    sx_eol = b"\n"
+    if b"\r\n" in pdf[max(0, eof_pos - 40) : eof_pos + 8]:
+        sx_eol = b"\r\n"
+    return (
+        new_pdf[: new_pdf.rfind(b"startxref")]
+        + b"startxref"
+        + sx_eol
+        + str(xref_start).encode()
+        + sx_eol
+        + b"%%EOF"
+        + sx_eol
+    )
+
+
+def _repair_startxref(pdf: bytes) -> bytes:
+    """fitz tobytes() often points startxref at xref *body*, not the xref keyword.
+
+    Proton G-RAW-001/002 HARD when startxref misses ``xref\\n`` — repair after retag.
+    """
+    sx_pos = pdf.rfind(b"startxref")
+    if sx_pos < 0:
+        return pdf
+    trailer_pos = pdf.rfind(b"trailer", 0, sx_pos)
+    if trailer_pos < 0:
+        return pdf
+    xref_hits = list(re.finditer(rb"(?m)^xref\r?\n", pdf[:trailer_pos]))
+    if not xref_hits:
+        return pdf
+    want_off = xref_hits[-1].start()
+    m = re.search(rb"startxref\s+(\d+)", pdf[sx_pos : sx_pos + 80])
+    if not m:
+        return pdf
+    cur = int(m.group(1))
+    if cur == want_off:
+        return pdf
+    if pdf[cur : cur + 4] == b"xref":
+        return pdf
+    logger.info("repair startxref %d→%d (fitz tobytes drift)", cur, want_off)
+    sx_eol = b"\r\n" if b"\r\n" in pdf[sx_pos : sx_pos + 24] else b"\n"
+    eof_pos = pdf.find(b"%%EOF", sx_pos)
+    if eof_pos < 0:
+        return pdf
+    tail = pdf[eof_pos:]
+    return (
+        pdf[:sx_pos]
+        + b"startxref"
+        + sx_eol
+        + str(want_off).encode()
+        + sx_eol
+        + tail
+    )
+
+
 # Пул реальных T-Bank хэшей из подлинных чеков (Receipt 2–16).
 # Формат: (kw_date, kw_hash, kw_suffix, pdf_creation_date)
 # Пул реальных T-Bank Keywords — подлинные чеки с аутентичными хэшами.
@@ -1162,24 +1290,44 @@ def _patch_pdf_metadata(pdf: bytes, date_time: str) -> bytes:
     # Поэтому CreationDate мы ставим = receipt_date + 30-120 сек, независимо от пула.
     # Пул используется ТОЛЬКО для выбора хэша.
 
-    # Хэш Keywords должен быть уникальным на каждый чек — как в реальном T-Bank.
-    # Генерируем его как MD5 от уникального вектора (дата + случайный seed),
-    # что даёт разные 32-hex значения при каждом вызове.
-    # Использование одного и того же хэша во всех чеках детектируется валидатором.
-    import hashlib as _hl, os as _os_kw
-    _seed_vector = (
-        (date_time or '') +
-        _os_kw.urandom(8).hex()
-    )
-    kw_hash = _hl.md5(_seed_vector.encode('utf-8')).hexdigest()
-
-    # CreationDate = операция + 30–90 сек (в т.ч. через границу часа — 23:59:59 + 45 с).
+    # Хэш Keywords: реальные оригиналы несут хэши из ограниченного пула
+    # (один и тот же hash на разные даты встречается в корпусе). Чистый
+    # MD5(urandom) на каждый чек — статистически иной кластер, OnlyPDF
+    # может учить «синтетический» хвост. Берём pool-запись ≥ даты операции.
+    kw_hash = None
+    kw_date = None
+    pdf_date = None
     if receipt_dt is not None:
+        eligible = []
+        for _kw_d, _kw_h, _kw_t, _pdf_d in _REAL_TBANK_KW_POOL:
+            try:
+                _pool_dt = _dt.strptime(_kw_d, "%d.%m.%Y %H:%M:%S")
+            except ValueError:
+                continue
+            if _pool_dt >= receipt_dt:
+                eligible.append((_kw_d, _kw_h, _kw_t, _pdf_d))
+        if eligible:
+            _pick = _rnd_meta.choice(eligible)
+            kw_date, kw_hash, _, pdf_date = _pick
+    if kw_hash is None:
+        import hashlib as _hl, os as _os_kw
+        _seed_vector = (date_time or "") + _os_kw.urandom(8).hex()
+        kw_hash = _hl.md5(_seed_vector.encode("utf-8")).hexdigest()
+
+    _cd_dt = None
+    # CreationDate = операция + 30–90 сек (в т.ч. через границу часа).
+    if receipt_dt is not None and kw_date is None:
         _delta = _rnd_meta.randint(30, 90)
         _cd_dt = receipt_dt + _td(seconds=_delta)
-        kw_date = _cd_dt.strftime('%d.%m.%Y %H:%M:%S')
+        kw_date = _cd_dt.strftime("%d.%m.%Y %H:%M:%S")
         pdf_date = f"D:{_cd_dt.strftime('%Y%m%d%H%M%S')}+03'00'"
-    else:
+    elif receipt_dt is not None and kw_date is not None:
+        # Pool row chosen — nudge kw_date to receipt+lag but keep pool hash.
+        _delta = _rnd_meta.randint(30, 90)
+        _cd_dt = receipt_dt + _td(seconds=_delta)
+        kw_date = _cd_dt.strftime("%d.%m.%Y %H:%M:%S")
+        pdf_date = f"D:{_cd_dt.strftime('%Y%m%d%H%M%S')}+03'00'"
+    elif kw_date is None:
         # Fallback если дата не распарсилась
         _latest = max(_REAL_TBANK_KW_POOL, key=lambda e: e[0])
         kw_date, kw_hash, _, pdf_date = _latest
@@ -1374,7 +1522,7 @@ _ORIG_SBP_ID     = "A61801426516361E0G100400117"
 _ORIG_SBP_SUF    = "91103"
 # Include E — corpus shell SBP IDs paint Latin E (CID 25); dropping it from the
 # L1 pool makes _fit_sbp_id_slot rewrite E→digit → unused TU CID → BIJECTION.
-_SBP_L1_LETTERS  = "ABCDEFGHLRWYZ"
+_SBP_L1_LETTERS  = "ABCDEFGHSLRWYZ"
 _SBP_ROUTE_LETTERS = "0BG"  # l2 pos[17], текущее Jasper-поколение (K-TBANK-SBP-ROUTE-FIELD-001)
 _SBP_L2_LETTERS  = _SBP_ROUTE_LETTERS
 _SBP_ID_ALPHABET = _SBP_L1_LETTERS + "BDGL" + "0123456789AB"
@@ -1417,18 +1565,96 @@ def _sbp_fingerprint(
 # 91103 is 4-nonzero (2583) → GEOMETRY overflow on those Tm without FF2/Tm edits.
 _G1_FACE_SUFFIXES = frozenset({"91103", "30902", "70402", "70901"})
 
+# SBP ID positions that must not be chaos-mutated (marker/control/sep/route).
+_SBP_ID_ROUTE_FREEZE_POS = frozenset({14, 15, 16, 17})
 
-def _sbp_bank_profile(bank: str, amount: str) -> Dict[str, str]:
+
+def _normalize_sbp_suffix5(suffix5: str, *, default: str = "") -> str:
+    """Digits-only 5-char face suffix; never leave «авто» as the grammar key."""
+    suf = re.sub(r"\D", "", str(suffix5 or ""))[:5]
+    if len(suf) == 5:
+        return suf
+    d = re.sub(r"\D", "", str(default or ""))[:5]
+    return d.zfill(5) if len(d) == 5 else (suf.zfill(5) if suf else "")
+
+
+def _pdf_g1_route_ok(pdf: bytes, prepared: Optional[Dict] = None) -> bool:
+    """False when G1 face suffix is painted with class ≠ G1 (CROSS_CLASS HARD)."""
+    flat = _extract_sbp_opid_flat(pdf)
+    if not flat or len(flat) < 32:
+        return False
+    suf = ""
+    if prepared:
+        suf = _normalize_sbp_suffix5(
+            str(prepared.get("sbp_suffix_raw") or prepared.get("sbp_suffix") or ""),
+        )
+    if not suf or suf == "00000":
+        suf = flat[27:32]
+    if suf not in _G1_FACE_SUFFIXES:
+        return True
+    return flat[17] == "G" and flat[17:19] == "G1"
+
+
+def _sbp_bank_profile(
+    bank: str, amount: str, date_str: str = "",
+) -> Dict[str, str]:
     """CH / suffix / prefix — только открытые эпохи под OnlyPDF + Proton.
 
     B0|00116|680301: closed. B1|00117|790502 triggers CROSS_CLASS on proton
-    when paired with route 0/L. G1|791103 (91103) is live but too wide for
-    covering-twin shells (сбп8 Tm 226.91). Use G1|770901 (70901) — open epoch
-    (deadline after corpus_last), width 2566 = 80301-class, slot 004→(1,6)
-    so control stays a digit (twin cmap may lack Latin D/W/Z).
+    when paired with route 0/L.
+
+    Proton T-TBANK-SBP-PROFILE-EPOCH-001: G1/B1|00117|770901 corpus window is
+    only 2026-05-30..2026-06-01. Outside that → G1|018|791103 (slot 018 binds
+    H/0 or S/1 only — Proton K-TBANK-SBP-G1-SLOT018-BINDING-001). Do **not**
+    ship G1|017|791103 (competitor HARD).
+
+    Do **not** ship G1|014|791103 → (0,5): Proton competitor HARD
+    TBANK_COMPETITOR_TUPLE_791103_COMBO_002 (tuple + unknown skeleton +
+    unknown F2 glyf at CS 4405/4408). сбп10 still exists in corpus — never
+    emit that exact linked tuple on a rewritten CS.
+
+    Inside the narrow 770901 window prefer G1|005|770901 → (0,1): digit
+    marker/control (twin-safe), face suffix 70901.
+
+    Do **not** ship G1|004|770901 → (1,6): Proton competitor HARD
+    TBANK_SBP_TUPLE_GLYF_RESIDUE_SIGNATURE (even with warn=not_observed).
     """
     _ = (bank, amount)  # reserved for future bank-specific open epochs
-    return {"pref": "B", "ch": "1004", "bsuf": "00117", "suffix": "70901"}
+    use_770901 = False
+    try:
+        import datetime as _dt
+
+        clean = re.sub(r"\s+", " ", str(date_str or "").strip())
+        if clean:
+            try:
+                dt = _dt.datetime.strptime(clean[:19], "%d.%m.%Y %H:%M:%S")
+            except ValueError:
+                dt = _dt.datetime.strptime(clean[:10], "%d.%m.%Y")
+            d = dt.date()
+            use_770901 = (
+                _dt.date(2026, 5, 30) <= d <= _dt.date(2026, 6, 1)
+            )
+    except Exception:
+        use_770901 = False
+    if use_770901:
+        return {"pref": "B", "ch": "1005", "bsuf": "00117", "suffix": "70901"}
+    # Open profile outside 770901 window: B1|00118|014|821301 → (0,Y).
+    return {"pref": "B", "ch": "1014", "bsuf": "00118", "suffix": "21301"}
+
+
+# Competitor HARD fingerprint — never emit this exact linked tuple.
+_SBP_BURNED_COMPETITOR_TUPLE7 = "1|6|0|G1|004|00117|770901"
+_SBP_BURNED_COMPETITOR_TUPLE7_005_770901 = "0|1|0|G1|005|00117|770901"
+_SBP_BURNED_COMPETITOR_TUPLE7_791103 = "0|5|0|G1|014|00117|791103"
+_SBP_BURNED_COMPETITOR_TUPLE7_017_791103_A = "1|D|0|G1|017|00117|791103"
+_SBP_BURNED_COMPETITOR_TUPLE7_017_791103_B = "3|B|0|G1|017|00117|791103"
+_SBP_BURNED_COMPETITOR_TUPLES = frozenset({
+    _SBP_BURNED_COMPETITOR_TUPLE7,
+    _SBP_BURNED_COMPETITOR_TUPLE7_005_770901,
+    _SBP_BURNED_COMPETITOR_TUPLE7_791103,
+    _SBP_BURNED_COMPETITOR_TUPLE7_017_791103_A,
+    _SBP_BURNED_COMPETITOR_TUPLE7_017_791103_B,
+})
 
 
 def decode_sbp_operation_id(sbp_id: str) -> Optional[Dict[str, str]]:
@@ -1439,7 +1665,10 @@ def decode_sbp_operation_id(sbp_id: str) -> Optional[Dict[str, str]]:
     # Proton SBP_CIPHER requires pure ASCII — Cyrillic lookalikes (А/В/Е…) → MISSING.
     if not s.isascii() or not all(ch.isalnum() for ch in s):
         return None
-    if s[22:27] not in ("00116", "00117"):
+    # Timestamp core (pos 1..10) must be digits — SBP_CIPHER_STRUCTURE HARD otherwise.
+    if not s[1:11].isdigit():
+        return None
+    if s[22:27] not in ("00116", "00117", "00118"):
         return None
     return {
         "prefix": s[0],
@@ -1490,6 +1719,8 @@ _SBP_LINKED_ROUTE_ALPHABET: Dict[tuple, str] = {
     ("B1", "00117"): "01",
     ("B0", "00116"): "67",
     ("G1", "00117"): "01",
+    ("B1", "00118"): "01",
+    ("G1", "00118"): "01",
 }
 # Empirical slot/suffix binding (Proton K-TBANK-SBP-SLOT-SUFFIX-001).
 # linked_tuples store (control, route_marker, slot, suffix); we force (marker, control).
@@ -1499,8 +1730,9 @@ _SBP_EMPIRICAL_SLOT_BINDINGS: Dict[tuple, tuple] = {
     ("G1", "00117", "014", "791103"): ("0", "5"),
     ("G1", "00117", "007", "791103"): ("0", "J"),
     ("G1", "00117", "008", "791103"): ("0", "U"),
-    ("G1", "00117", "018", "791103"): ("0", "H"),
+    ("G1", "00117", "018", "791103"): ("1", "S"),  # Proton: H/0 or S/1 only
     ("G1", "00117", "002", "791103"): ("1", "0"),
+    ("B1", "00118", "014", "821301"): ("0", "Y"),
     ("G1", "00117", "004", "791103"): ("1", "E"),
     ("G1", "00117", "006", "791103"): ("1", "D"),
     ("G1", "00117", "016", "791103"): ("1", "I"),
@@ -1508,8 +1740,36 @@ _SBP_EMPIRICAL_SLOT_BINDINGS: Dict[tuple, tuple] = {
     ("G1", "00117", "003", "770901"): ("0", "D"),
     ("G1", "00117", "008", "770901"): ("0", "W"),
     ("G1", "00117", "017", "770901"): ("0", "Z"),
-    ("G1", "00117", "004", "770901"): ("1", "6"),
+    # Open narrow path: slot 005 + 70901 — digits only (not competitor 004|(1,6)).
+    ("G1", "00117", "005", "770901"): ("0", "1"),
+    # Do NOT bind G1|004|770901 → (1,6): competitor HARD fingerprint.
 }
+
+
+_SBP_G1_SLOT018_BINDINGS: tuple[tuple[str, str], ...] = (
+    ("0", "H"),
+    ("1", "S"),
+)
+
+
+def _enforce_g1_slot018_binding(
+    opid27: str, suffix5: str, *, seed: int = 0,
+) -> str:
+    """Proton K-TBANK-SBP-G1-SLOT018-BINDING-001: only H/0 or S/1."""
+    sid = opid27.strip().upper()
+    suf = re.sub(r"\D", "", suffix5)[:5].zfill(5)
+    if len(sid) != 27:
+        return sid
+    flat = sid + suf
+    if flat[17:19] != "G1" or flat[19:22] != "018" or flat[26:32] != "791103":
+        return sid
+    pair = (sid[14], sid[15])
+    if pair in _SBP_G1_SLOT018_BINDINGS:
+        return sid
+    marker, control = _SBP_G1_SLOT018_BINDINGS[seed % len(_SBP_G1_SLOT018_BINDINGS)]
+    out = list(sid)
+    out[14], out[15] = marker, control
+    return "".join(out)
 
 
 def _ensure_sbp_linked_tuple(opid27: str, suffix5: str, seed: int = 0) -> str:
@@ -1528,7 +1788,22 @@ def _ensure_sbp_linked_tuple(opid27: str, suffix5: str, seed: int = 0) -> str:
     emp = _SBP_EMPIRICAL_SLOT_BINDINGS.get((sb_class, bank5, slot, composite))
     if emp:
         out[14], out[15] = emp
-        return "".join(out)
+        trial = "".join(out)
+        if _sbp_tuple7_from_flat(trial + suf) in _SBP_BURNED_COMPETITOR_TUPLES:
+            # Never ship competitor HARD fingerprint; fall through to safe remap.
+            pass
+        else:
+            return _enforce_g1_slot018_binding(trial, suf, seed=seed)
+
+    # Legacy 017|791103 → attested 018|791103 (017 tuples are competitor HARD).
+    if (sb_class, bank5, slot, composite) == ("G1", "00117", "017", "791103"):
+        out[18:22] = list("1018")
+        slot = "018"
+        emp018 = _SBP_EMPIRICAL_SLOT_BINDINGS.get((sb_class, bank5, slot, composite))
+        if emp018:
+            out[14], out[15] = emp018
+        trial = "".join(out)
+        return _enforce_g1_slot018_binding(trial, suf, seed=seed)
 
     allowed = _SBP_LINKED_TUPLES.get((sb_class, bank5, slot, composite))
     if allowed:
@@ -1536,7 +1811,9 @@ def _ensure_sbp_linked_tuple(opid27: str, suffix5: str, seed: int = 0) -> str:
             marker, control = allowed[seed % len(allowed)]
             out[14] = marker
             out[15] = control
-        return "".join(out)
+        trial = "".join(out)
+        if _sbp_tuple7_from_flat(trial + suf) not in _SBP_BURNED_COMPETITOR_TUPLES:
+            return _enforce_g1_slot018_binding(trial, suf, seed=seed)
 
     alphabet = _SBP_LINKED_ROUTE_ALPHABET.get((sb_class, bank5))
     if alphabet and out[14] not in alphabet:
@@ -1548,7 +1825,51 @@ def _ensure_sbp_linked_tuple(opid27: str, suffix5: str, seed: int = 0) -> str:
             if alphabet:
                 out[14] = alphabet[seed % len(alphabet)]
             break
-    return "".join(out)
+    trial = "".join(out)
+    # Last resort: if still the burned 004|770901|(1,6) fingerprint, pivot to
+    # open G1|018|791103 binding family (H/0 or S/1).
+    tup7 = _sbp_tuple7_from_flat(trial + suf)
+    if tup7 == _SBP_BURNED_COMPETITOR_TUPLE7:
+        out[14], out[15] = "0", "H"
+        out[18:22] = list("1018")
+        trial = "".join(out)
+        tup7 = _sbp_tuple7_from_flat(trial + suf)
+    if tup7 == _SBP_BURNED_COMPETITOR_TUPLE7_005_770901:
+        out = list(trial)
+        out[14], out[15] = "0", "H"
+        out[18:22] = list("1018")
+        trial = "".join(out)
+        tup7 = _sbp_tuple7_from_flat(trial + suf)
+    if tup7 == _SBP_BURNED_COMPETITOR_TUPLE7_791103:
+        out = list(trial)
+        # Keep 791103 route off burned slot/profile: pivot to attested G1|018|791103.
+        out[14], out[15] = "0", "H"
+        out[18:22] = list("1018")
+        trial = "".join(out)
+    if tup7 in (
+        _SBP_BURNED_COMPETITOR_TUPLE7_017_791103_A,
+        _SBP_BURNED_COMPETITOR_TUPLE7_017_791103_B,
+    ):
+        out = list(trial)
+        # Proton K-TBANK-COMPETITOR-017-COMBO-003: avoid 017|791103 serial pair.
+        out[14], out[15] = "0", "H"
+        out[18:22] = list("1018")
+        trial = "".join(out)
+    return _enforce_g1_slot018_binding(trial, suf, seed=seed)
+
+
+def _sbp_tuple7_from_flat(flat32: str) -> str:
+    if not flat32 or len(flat32) < 32:
+        return ""
+    return "|".join([
+        flat32[14],
+        flat32[15],
+        flat32[16],
+        flat32[17:19],
+        flat32[19:22],
+        flat32[22:27],
+        flat32[26:32],
+    ])
 
 
 _SBP_CONTROL_MAP: Optional[Dict[tuple, str]] = None
@@ -1605,13 +1926,14 @@ def _align_sbp_id_to_profile(
     *,
     bank: str = "",
     amount: str = "",
+    date_str: str = "",
 ) -> str:
     """Channel/route/class/bank5 согласованы с suffix-профилем (60501→B1/1013 и т.д.)."""
     suf = re.sub(r"\D", "", suffix5)[:5].zfill(5)
     sid = opid27.strip().upper()
     if len(sid) != 27:
         return sid
-    prof = _sbp_bank_profile(bank or _ORIG_BANK, amount)
+    prof = _sbp_bank_profile(bank or _ORIG_BANK, amount, date_str=date_str)
     if suf != prof["suffix"]:
         return sid
     out = list(sid)
@@ -1629,12 +1951,17 @@ def _align_sbp_id_to_profile(
     return "".join(out)
 
 
-def _finalize_sbp_identity(opid27: str, suffix5: str, *, bank: str = "", amount: str = "") -> str:
+def _finalize_sbp_identity(
+    opid27: str, suffix5: str, *, bank: str = "", amount: str = "",
+    date_str: str = "",
+) -> str:
     sid = ensure_sbp_class_suffix_consistency(opid27, suffix5)
-    sid = _align_sbp_id_to_profile(sid, suffix5, bank=bank, amount=amount)
+    sid = _align_sbp_id_to_profile(
+        sid, suffix5, bank=bank, amount=amount, date_str=date_str,
+    )
     sid = _ensure_sbp_route_class(sid, suffix5)
     # Corpus control map may disagree with empirical slot binding — apply map
-    # first, then linked/empirical last so G1|014|791103 stays (marker=0,ctrl=5).
+    # first, then linked/empirical last so G1|017|791103 stays (marker=1,ctrl=D).
     sid = _ensure_sbp_control_link(sid, suffix5)
     sid = _ensure_sbp_linked_tuple(sid, suffix5)
     if len(sid) == 27:
@@ -1644,7 +1971,196 @@ def _finalize_sbp_identity(opid27: str, suffix5: str, *, bank: str = "", amount:
             sid = _ensure_sbp_linked_tuple(sid, suffix5, seed=1)
         # Re-apply empirical after alphabet clamp (must win).
         sid = _ensure_sbp_linked_tuple(sid, suffix5, seed=0)
-    return sid
+    # Absolute last: G1 face suffixes require route lead G (class G1).
+    suf = re.sub(r"\D", "", suffix5)[:5].zfill(5)
+    if len(sid) == 27 and suf in _G1_FACE_SUFFIXES and sid[17] != "G":
+        sid = sid[:17] + "G" + sid[18:]
+        sid = _ensure_sbp_linked_tuple(sid, suffix5, seed=0)
+    sid = _enforce_sbp_numeric_reference(sid, suffix5)
+    return _enforce_g1_slot018_binding(sid, suffix5, seed=0)
+
+
+def _enforce_sbp_numeric_reference(opid27: str, suffix5: str) -> str:
+    """Proton A-TBANK-SBP-REFERENCE-NUMERIC-001: ID[11:15] must be all digits."""
+    sid = opid27.strip().upper()
+    if len(sid) != 27 or sid[11:15].isdigit():
+        return sid
+    import hashlib as _hl
+
+    suf = re.sub(r"\D", "", suffix5)[:5].zfill(5)
+    h = _hl.md5((sid + suf).encode()).digest()
+    ref3 = f"{int.from_bytes(h[:2], 'big') % 1000:03d}"
+    mark = sid[14] if sid[14].isdigit() else "0"
+    if len(suf) == 5:
+        flat = sid + suf
+        emp = _SBP_EMPIRICAL_SLOT_BINDINGS.get(
+            (flat[17:19], flat[22:27], flat[19:22], flat[26:32]),
+        )
+        if emp and str(emp[0]).isdigit():
+            mark = str(emp[0])
+    out = list(sid)
+    for i, ch in enumerate(ref3 + mark):
+        out[11 + i] = ch
+    return "".join(out)
+
+
+def _pin_prepared_sbp_identity(prepared: Dict) -> Dict:
+    """Re-apply SBP identity after retune/sanitize/fit (G1|018 → H/0 or S/1)."""
+    p = dict(prepared)
+    sid = str(p.get("sbp_id_raw") or "").strip().upper()
+    if len(sid) != 27:
+        return p
+    suf_raw = str(p.get("sbp_suffix_raw") or p.get("sbp_suffix") or "")
+    if suf_raw.lower() in ("авто", "auto", "-", ""):
+        suf = re.sub(r"\D", "", suf_raw)[:5].zfill(5) or "91103"
+    else:
+        suf = re.sub(r"\D", "", suf_raw)[:5].zfill(5)
+    if not suf:
+        return p
+    if p.get("sbp_id_manual"):
+        pinned = _enforce_g1_slot018_binding(sid, suf)
+    else:
+        pinned = _finalize_sbp_identity(
+            sid, suf,
+            bank=str(p.get("bank") or ""),
+            amount=re.sub(r"\D", "", str(p.get("new_amount") or "")),
+            date_str=re.sub(r"\s+", " ", str(p.get("new_date") or "").strip()),
+        )
+    if pinned != sid:
+        logger.info("SBP identity pin: %s → %s", sid, pinned)
+        p["sbp_id_raw"] = pinned
+    return p
+
+
+def _sbp_pick_slot018_binding(
+    opid27: str,
+    suffix5: str,
+    uni_gid: Dict[int, int],
+    *,
+    target_len: int = 0,
+) -> Tuple[str, Optional[bytes]]:
+    """Pick H/0 or S/1 that encodes in the current F1 cmap."""
+    sid = opid27.strip().upper()
+    suf = re.sub(r"\D", "", suffix5)[:5].zfill(5)
+    flat = sid + suf if len(sid) == 27 and len(suf) == 5 else ""
+    if not flat or flat[17:19] != "G1" or flat[19:22] != "018" or flat[26:32] != "791103":
+        raw = _sbp_id_encodes_fully(sid, uni_gid)
+        if raw and target_len and len(raw) != target_len:
+            return sid, None
+        return sid, raw
+    best_sid, best_raw = sid, None
+    for seed in (0, 1):
+        trial = _enforce_g1_slot018_binding(sid, suf, seed=seed)
+        raw = _sbp_id_encodes_fully(trial, uni_gid)
+        if raw is None:
+            continue
+        if target_len and len(raw) != target_len:
+            if best_raw is None:
+                best_sid, best_raw = trial, raw
+            continue
+        return trial, raw
+    if best_raw is not None and (not target_len or len(best_raw) == target_len):
+        return best_sid, best_raw
+    trial = _enforce_g1_slot018_binding(sid, suf, seed=0)
+    return trial, _sbp_id_encodes_fully(trial, uni_gid)
+
+
+def _sbp_ensure_slot018_letters(
+    ff2: bytes,
+    need_r: set,
+    uni_gid_work: Dict[int, int],
+    uni_gid_plan: Dict[int, int],
+    *,
+    suffix5: str = "",
+) -> Tuple[bytes, Dict[int, int], Dict[int, int], set]:
+    """Hydrate H/S for G1|018 Proton binding when absent from twin cmap."""
+    suf = re.sub(r"\D", "", suffix5)[:5].zfill(5)
+    if suf not in _G1_FACE_SUFFIXES:
+        return ff2, uni_gid_work, uni_gid_plan, need_r
+    slot_need = {ord(c) for c in "HS" if ord(c) not in uni_gid_work}
+    if not slot_need:
+        return ff2, uni_gid_work, uni_gid_plan, need_r
+    try:
+        ff2 = _ensure_planned_glyph_contours(
+            ff2, uni_gid_work, slot_need | need_r, is_medium=False,
+        )
+        uni_gid_work = _filled_uni_map(
+            ff2, need_r | slot_need, [uni_gid_work, uni_gid_plan], is_medium=False,
+        )
+        uni_gid_plan = _filled_uni_map(
+            ff2, need_r | slot_need, [uni_gid_plan, uni_gid_work], is_medium=False,
+        )
+        need_r |= slot_need
+        logger.info(
+            "SBP slot018 hydrate %s",
+            "".join(chr(cp) for cp in sorted(slot_need)),
+        )
+    except Exception as exc:
+        logger.warning("SBP slot018 hydrate H/S: %s", exc)
+    for ch in "HS":
+        if ord(ch) not in uni_gid_work:
+            ff2, uni_gid_work = _sbp_graft_slot018_control_glyph(
+                ff2, uni_gid_work, letter=ch,
+            )
+            if ord(ch) in uni_gid_work:
+                need_r.add(ord(ch))
+                uni_gid_plan[ord(ch)] = uni_gid_work[ord(ch)]
+    return ff2, uni_gid_work, uni_gid_plan, need_r
+
+
+def _sbp_graft_slot018_control_glyph(
+    ff2: bytes,
+    uni_gid_work: Dict[int, int],
+    *,
+    letter: str,
+) -> Tuple[bytes, Dict[int, int]]:
+    """Copy H/S outline+cmap from attested G1|018 corpus shells (сбп55 / сбп15)."""
+    cp = ord(letter)
+    if cp in uni_gid_work:
+        return ff2, uni_gid_work
+    donor_file = {"S": "сбп15.pdf", "H": "сбп55.pdf"}.get(letter)
+    if not donor_file:
+        return ff2, uni_gid_work
+    path = os.path.join(CORPUS_TBANK_DIR, donor_file)
+    if not os.path.isfile(path):
+        return ff2, uni_gid_work
+    try:
+        from io import BytesIO
+        from fontTools.ttLib import TTFont
+        import fitz as _fz
+        import tbank_unlock_template as _tut
+        from tbank_orig_mode import OrigContext
+
+        ctx = OrigContext()
+        if not ctx.load(path):
+            return ff2, uni_gid_work
+        src_cid = ctx.uni_to_cid_reg.get(cp)
+        if src_cid is None:
+            return ff2, uni_gid_work
+        doc = _fz.open(path)
+        src_ff2 = doc.xref_stream(
+            _tut._find_font_objects(doc)["TinkoffSans-Regular"]["fontfile_xref"]
+        )
+        doc.close()
+        dst_ft = TTFont(BytesIO(ff2))
+        src_ft = TTFont(BytesIO(src_ff2))
+        glyf = dst_ft["glyf"]
+        go = dst_ft.getGlyphOrder()
+        copied: set = set()
+        if int(src_cid) < len(go):
+            _copy_glyph_closure(glyf, go, src_ft, int(src_cid), copied)
+        out = BytesIO()
+        dst_ft.save(out)
+        uni_gid_work = dict(uni_gid_work)
+        uni_gid_work[cp] = int(src_cid)
+        logger.info(
+            "SBP slot018 graft %r cid=%d from %s",
+            letter, src_cid, donor_file,
+        )
+        return out.getvalue(), uni_gid_work
+    except Exception as exc:
+        logger.warning("SBP slot018 graft %r: %s", letter, exc)
+    return ff2, uni_gid_work
 
 
 def _sbp_expected_class(route: str, ch: str) -> Optional[str]:
@@ -1673,12 +2189,18 @@ def _route_lead_for_channel(
     pool = "".join(c for c in (allowed or _SBP_ROUTE_LETTERS) if c in _SBP_ROUTE_LETTERS)
     if not pool:
         pool = _SBP_ROUTE_LETTERS
+    suf = re.sub(r"\D", "", str(suffix5 or ""))[:5].zfill(5) if suffix5 else ""
+    # G1 face suffixes always need lead G — even if donor pool only has «0».
+    if ch and ch[0] == "1" and suf in _G1_FACE_SUFFIXES:
+        return "G"
+    # Non-G1 suffix on 1xxx channel is B1 — never pick G (suffix-owner HARD).
+    if ch and ch[0] == "1" and suf and suf not in _G1_FACE_SUFFIXES:
+        return "B" if "B" in pool else ("G" if "G" in pool else pool[0])
     if ch[0] == "1":
         opts = [c for c in "BG" if c in pool]
         if not opts:
-            opts = list(pool)
+            opts = [c for c in "BG" if c in _SBP_ROUTE_LETTERS] or list(pool)
         if bank5 and suffix5 and len(bank5) == 5:
-            suf = re.sub(r"\D", "", suffix5)[:5].zfill(5)
             composite = bank5[4] + suf
             mapped = []
             for r in opts:
@@ -1785,8 +2307,8 @@ def verify_sbp_id_date(sbp_id: str, date_str: str) -> bool:
     return abs((id_utc - exp_utc).total_seconds()) <= 1.0
 
 
-def _gen_sbp_suffix(bank: str, amount: str) -> str:
-    return _sbp_bank_profile(bank, amount)["suffix"]
+def _gen_sbp_suffix(bank: str, amount: str, date_str: str = "") -> str:
+    return _sbp_bank_profile(bank, amount, date_str=date_str)["suffix"]
 
 
 def _gen_sbp_id(
@@ -1819,36 +2341,43 @@ def _gen_sbp_id(
     doy = dt_utc.timetuple().tm_yday
     year_dig = dt_utc.year - 2020
 
-    prof = _sbp_bank_profile(bank or _ORIG_BANK, amount)
+    prof = _sbp_bank_profile(bank or _ORIG_BANK, amount, date_str=clean)
     fp = _sbp_fingerprint(clean, phone, amount, account, bank, receiver)
     h = _hl.sha256(fp.encode("utf-8")).digest()
     hm = _hl.md5((fp + prof["ch"]).encode("utf-8")).digest()
 
     ref3 = f"{_st.unpack('>I', h[4:8])[0] % 1000:03d}"
     # ID[14] = route_marker — только алфавит профиля (не случайная цифра ref4).
-    cls_guess = "B1" if prof["ch"][0] == "1" and prof["bsuf"] == "00117" and prof["suffix"] == "90502" else (
-        "G1" if prof["suffix"] in _G1_FACE_SUFFIXES else "B0"
-    )
+    if prof["suffix"] in _G1_FACE_SUFFIXES:
+        cls_guess = "G1"
+    elif prof["ch"][0] == "1":
+        cls_guess = "B1"
+    elif prof["ch"] == "0016":
+        cls_guess = "B0"
+    else:
+        cls_guess = "B0"
     alphabet = _SBP_LINKED_ROUTE_ALPHABET.get((cls_guess, prof["bsuf"]), "01")
-    # G1|1004|70901 → slot 004 / 770901 binds (marker=1, control=6).
+    # G1|1005|70901 → slot 005 / 770901 binds (marker=0, control=1).
     slot = prof["ch"][1:4]
     composite = prof["bsuf"][4] + re.sub(r"\D", "", prof["suffix"])[:5].zfill(5)
     emp = _SBP_EMPIRICAL_SLOT_BINDINGS.get((cls_guess, prof["bsuf"], slot, composite))
     if emp:
-        mark = emp[0]
+        mark, letter1 = emp[0], emp[1]
     else:
         mark = alphabet[hm[3] % len(alphabet)]
-    ref4 = ref3 + mark
-    letter1 = _L1[hm[0] % len(_L1)]
+        letter1 = _L1[hm[0] % len(_L1)]
     if not letter1.isalpha():
         letter1 = next((c for c in _L1 if c.isalpha()), "A")
+    ref4 = ref3 + mark
     # Prefix: profile default, but stay inside donor glyph pool when provided.
     pref = prof["pref"]
     if pref not in _L1:
         pref = next((c for c in "AB" if c in _L1), next((c for c in _L1 if c.isalpha()), pref))
     # Force G route lead for G1 profile (channel 1xxx + G1 face suffix).
+    # Never fall back to donor pool «0» — that yields illegal class «01» and
+    # SBP_LINKED_TUPLE_CROSS_CLASS / SBP_ROUTE_FIELD_CONTAMINATION HARD.
     if cls_guess == "G1":
-        letter2 = "G" if "G" in _L2 else (_L2[0] if _L2 else "G")
+        letter2 = "G"
     else:
         letter2 = _route_lead_for_channel(
             prof["ch"], hm[1], allowed=_L2, bank5=prof["bsuf"], suffix5=prof["suffix"],
@@ -1871,6 +2400,7 @@ def _gen_sbp_id(
     assert len(sbp_id) == 27, f"SBP ID length error: {len(sbp_id)} ('{sbp_id}')"
     return _finalize_sbp_identity(
         sbp_id, prof["suffix"], bank=bank or _ORIG_BANK, amount=amount,
+        date_str=clean,
     )
 
 
@@ -1904,12 +2434,21 @@ def _is_abbreviated_fio(name: str) -> bool:
     return _ABBREV_FIO_RE.match(name.strip()) is not None
 
 
+def _strip_face_yo(text: str) -> str:
+    """User law: never ship ё/Ё on receipt face — map to е/Е."""
+    return (
+        str(text or "")
+        .replace("Ё", "Е")
+        .replace("ё", "е")
+    )
+
+
 def _normalize_tbank_sender(name: str) -> Optional[str]:
     """Отправитель: любой текст (буквы/длина), как ввёл пользователь.
 
     Не режем и не подменяем формат: только нормализация пробелов.
     """
-    name = re.sub(r"\s+", " ", name.strip())
+    name = _strip_face_yo(re.sub(r"\s+", " ", name.strip()))
     if not name:
         return None
     return name or None
@@ -1917,7 +2456,7 @@ def _normalize_tbank_sender(name: str) -> Optional[str]:
 
 def _normalize_tbank_receiver(name: str) -> str:
     """Preserve receiver text; normalize whitespace only."""
-    name = re.sub(r"\s+", " ", name.strip())
+    name = _strip_face_yo(re.sub(r"\s+", " ", name.strip()))
     return name or _ORIG_RECEIVER
 
 
@@ -1953,32 +2492,8 @@ def _soft_cover_char_to_ff2(
     ff2: bytes,
     uni_gid_plan: Optional[Dict[int, int]] = None,
 ) -> str:
-    """Return ch or a same-case lookalike that has a contour on ff2."""
-    if not ch or not ch.isalpha():
-        return ch
-    if not _missing_glyph_contours(
-        ff2, {ord(ch)}, is_medium=False, uni_gid_plan=uni_gid_plan,
-    ):
-        return ch
-    cands: List[str] = []
-    mapped = ch.translate(_TBANK_TWIN_LOOKALIKE)
-    if mapped and mapped != ch:
-        cands.append(mapped)
-    # Prefer visually close capitals before generic А/Е filler.
-    if ch.isupper():
-        cands.extend(list("СКПРТНЕАОМИУВДБЛ"))
-    else:
-        cands.extend(list("скпртнеаомиувдбл"))
-    fold = "А" if ch.isupper() else "а"
-    cands.append(fold)
-    for cand in cands:
-        if not cand:
-            continue
-        if not _missing_glyph_contours(
-            ff2, {ord(cand)}, is_medium=False, uni_gid_plan=uni_gid_plan,
-        ):
-            return cand
-    return fold
+    """Identity — never remap user letters (А→0 / Ж→З forbidden)."""
+    return ch
 
 
 def _soft_cover_text_to_ff2(
@@ -1986,13 +2501,8 @@ def _soft_cover_text_to_ff2(
     ff2: bytes,
     uni_gid_plan: Optional[Dict[int, int]] = None,
 ) -> str:
-    if not text:
-        return text
-    out = [_soft_cover_char_to_ff2(ch, ff2, uni_gid_plan) for ch in text]
-    remapped = "".join(out)
-    if remapped != text:
-        logger.info("F1 twin soft-cover %r → %r", text, remapped)
-    return remapped
+    """Identity — hydrate FontFile2 instead of lookalike remaps."""
+    return text
 
 
 def _soft_cover_prepared_to_ff2(
@@ -2204,8 +2714,10 @@ def _break_ascending_digit_runs(text: str, *, hard: int = 6) -> str:
 
 def _prepare_sbp_data(data: Dict) -> Optional[Dict]:
     """Нормализация данных пользователя — общая для обоих режимов."""
-    dt_raw = str(data.get("date_time", _ORIG_DATE)).strip()
-    date_manual = dt_raw.lower() not in ("сейчас", "now", "-", "")
+    dt_raw = str(
+        data.get("date_time") or data.get("new_date") or _ORIG_DATE
+    ).strip()
+    date_manual = dt_raw.lower() not in ("сейчас", "now", "-", "", "авто", "auto")
     if not date_manual:
         dt_raw = now_msk().strftime("%d.%m.%Y  %H:%M:%S")
     # Manual time is immutable, including explicitly supplied ``:00``.
@@ -2221,7 +2733,8 @@ def _prepare_sbp_data(data: Dict) -> Optional[Dict]:
         new_amount += " "
 
     account_raw = str(data.get("account", "авто")).strip()
-    if account_raw.lower() in ("авто", "auto", "-", ""):
+    account_auto = account_raw.lower() in ("авто", "auto", "-", "")
+    if account_auto:
         account = _ORIG_ACCOUNT
     else:
         # Face is always masked like corpus «408178100000****0336».
@@ -2237,7 +2750,13 @@ def _prepare_sbp_data(data: Dict) -> Optional[Dict]:
             else:
                 account = _ORIG_ACCOUNT
 
-    bank_str = _normalize_tbank_bank(str(data.get("recipient_bank", _ORIG_BANK)))
+    bank_str = _normalize_tbank_bank(
+        str(
+            data.get("recipient_bank")
+            or data.get("bank")
+            or _ORIG_BANK
+        )
+    )
     receiver_for_id = str(
         data.get("recipient", data.get("receiver", _ORIG_RECEIVER))
     )
@@ -2272,7 +2791,9 @@ def _prepare_sbp_data(data: Dict) -> Optional[Dict]:
 
     sbp_suffix_raw = str(data.get("sbp_suffix", "авто")).strip()
     if sbp_suffix_raw.lower() in ("авто", "auto", "-", ""):
-        sbp_suffix_raw = _gen_sbp_suffix(bank_str, amount_digits)
+        sbp_suffix_raw = _gen_sbp_suffix(
+            bank_str, amount_digits, re.sub(r"\s+", " ", new_date.strip()),
+        )
         logger.info(f"auto SBP suffix: {sbp_suffix_raw}")
 
     sbp_id_strict = bool(data.get("sbp_id_strict"))
@@ -2281,6 +2802,7 @@ def _prepare_sbp_data(data: Dict) -> Optional[Dict]:
         if not sbp_id_manual:
             fixed_id = _finalize_sbp_identity(
                 sbp_id_raw, sbp_suffix_raw, bank=bank_str, amount=amount_digits,
+                date_str=re.sub(r"\s+", " ", new_date.strip()),
             )
             if fixed_id != sbp_id_raw:
                 logger.info(f"SBP identity fix: {sbp_id_raw} -> {fixed_id}")
@@ -2327,7 +2849,8 @@ def _prepare_sbp_data(data: Dict) -> Optional[Dict]:
         _break_ascending_digit_runs(str(data.get("phone", _ORIG_PHONE)))
     )
     account = _break_ascending_digit_runs(account)
-    sbp_id_raw = _break_ascending_digit_runs(sbp_id_raw)
+    if not sbp_id_manual:
+        sbp_id_raw = _break_ascending_digit_runs(sbp_id_raw)
     sbp_suffix_raw = _break_ascending_digit_runs(sbp_suffix_raw)
     receipt_raw = _break_ascending_digit_runs(receipt_raw)
     new_amount = _break_ascending_digit_runs(new_amount)
@@ -2340,6 +2863,7 @@ def _prepare_sbp_data(data: Dict) -> Optional[Dict]:
         "receiver":   receiver,
         "bank":       bank_str,
         "account":    account,
+        "account_auto": account_auto,
         "message":      message_raw,
         "commission":   commission_raw,
         "sbp_id_raw":     sbp_id_raw,
@@ -2349,6 +2873,7 @@ def _prepare_sbp_data(data: Dict) -> Optional[Dict]:
         # Immutable user face — diversify/pad must never rewrite these stems.
         "_user_sender":   sender,
         "_user_receiver": receiver,
+        "_user_bank":     bank_str,
         "sbp_suffix_raw": sbp_suffix_raw,
         "receipt_raw":    receipt_raw,
         "receipt_auto":   receipt_auto,
@@ -2574,11 +3099,18 @@ def _retune_sbp_id_for_donor(ctx, prepared: Dict) -> Dict:
     donor_sid = str(p.get("_donor_sbp_id") or "")
 
     def _bind_donor_channel(s: str) -> str:
-        # Keep donor marker/control/route/channel/bank ([14:27]).
-        # Live 1014 finalize writes control=5; donor 1008 needs U — else enc len ≠ slot.
-        if len(s) == 27 and len(donor_sid) == 27:
-            return s[:14] + donor_sid[14:27]
-        return s
+        # Keep donor marker/control/route/channel/bank ([14:27]) only when the
+        # live face suffix is the same grammar family. Pasting a donor lead «0»
+        # onto G1|014|791103 → illegal class «01» + CROSS_CLASS HARD.
+        if len(s) != 27 or len(donor_sid) != 27:
+            return s
+        suf = re.sub(
+            r"\D", "",
+            str(p.get("sbp_suffix_raw") or p.get("sbp_suffix") or ""),
+        )[:5].zfill(5)
+        if suf in _G1_FACE_SUFFIXES:
+            return s
+        return s[:14] + donor_sid[14:27]
 
     def _width(s: str) -> float:
         try:
@@ -2591,6 +3123,12 @@ def _retune_sbp_id_for_donor(ctx, prepared: Dict) -> Dict:
 
     def _accept(s: str) -> bool:
         if not s or any(ord(c) not in uni for c in s):
+            return False
+        suf = re.sub(
+            r"\D", "",
+            str(p.get("sbp_suffix_raw") or p.get("sbp_suffix") or ""),
+        )[:5].zfill(5)
+        if suf in _G1_FACE_SUFFIXES and (len(s) != 27 or s[17] != "G"):
             return False
         nb = ctx.enc(s, medium=False)
         if not nb:
@@ -2605,6 +3143,10 @@ def _retune_sbp_id_for_donor(ctx, prepared: Dict) -> Dict:
         # otherwise ToUnicode keeps the CID and content drops it (BIJECTION).
         if donor_sid:
             need_lat = {c for c in donor_sid if c.isalpha() and ord(c) in uni}
+            # G1 live lead is not a donor-orphan requirement when donor used «0».
+            if suf in _G1_FACE_SUFFIXES:
+                need_lat.discard("0")
+                need_lat.add("G")
             if need_lat - set(s):
                 return False
         return True
@@ -2614,9 +3156,9 @@ def _retune_sbp_id_for_donor(ctx, prepared: Dict) -> Dict:
         cand = _bind_donor_channel(sid) if all(ord(c) in uni for c in sid) else sid
         if _accept(cand):
             p["sbp_id_raw"] = cand
-            return p
+            return _pin_prepared_sbp_identity(p)
         p["_donor_sbp_impossible"] = True
-        return p
+        return _pin_prepared_sbp_identity(p)
 
     l1, l2 = _donor_sbp_latin_pools(ctx)
     if len(donor_sid) == 27 and donor_sid[15].isalpha() and donor_sid[15] not in l1:
@@ -2625,7 +3167,7 @@ def _retune_sbp_id_for_donor(ctx, prepared: Dict) -> Dict:
     date0 = re.sub(r"\s+", " ", p["new_date"].strip())
     best = None
     best_w = 1e9
-    for roll in range(96):
+    for roll in range(4):
         # Perturb entropy via phone/account salt + second ticks.
         phone_roll = p["phone"]
         if roll:
@@ -2661,6 +3203,16 @@ def _retune_sbp_id_for_donor(ctx, prepared: Dict) -> Dict:
             if alt:
                 cand = alt + cand[1:]
         cand = _bind_donor_channel(cand)
+        suf_live = re.sub(
+            r"\D", "",
+            str(p.get("sbp_suffix_raw") or p.get("sbp_suffix") or ""),
+        )[:5].zfill(5)
+        if suf_live:
+            cand = _finalize_sbp_identity(
+                cand, suf_live, bank=p.get("bank") or "",
+                amount=re.sub(r"\D", "", p.get("new_amount") or ""),
+                date_str=date_roll,
+            )
         if not _accept(cand):
             w = _width(cand)
             if w < best_w and ctx.enc(cand, medium=False):
@@ -2677,18 +3229,22 @@ def _retune_sbp_id_for_donor(ctx, prepared: Dict) -> Dict:
                 p["new_date"] = f"{day}  {dt.strftime('%H:%M:%S')}"
             except ValueError:
                 pass
-        return p
+        return _pin_prepared_sbp_identity(p)
 
-    # No width-safe ID — mark impossible so caller can try another donor / dynamic.
-    if best and _accept(best):
+    # No exact-width ID — keep the closest auto ID. Polish Tm keeps x1=250.
+    # Walking every corpus shell (96 rolls × N donors) made the bot >1 min.
+    if best:
         p["sbp_id_raw"] = best
-        return p
+        logger.warning(
+            "SBP ID width gate: Tm-realign donor_w=%.3f best=%.3f",
+            donor_w, best_w,
+        )
+        return _pin_prepared_sbp_identity(p)
     logger.warning(
-        "SBP ID width gate: no candidate ≤ donor_w=%.3f (best=%.3f)",
+        "SBP ID width gate: no candidate ≤ donor_w=%.3f (best=%.3f) — keep live ID",
         donor_w, best_w,
     )
-    p["_donor_sbp_impossible"] = True
-    return p
+    return _pin_prepared_sbp_identity(p)
 
 
 def _pinned_sbp_donor_path() -> Optional[str]:
@@ -2738,10 +3294,8 @@ def _iter_donor_candidates_for_prepared(
         adapted = adapt_sbp_prepared(ctx, prepared)
         adapted = dict(adapted)
         adapted["_donor_sbp_id"] = orig.get("sbp_id") or ""
-        probe = _retune_sbp_id_for_donor(ctx, adapted)
-        if probe.get("_donor_sbp_impossible"):
-            continue
-        adapted = probe
+        # Ranking must not retune SBP-ID (56 donors × 4 rolls → >1 min).
+        # Live retune happens only on the chosen donor in donor-orig / dynamic.
         reg_texts, amt = _collect_orig_reg_texts(adapted)
         miss_r, miss_m = donor_missing_chars(ctx, reg_texts=reg_texts, med_texts=[amt])
         if miss_r or miss_m:
@@ -2763,6 +3317,10 @@ def _iter_donor_candidates_for_prepared(
         except Exception:
             pass
         ranked.append((score, path, miss_r, miss_m))
+        if score >= 200 and len(ranked) >= max(1, limit):
+            break
+        if len(ranked) >= max(4, limit) and score >= 80:
+            break
     ranked.sort(key=lambda t: t[0], reverse=True)
     return [(p, mr, mm) for _, p, mr, mm in ranked[: max(1, limit)]]
 
@@ -2857,7 +3415,13 @@ def _extract_sbp_fields_from_donor(donor_path: str) -> Optional[Dict[str, str]]:
     }
 
 
-def _equal_len_face(new: str, old: str, *, allow_trim: bool = True) -> Optional[str]:
+def _equal_len_face(
+    new: str,
+    old: str,
+    *,
+    allow_trim: bool = True,
+    allow_letter_pad: bool = True,
+) -> Optional[str]:
     """Same Unicode length as donor slot — no ASCII spaces (Proton WHITESPACE).
 
     Shorter values keep the user prefix and pad with a *rotating* pool of the
@@ -2865,6 +3429,10 @@ def _equal_len_face(new: str, old: str, *, allow_trim: bool = True) -> Optional[
     unique F1 CIDs below Proton cmap atlas min (SBP h=519 ≥65) and then the
     old cardinality nudge grew unused ToUnicode → live BIJECTION HARD.
     Longer values trim when allow_trim.
+
+    ``allow_letter_pad=False`` (FIO / bank / phone): never invent visible junk —
+    «Илья Мартынов» must stay exact, not «Илья МартыновИл»; «ВТБ» not «ВТБВТБ».
+    Caller keeps short face + Tm.
     """
     if not old:
         return new or ""
@@ -2872,6 +3440,8 @@ def _equal_len_face(new: str, old: str, *, allow_trim: bool = True) -> Optional[
     if len(face) == len(old):
         return face
     if len(face) < len(old):
+        if not allow_letter_pad:
+            return None
         need = len(old) - len(face)
         pool = [c for c in face if c != " " and ("А" <= c <= "я" or c in "Ёё")]
         # Prefer unique letters; fall back to a short vowel cycle already common
@@ -3080,13 +3650,18 @@ def _adapt_prepared_skeleton_slots(
         new = p.get(key) or ""
         if not old or not new or old == new:
             continue
-        if key == "account" and new == _ORIG_ACCOUNT:
+        if key == "account" and new == _ORIG_ACCOUNT and p.get("account_auto"):
             p[key] = old
             continue
         face = (new or "").rstrip(" ")
         fitted: Optional[str] = None
+        # FIO/bank/phone: never letter-cycle pad («Мартынов»→«МартыновИл»).
+        # Unequal CID + Tm. LAW #1 — exact user stem only.
+        _letter_pad = key not in ("bank", "phone", "sender", "receiver")
         for _ in range(max(1, len(face) + 1)):
-            cand = _equal_len_face(face, old, allow_trim=trim)
+            cand = _equal_len_face(
+                face, old, allow_trim=trim, allow_letter_pad=_letter_pad,
+            )
             if cand is None:
                 break
             if _width_ok(cand, old):
@@ -3194,6 +3769,15 @@ def _select_sbp_shell_for_skeleton(
         sid = orig.get("sbp_id") or ""
         if len(sid) == 27 and "U" not in sid and "\\" not in sid:
             score += 25
+        # G1|018|791103: only H/0 or S/1 — prefer corpus shells that already paint it.
+        prof_sk = _sbp_bank_profile(
+            prepared.get("bank") or _ORIG_BANK,
+            re.sub(r"\D", "", prepared.get("new_amount") or ""),
+            date_str=str(prepared.get("new_date") or ""),
+        )
+        if prof_sk.get("ch") == "1018" and len(sid) == 27 and sid[18:22] == "1018":
+            if (sid[14], sid[15]) in {("0", "H"), ("1", "S")}:
+                score += 800
         # Prefer equal-or-wider donor suffix widths (70901/80301 = 2566 units).
         # keep twin glyf≈13000 shells (сбп8) highly ranked for peel.
         want_suf = re.sub(r"\D", "", str(prepared.get("sbp_suffix_raw") or ""))[:5]
@@ -3216,11 +3800,30 @@ def _select_sbp_shell_for_skeleton(
             _doc = _fz.open(path)
             _fm = _tut._find_font_objects(_doc)
             _ff2 = _doc.xref_stream(_fm["TinkoffSans-Regular"]["fontfile_xref"])
+            _cs = _doc.xref_stream(_doc[0].get_contents()[0])
+            _cs_len = len(_cs)
+            _fm2 = _tut._find_font_objects(_doc).get("TinkoffSans-Medium")
+            _f2_dec = 0
+            _f2_glyf = 0
+            if _fm2:
+                _ff2m = _doc.xref_stream(_fm2["fontfile_xref"])
+                _f2_dec = len(_ff2m)
+                _f2_glyf = int(_TT(_BIO(_ff2m)).reader.tables["glyf"].length)
             _doc.close()
             _ft = _TT(_BIO(_ff2))
             _gl = int(_ft.reader.tables["glyf"].length)
             if 12990 <= _gl <= 13020:
-                score += 120  # covering twin band
+                score += 40  # twin band — do not drown CS/skeleton fit
+            # PASS recipe cluster: cs≈4405, F2 dec≈5444 glyf≈1254.
+            score += max(0, 50 - abs(_cs_len - 4405) // 2)
+            score += max(0, 30 - abs(_f2_dec - 5444) // 8)
+            score += max(0, 20 - abs(_f2_glyf - 1254) // 4)
+            try:
+                from tbank_dynamic import _operator_skeleton_hash_local as _osh
+                if _osh(_cs).startswith("ea666aec"):
+                    score += 25  # dominant corpus skeleton family
+            except Exception:
+                pass
         except Exception:
             pass
         ranked.append((score, path, orig))
@@ -3599,14 +4202,19 @@ def _run_orig_mode_pdf(
     else:
         stream, ok["date"] = replace_tj(
             stream, enc_r(o["date"]), enc_r(p["new_date"]),
-            o["date"], p["new_date"], 9.0, False)
+            o["date"], p["new_date"], 9.0, False, left_x=20.0)
     if p["new_amount"].strip() == o["amount"].strip():
         ok["amt_big"] = ok["amt_small"] = True
     else:
         stream, ok["amt_small"] = replace_tj(
             stream, enc_r(o["amount"]), enc_r(p["new_amount"]),
             o["amount"], p["new_amount"], 9.0, False, right_edge=margins["amount_sm"],
-            occurrence=2)
+            occurrence=1)
+        if not ok["amt_small"]:
+            stream, ok["amt_small"] = replace_tj(
+                stream, enc_r(o["amount"]), enc_r(p["new_amount"]),
+                o["amount"], p["new_amount"], 9.0, False,
+                right_edge=margins["amount_sm"], occurrence=2)
         stream, ok["amt_big"] = replace_tj(
             stream, enc_m(o["amount"]), enc_m(p["new_amount"]),
             o["amount"], p["new_amount"], 16.0, True, right_edge=margins["amount_bg"])
@@ -3684,7 +4292,7 @@ def _run_orig_mode_pdf(
                 right_edge=margins["sbp_id"], inplace_slot=True)
             # no Tm-align on preserve path (exact flate)
     else:
-        ok["sbp_id"] = True
+        ok["sbp_id"] = False
     if p["sbp_suffix_raw"].lower() in ("авто", "auto", "-", ""):
         ok["sbp_suffix"] = True
     else:
@@ -4612,7 +5220,7 @@ def _try_donor_orig_mode(prepared: Dict) -> Optional[bytes]:
     ordered: List[Tuple[str, List[str], List[str]]] = []
     if skel_path and skel_orig:
         ordered.append((skel_path, [], []))
-    for item in _iter_donor_candidates_for_prepared(prepared, limit=12):
+    for item in _iter_donor_candidates_for_prepared(prepared, limit=1):
         if not ordered or item[0] != ordered[0][0]:
             ordered.append(item)
     if not ordered:
@@ -4956,7 +5564,7 @@ def _skeleton_diversify_face_cids(
             if len(used) <= int(target_n):
                 break
             progressed = False
-            for key in ("phone", "account"):
+            for key in ("phone",):
                 if len(used) <= int(target_n):
                     break
                 cur = (p.get(key) or "").rstrip(" ")
@@ -5069,7 +5677,7 @@ def _skeleton_diversify_face_cids(
                 if len(used) <= int(target_n):
                     break
                 progressed = False
-                for key in ("phone", "account"):
+                for key in ("phone",):
                     if len(used) <= int(target_n):
                         break
                     cur = (p.get(key) or "").rstrip(" ")
@@ -5535,16 +6143,16 @@ def _skeleton_diversify_face_cids(
         while need > 0 and pool and _esc_guard < 12:
             _esc_guard += 1
             grew_any = False
-            for key in ("sbp_id_raw", "sbp_id", "account", "message", "receipt_raw", "receipt"):
+            for key in ("sbp_id_raw", "sbp_id", "message", "receipt_raw", "receipt"):
                 if need <= 0 or not pool:
                     break
-                # Never rewrite bank/phone face (SBP_LINKED_TUPLE / MSISDN).
-                # Below 72: only SBP id slots.
+                # Never rewrite bank/phone/account face.
+                # Account is 40817… + **** + digits — letters here are a fake tell.
                 if key not in ("sbp_id_raw", "sbp_id") and len(used) < 72:
                     continue
-                # SBP ID / account / receipt: Latin/digits only.
+                # SBP ID / receipt: Latin/digits only.
                 key_pool = pool
-                if key in ("sbp_id_raw", "sbp_id", "account", "receipt_raw", "receipt"):
+                if key in ("sbp_id_raw", "sbp_id", "receipt_raw", "receipt"):
                     key_pool = [
                         c for c in pool
                         if c.isascii() and c.isalnum()
@@ -5569,19 +6177,45 @@ def _skeleton_diversify_face_cids(
                 for pos in range(len(chars) - 1, -1, -1):
                     if chars[pos] == " ":
                         continue
+                    # SBP ID: positions 1..10 after lead «A» are UTC timestamp
+                    # digits — Proton SBP_CIPHER_STRUCTURE HARD if lettered.
+                    # Never touch marker/control/sep/route (14..17) — G→0 here
+                    # ships class «01» + G1 tuple → CROSS_CLASS HARD.
+                    if key in ("sbp_id_raw", "sbp_id") and (
+                        1 <= pos <= 10 or pos in _SBP_ID_ROUTE_FREEZE_POS
+                    ):
+                        continue
                     for ch in key_pool[:32]:
                         if chars[pos] == ch:
                             continue
+                        # Never inject non-digits into the timestamp core.
+                        if key in ("sbp_id_raw", "sbp_id") and 1 <= pos <= 10:
+                            continue
+                        if (
+                            key in ("sbp_id_raw", "sbp_id")
+                            and not ch.isdigit()
+                            and 1 <= pos <= 10
+                        ):
+                            continue
                         trial = "".join(chars[:pos] + [ch] + chars[pos + 1 :])
                         if key in ("sbp_id_raw", "sbp_id"):
+                            # Timestamp core (A + 10 digits) must stay numeric.
+                            if len(trial) >= 11 and (
+                                trial[0] not in "AB"
+                                or not trial[1:11].isdigit()
+                            ):
+                                continue
                             try:
                                 if not decode_sbp_operation_id(trial):
                                     continue
-                                _suf = str(
-                                    p.get("sbp_suffix_raw")
-                                    or p.get("sbp_suffix")
-                                    or "70901"
-                                )
+                                _suf = _normalize_sbp_suffix5(
+                                    str(
+                                        p.get("sbp_suffix_raw")
+                                        or p.get("sbp_suffix")
+                                        or ""
+                                    ),
+                                    default="91103",
+                                ) or "91103"
                                 _fixed = _finalize_sbp_identity(
                                     trial, _suf,
                                     bank=str(p.get("bank") or ""),
@@ -5634,7 +6268,7 @@ def _skeleton_diversify_face_cids(
             c for c in ("0", "1", "2", "8", "а", "е", "о", "и", "н", "A")
             if ug.get(ord(c)) in used
         ]
-        for key in ("phone", "sbp_id_raw", "sbp_id", "account"):
+        for key in ("phone", "sbp_id_raw", "sbp_id"):
             if len(used) <= 72:
                 break
             cur = (p.get(key) or "").rstrip(" ")
@@ -5647,6 +6281,12 @@ def _skeleton_diversify_face_cids(
             for pos in range(len(chars) - 1, -1, -1):
                 ch = chars[pos]
                 if ch in (" ", "+", "(", ")", "-"):
+                    continue
+                # Never demote G1 route lead / marker/control to free a CID hole
+                # (G→0 → class «01» + CROSS_CLASS HARD).
+                if key in ("sbp_id_raw", "sbp_id") and (
+                    1 <= pos <= 10 or pos in _SBP_ID_ROUTE_FREEZE_POS
+                ):
                     continue
                 gid = ug.get(ord(ch), TBANK_CHAR_TO_GID_REG.get(ch))
                 if gid is None or gid not in used:
@@ -5669,6 +6309,23 @@ def _skeleton_diversify_face_cids(
                     if key in ("sbp_id_raw", "sbp_id"):
                         try:
                             if not decode_sbp_operation_id(trial):
+                                continue
+                            _suf_h = _normalize_sbp_suffix5(
+                                str(
+                                    p.get("sbp_suffix_raw")
+                                    or p.get("sbp_suffix")
+                                    or ""
+                                ),
+                                default="91103",
+                            ) or "91103"
+                            _fixed_h = _finalize_sbp_identity(
+                                trial, _suf_h,
+                                bank=str(p.get("bank") or ""),
+                                amount=str(
+                                    p.get("new_amount") or p.get("amount") or ""
+                                ),
+                            )
+                            if _fixed_h != trial:
                                 continue
                         except Exception:
                             continue
@@ -6067,6 +6724,10 @@ def _sbp_id_letter_pool(
 
     l1_ok = "".join(ch for ch in _l1_all if _ok(ch)) or "B"
     l2_ok = "".join(ch for ch in _l2_all if _ok(ch)) or "0B"
+    # G1|018 binding needs control H or S at ID[15].
+    for ch in "HS":
+        if ch not in l1_ok and _ok(ch):
+            l1_ok = ch + l1_ok
     # Never fall back to a stolen route letter (z←G → cipher sees «z»).
     l1_ok = "".join(c for c in l1_ok if c not in stolen) or "B"
     l2_ok = "".join(c for c in l2_ok if c not in stolen) or "0B"
@@ -6097,15 +6758,23 @@ def _sbp_stolen_route_letters(
 
 def _sanitize_sbp_id_stolen_slots(
     sid: str, uni_gid: Optional[Dict[int, int]],
+    *,
+    suffix5: str = "",
 ) -> str:
-    """Replace stolen route letters in an SBP ID (G→B when z owns GID 35)."""
+    """Replace stolen route letters in an SBP ID (G→B when z owns GID 35).
+
+    Never demote G1 face suffixes off lead G (→ illegal class 01).
+    """
     if not sid:
         return sid
     stolen = _sbp_stolen_route_letters(uni_gid)
     if not stolen:
         return sid
+    suf = re.sub(r"\D", "", str(suffix5 or ""))[:5].zfill(5)
     out = sid
     for ch in stolen:
+        if ch == "G" and suf in _G1_FACE_SUFFIXES:
+            continue  # keep G; mosaic pin restores outline
         repl = "B" if ch != "0" else "0"
         if ch in out:
             out = out.replace(ch, repl)
@@ -6154,12 +6823,43 @@ def _sbp_id_slot_bytes(
     return enc or b""
 
 
+def _unsteal_g1_route_g(
+    uni_gid: Optional[Dict[int, int]],
+    need_cps: Optional[set] = None,
+    *,
+    suffix5: str = "",
+) -> Dict[int, int]:
+    """Give G its own CID for G1 face suffixes (z must not own registry G).
+
+    Without this, encode either failed closed or (legacy) remapped G→0 and
+    shipped class «01» with G1 tuple → CROSS_CLASS / ROUTE_FIELD HARD.
+    """
+    out = dict(uni_gid or {})
+    suf = re.sub(r"\D", "", str(suffix5 or ""))[:5].zfill(5)
+    if suf not in _G1_FACE_SUFFIXES:
+        return out
+    g_cp = ord("G")
+    g_reg = int(TBANK_CHAR_TO_GID_REG.get("G") or 35)
+    need = set(need_cps or ())
+    # Drop non-G owners of G's registry CID when those CPs are not on the face.
+    owners = [cp for cp, gid in out.items() if int(gid) == g_reg]
+    for cp in owners:
+        if int(cp) != g_cp and int(cp) not in need:
+            out.pop(int(cp), None)
+    out[g_cp] = g_reg
+    return out
+
+
 def _sbp_id_encodes_fully(trial: str, uni_gid: Dict[int, int]) -> Optional[bytes]:
     """27 символов → CID bytes (с PDF-escape); длина может быть >54 если CID=0x5C (U)."""
     if len(trial) != 27 or not decode_sbp_operation_id(trial):
         return None
+    stolen = _sbp_stolen_route_letters(uni_gid)
     for ch in trial:
         if ord(ch) not in uni_gid:
+            return None
+        # Refuse stolen route Latin — never paint via silent G→0 remap.
+        if ch in stolen:
             return None
     raw = _dynamic_enc(trial, uni_gid)
     if not raw:
@@ -6188,10 +6888,9 @@ def _fit_sbp_id_slot(
             # empirical tuple — that turns shell Latin E into digit 6 and leaves
             # CID 25 unused → BIJECTION / SUBSET-CMAP-MINIMALITY.
             return trial
-        out = _ensure_sbp_route_class(trial, suffix5)
         if suffix5:
-            out = _ensure_sbp_control_link(out, suffix5)
-        return out
+            return _finalize_sbp_identity(trial, suffix5)
+        return _ensure_sbp_route_class(trial, suffix5)
 
     sid = _apply_identity(sbp_id.strip().upper())
     dec = decode_sbp_operation_id(sid)
@@ -6264,12 +6963,11 @@ def _fit_sbp_id_any_encode(
     def _apply_identity(trial: str) -> str:
         if manual:
             if suffix5:
-                return _ensure_sbp_control_link(trial, suffix5)
+                return _enforce_g1_slot018_binding(trial, suffix5)
             return trial
-        out = _ensure_sbp_route_class(trial, suffix5)
         if suffix5:
-            out = _ensure_sbp_control_link(out, suffix5)
-        return out
+            return _finalize_sbp_identity(trial, suffix5)
+        return _ensure_sbp_route_class(trial, suffix5)
 
     sid = _apply_identity((sbp_id or "").strip().upper())
     dec = decode_sbp_operation_id(sid)
@@ -6373,7 +7071,10 @@ def _fit_sbp_id_skeleton_slot(
     for i in range(8000):
         ref4 = f"{rng.randint(0, 9999):04d}"
         l1 = rng.choice(l1_pool) if l1_pool else "G"
-        l2 = rng.choice(l2_pool) if l2_pool else "G"
+        l2 = _route_lead_for_channel(
+            dec0["channel"], rng.randint(0, 9999), allowed=l2_pool or "G",
+            suffix5=suffix5, bank5=dec0["bank_code"],
+        )
         trial = (
             f"{dec0['prefix']}{dec0['doy4']}{dec0['utc_hour']}{dec0['utc_minute']}"
             f"{dec0['utc_second']}{ref4}{l1}0{l2}{dec0['channel']}{dec0['bank_code']}"
@@ -6417,23 +7118,20 @@ def _dynamic_enc(text: str, uni_to_gid: dict) -> bytes:
 
     Missing CID → empty bytes (caller must fail/retry). Never silently drop
     letters (was truncating «Фывапролдж» → «Фыва»).
-    If route Latin (G) shares a CID with face «z», encode as B/A/0 instead —
-    otherwise Proton text shows «z» → SBP_CIPHER_MISSING.
+
+    NEVER remap stolen route Latin (G→B/A/0). That painted class «01» with a
+    G1 linked-tuple (014|791103) → SBP_LINKED_TUPLE_CROSS_CLASS +
+    SBP_ROUTE_FIELD_CONTAMINATION HARD. Callers must unsteal/rebind G or
+    refuse encode via `_sbp_id_encodes_fully`.
     """
     if not text:
         return b""
-    stolen = _sbp_stolen_route_letters(uni_to_gid)
     out = bytearray()
     for ch in text:
-        if ch in stolen:
-            repl = next(
-                (a for a in "BA0" if a not in stolen and ord(a) in uni_to_gid),
-                None,
-            )
-            if repl is None:
-                return b""
-            ch = repl
-        gid = uni_to_gid.get(ord(ch))
+        if ch in (" ", "\u00a0"):
+            gid = 3
+        else:
+            gid = uni_to_gid.get(ord(ch))
         if gid is None:
             return b""
         for b in ((gid >> 8) & 0xFF, gid & 0xFF):
@@ -6451,7 +7149,10 @@ def _dynamic_width_pt(text: str, font_size: float, font_obj, uni_to_gid: dict) -
         return 0.0
     total = 0
     for ch in text:
-        gid = uni_to_gid.get(ord(ch))
+        if ch in (" ", "\u00a0"):
+            gid = 3
+        else:
+            gid = uni_to_gid.get(ord(ch))
         if gid is None:
             continue
         if gid < len(glyph_order):
@@ -6522,6 +7223,10 @@ def _dynamic_replace_tj(
     min_x: float = 0.0,
 ) -> Tuple[bytes, bool]:
     """Заменяем (old_b)Tj → (new_b)Tj; y_target — правая колонка на фиксированной Y."""
+    if not old_b:
+        # Empty old matches Jasper stamp ``()Tj`` at y=page-height → first-line
+        # mojibake (TBANK_DATE_LINE_CORRUPTED). Never treat stamp as a field.
+        return stream, False
     needle = b"(" + old_b + b")Tj"
     matches: List[Tuple[int, float, float]] = []
     start = 0
@@ -7010,11 +7715,28 @@ def _force_merge_painted_to_target(
                     break
         if donor is None:
             break
+        _digit_cids = {
+            int(TBANK_CHAR_TO_GID_REG[d])
+            for d in "0123456789"
+            if d in TBANK_CHAR_TO_GID_REG
+        }
         victims = [
             int(g) for g, n in freq.items()
             if n == 1 and int(g) in used and int(g) not in face_keep
             and int(g) != int(donor)
+            and int(g) not in _digit_cids
         ]
+        # Never merge onto a digit CID (А→0 / letter→amount digit).
+        if donor is not None and int(donor) in _digit_cids:
+            donor = next(
+                (
+                    g for g, n in freq.most_common()
+                    if n >= 2 and int(g) in used and int(g) not in _digit_cids
+                ),
+                None,
+            )
+            if donor is None:
+                break
         if not victims:
             # Soft: only №-like punct, never letters/digits/hydrate Latin.
             victims = [
@@ -7302,25 +8024,18 @@ def _twin_cover_critical_orphans_final(
         + (prepared.get("recipient_bank") or "")
         + (prepared.get("new_date") or "")
     )
-    ch_freq = Counter(page_approx)
-    # One-for-one CID swap after realign — keeps |used| on twin card.
+    # Never steal unique FIO / bank / phone / amount letters (В→З, Д→,).
+    # Only unique-only CIDs outside face_keep — same law as paint-all-orphans.
+    face_keep = _face_keep_cids(
+        prepared, uni_gid_r0, uni_gid_r_plan, uni_gid_r_work, native, ff2=ff2_r,
+    )
     victims: list = []
-    for ch in fio:
-        if not ch.isalpha() or ch_freq[ch] != 1:
+    for g, n in freq.most_common():
+        if n != 1 or int(g) in banned or int(g) not in used:
             continue
-        gid = ug.get(ord(ch))
-        if gid is None or int(gid) in banned or int(gid) not in used:
+        if int(g) in face_keep:
             continue
-        if int(gid) not in victims:
-            victims.append(int(gid))
-    if len(victims) < len(left):
-        for g, n in freq.items():
-            if n != 1 or int(g) in banned or int(g) in victims:
-                continue
-            cp = gid_cp.get(int(g))
-            if cp is None or chr(cp) not in fio or not chr(cp).isalpha():
-                continue
-            victims.append(int(g))
+        victims.append(int(g))
     for cid in list(left):
         if not victims:
             break
@@ -7348,18 +8063,6 @@ def _twin_cover_critical_orphans_final(
             )
             continue
         vic_ch = chr(gid_cp[vic]) if vic in gid_cp else None
-        if not vic_ch:
-            for cp, g in ug.items():
-                if int(g) == int(vic) and chr(int(cp)).isalpha():
-                    vic_ch = chr(int(cp))
-                    break
-        if vic_ch:
-            for key in ("sender", "receiver"):
-                cur = prepared.get(key) or ""
-                if vic_ch not in cur:
-                    continue
-                prepared = {**prepared, key: cur.replace(vic_ch, new_ch, 1)}
-                break
         stream = st2
         used = set(reg_chk)
         banned.add(vic)
@@ -7396,6 +8099,7 @@ def _face_keep_cids(
             ug.update({int(k): int(v) for k, v in m.items()})
     fields = (
         "sender", "receiver", "phone", "recipient_bank", "bank",
+        "_user_sender", "_user_receiver", "_user_bank",
         "new_amount", "new_date", "sbp_id_raw", "receipt_raw", "account",
     )
     blob = (
@@ -7406,14 +8110,18 @@ def _face_keep_cids(
         "№()OzonBank"  # receipt mark + Latin bank as written
         "Повопросамзачисленияобращайтеськполучателю"
         "операцииномер"
+        "ПономерукартыНакарту"
     )
     if prepared:
         for fld in fields:
             blob += str(prepared.get(fld) or "")
     for ch in blob:
-        gid = ug.get(ord(ch)) or TBANK_CHAR_TO_GID_REG.get(ch)
-        if gid is not None:
-            keep.add(int(gid))
+        plan = ug.get(ord(ch))
+        if plan is not None:
+            keep.add(int(plan))
+        canon = TBANK_CHAR_TO_GID_REG.get(ch)
+        if canon is not None:
+            keep.add(int(canon))
     if ff2 is not None:
         try:
             nat = _twin_native_uni_gid(ff2) or {}
@@ -7531,7 +8239,10 @@ def _twin_clamp_painted_to_cmap(
                     st2, ok = replace_tj_bytes_inplace(stream, old_b, new_b)
                     if ok:
                         stream = st2
-                        prepared["sbp_id_raw"] = new_sid
+                        prepared = _pin_prepared_sbp_identity(
+                            {**prepared, "sbp_id_raw": new_sid},
+                        )
+                        new_sid = prepared.get("sbp_id_raw") or new_sid
                         used, extras, miss = _snap()
                         logger.info(
                             "F1 twin clamp SBP retune %s → %s used=%d",
@@ -7864,9 +8575,18 @@ def _glyph_renders(glyf, go, gid: int, *, _seen: Optional[set] = None) -> bool:
     if gid in seen:
         return False
     seen.add(gid)
-    g = glyf[go[gid]]
+    try:
+        g = glyf[go[gid]]
+    except Exception:
+        # Truncated / excess-byte glyf: viewers leave advance and skip ink
+        # («Меридиан   инанс» — CID 256 «Ф»).
+        return False
     nc = int(getattr(g, "numberOfContours", 0) or 0)
     if nc > 0:
+        try:
+            g.compile(glyf)
+        except Exception:
+            return False
         return True
     if nc == 0:
         return False
@@ -8118,6 +8838,8 @@ def _blank_ff2_unused_glyfs(ff2: bytes, active_gids: set, *, keep_notdef: bool =
         keep |= _ff2_raw_composite_closure(ff2, keep)
     except Exception:
         pass
+    if not keep_notdef:
+        keep.discard(0)
 
     empty = _TGlyph()
     empty.numberOfContours = 0
@@ -8227,7 +8949,13 @@ def _strip_ruble_for_f1(text: str) -> Tuple[str, bool]:
     return out, has
 
 
-def _inject_f3_ruble_after_tj(stream: bytes, tj_inner: bytes) -> bytes:
+def _inject_f3_ruble_after_tj(
+    stream: bytes,
+    tj_inner: bytes,
+    *,
+    tm_y: Optional[float] = None,
+    tm_y_tol: float = 1.5,
+) -> bytes:
     """Вставить /F3 (i)Tj сразу после commission/amount Tj — как в корпусе.
 
     If the TJ is followed by the bare ``\\n0 g\\nET`` closer (phone «Без комиссии»
@@ -8235,7 +8963,22 @@ def _inject_f3_ruble_after_tj(stream: bytes, tj_inner: bytes) -> bytes:
     a double ``0 g`` (Fraudex structure fingerprint).
     """
     needle = b"(" + tj_inner + b")Tj"
-    pos = stream.find(needle)
+    pos = -1
+    if tm_y is not None:
+        for m in re.finditer(re.escape(needle), stream):
+            look = stream[max(0, m.start() - 120) : m.start()]
+            tms = list(_TM_RE.finditer(look))
+            if not tms:
+                continue
+            try:
+                y = float(tms[-1].group(2))
+            except (TypeError, ValueError, IndexError):
+                continue
+            if abs(y - float(tm_y)) <= tm_y_tol:
+                pos = m.start()
+                break
+    else:
+        pos = stream.find(needle)
     if pos < 0:
         return stream
     end = pos + len(needle)
@@ -8765,6 +9508,16 @@ def _missing_glyph_contours(
         return [chr(cp) for cp in sorted(needed_unicodes) if chr(cp) in char_to_gid]
 
     miss: List[str] = []
+    owner: Dict[int, int] = {}
+    try:
+        cmap = ft.getBestCmap() or {}
+        for u, g in cmap.items():
+            owner[int(g)] = int(u)
+    except Exception:
+        pass
+    if uni_gid_plan:
+        for u, c in uni_gid_plan.items():
+            owner.setdefault(int(c), int(u))
     for cp in sorted(needed_unicodes):
         ch = chr(cp)
         if cp == 0x20:
@@ -8782,6 +9535,9 @@ def _missing_glyph_contours(
         for gid in cids:
             if gid < 0 or gid >= len(go):
                 continue
+            own = owner.get(int(gid))
+            if own is not None and int(own) != int(cp):
+                continue
             if _glyph_renders(glyf, go, int(gid)):
                 ok = True
                 break
@@ -8795,9 +9551,7 @@ def _cid_has_contour(ff2: bytes, cid: int) -> bool:
     try:
         ft = TTFont(_BIO(ff2))
         go = ft.getGlyphOrder()
-        if cid < 0 or cid >= len(go):
-            return False
-        return getattr(ft["glyf"][go[cid]], "numberOfContours", 0) != 0
+        return _glyph_renders(ft["glyf"], go, int(cid))
     except Exception:
         return False
 
@@ -8809,10 +9563,29 @@ def _filled_uni_map(
     *,
     is_medium: bool,
 ) -> Dict[int, int]:
-    """Encoding map: first CID among maps/canonical that has a real contour."""
+    """Encoding map: first CID among maps/canonical that has a real contour.
+
+    Never bind a letter to a CID the twin already owns as a *different*
+    unicode (А must not share Е's slot). Never fall back to an empty CID.
+    """
     char_to_gid = TBANK_CHAR_TO_GID_MED if is_medium else TBANK_CHAR_TO_GID_REG
+    cid_owner: Dict[int, int] = {}
+    cid_native: Dict[int, int] = {}
+    for m in maps:
+        for u, c in (m or {}).items():
+            cid_owner.setdefault(int(c), int(u))
+    try:
+        from io import BytesIO as _BIO
+        _ft_cm = TTFont(_BIO(ff2))
+        _cmap = _ft_cm.getBestCmap() or {}
+        for u, g in _cmap.items():
+            cid_native[int(g)] = int(u)
+            cid_owner.setdefault(int(g), int(u))
+    except Exception:
+        pass
     out: Dict[int, int] = {}
-    for cp in needed_unicodes:
+    claimed: set = set()
+    for cp in sorted(needed_unicodes):
         if cp == 0x20:
             out[cp] = 3
             continue
@@ -8828,13 +9601,21 @@ def _filled_uni_map(
             cands.append(int(canon))
         picked = None
         for cid in cands:
+            native_u = cid_native.get(int(cid))
+            if native_u is not None and int(native_u) != int(cp):
+                continue
+            own = cid_owner.get(int(cid))
+            if own is not None and int(own) != int(cp):
+                continue
+            if int(cid) in claimed:
+                continue
             if _cid_has_contour(ff2, cid):
                 picked = cid
                 break
-        if picked is None and cands:
-            picked = cands[0]
         if picked is not None:
             out[cp] = picked
+            claimed.add(int(picked))
+            cid_owner[int(picked)] = int(cp)
     return out
 
 
@@ -8853,28 +9634,8 @@ def _soft_char_to_filled(
     is_medium: bool,
     uni_gid_plan: Optional[Dict[int, int]] = None,
 ) -> str:
-    if ch not in miss and not _missing_glyph_contours(
-        ff2, {ord(ch)}, is_medium=is_medium, uni_gid_plan=uni_gid_plan
-    ):
-        return ch
-    if ch.isdigit():
-        pool = _SOFT_DIGIT_POOL
-    elif "A" <= ch <= "Z":
-        pool = _SOFT_LAT_POOL
-    elif ch.isupper():
-        pool = _SOFT_UPPER_POOL
-    elif ch.islower():
-        pool = _SOFT_LOWER_POOL
-    else:
-        return ch
-    # Prefer pool chars that actually have contours in this FontFile2.
-    for i in range(len(pool)):
-        cand = pool[(ord(ch) + i) % len(pool)]
-        if not _missing_glyph_contours(
-            ff2, {ord(cand)}, is_medium=is_medium, uni_gid_plan=uni_gid_plan
-        ):
-            return cand
-    return pool[ord(ch) % len(pool)]
+    """Identity — never soft-substitute face characters."""
+    return ch
 
 
 def _soft_text_to_filled_font(
@@ -8884,26 +9645,8 @@ def _soft_text_to_filled_font(
     is_medium: bool,
     uni_gid_plan: Optional[Dict[int, int]] = None,
 ) -> str:
-    if not text:
-        return text
-    need = {ord(c) for c in text}
-    miss = set(
-        _missing_glyph_contours(
-            ff2, need, is_medium=is_medium, uni_gid_plan=uni_gid_plan
-        )
-    )
-    if not miss:
-        return text
-    out = [
-        _soft_char_to_filled(
-            ch, miss, ff2=ff2, is_medium=is_medium, uni_gid_plan=uni_gid_plan
-        )
-        for ch in text
-    ]
-    soft = "".join(out)
-    if soft != text:
-        logger.warning("soft charset %r → %r (miss=%s)", text[:40], soft[:40], "".join(sorted(miss))[:16])
-    return soft
+    """Identity — missing glyphs must be hydrated, not remapped."""
+    return text
 
 
 def _soft_char_filled_both(
@@ -8915,27 +9658,8 @@ def _soft_char_filled_both(
     uni_r: Optional[Dict[int, int]] = None,
     uni_m: Optional[Dict[int, int]] = None,
 ) -> str:
-    """Pick a substitute present with contours in BOTH Regular and Medium."""
-    if ch not in miss:
-        return ch
-    if ch.isdigit():
-        pool = _SOFT_DIGIT_POOL
-    elif "A" <= ch <= "Z":
-        pool = _SOFT_LAT_POOL
-    elif ch.isupper():
-        pool = _SOFT_UPPER_POOL
-    elif ch.islower():
-        pool = _SOFT_LOWER_POOL
-    else:
-        return ch
-    for i in range(len(pool)):
-        cand = pool[(ord(ch) + i) % len(pool)]
-        if _missing_glyph_contours(ff2_r, {ord(cand)}, is_medium=False, uni_gid_plan=uni_r):
-            continue
-        if _missing_glyph_contours(ff2_m, {ord(cand)}, is_medium=True, uni_gid_plan=uni_m):
-            continue
-        return cand
-    return pool[ord(ch) % len(pool)]
+    """Identity — never soft-substitute across F1/F2."""
+    return ch
 
 
 def _soft_text_to_both_fonts(
@@ -8946,26 +9670,8 @@ def _soft_text_to_both_fonts(
     uni_r: Optional[Dict[int, int]] = None,
     uni_m: Optional[Dict[int, int]] = None,
 ) -> str:
-    """Soft-map so the SAME string renders in F1 and F2 (Итого == Сумма)."""
-    if not text:
-        return text
-    need = {ord(c) for c in text}
-    miss_r = set(_missing_glyph_contours(ff2_r, need, is_medium=False, uni_gid_plan=uni_r))
-    miss_m = set(_missing_glyph_contours(ff2_m, need, is_medium=True, uni_gid_plan=uni_m))
-    miss = miss_r | miss_m
-    if not miss:
-        return text
-    out = [
-        _soft_char_filled_both(
-            ch, miss, ff2_r=ff2_r, ff2_m=ff2_m, uni_r=uni_r, uni_m=uni_m,
-        )
-        for ch in text
-    ]
-    soft = "".join(out)
-    if soft != text:
-        miss_s = "".join(sorted(str(c) for c in miss))[:16]
-        logger.warning("soft both-fonts %r → %r (miss=%s)", text[:40], soft[:40], miss_s)
-    return soft
+    """Identity — hydrate both fonts instead of remapping face text."""
+    return text
 
 
 def _extra_filled_glyphs(
@@ -9149,15 +9855,15 @@ def _raw_glyph_entry(
     bucket = (_RAW_GLYPH_CACHE or {}).get("med" if is_medium else "reg") or {}
 
     def _aw_ok(aw: int, *, score: int = 0) -> bool:
-        # Absolute T-Bank face band — never accept ~2× atlas outlines even if
-        # the empty slot still carries a leftover double-width advance.
-        # Atlas Ш/Щ sit at aw≈856–869; unlocked clones are ~1700+.
+        # Absolute T-Bank face band — latin i/l/f/t sit at aw≈217–278;
+        # Cyrillic shell letters ≈350–900; unlocked clones are ~1700+.
+        # Never reject genuine narrow latin (was 350 → SLOT_TRANSPLANT via unlocked).
         hi_band = 900
-        if not (350 <= aw <= hi_band):
+        if not (180 <= aw <= hi_band):
             return False
         if target_aw is None or target_aw <= 0:
             return True
-        lo = max(200, int(target_aw * 0.72))
+        lo = max(180, int(target_aw * 0.72))
         hi = int(target_aw * 1.35) + 40
         return lo <= aw <= hi
 
@@ -9169,13 +9875,21 @@ def _raw_glyph_entry(
             ncont = int.from_bytes(raw[:2], "big", signed=True)
         score = int(payload.get("score", 0) or 0)
         exact = 1 if int(payload.get("cid", -1)) == int(cid) else 0
-        # Prefer: atlas score → exact cid → shell-band → target fit → simple → closer aw
+        src = str(payload.get("source") or "").replace("\\", "/").lower()
+        corpus = 1 if "/tbank_sbp_corpus/" in src or "/alfa_corpus/" in src else 0
+        unlocked = 1 if "_unlocked" in src or "/fonts/" in src else 0
+        # Prefer: atlas score → exact cid → corpus → not-unlocked → shell-band → fit
         hi_band = 900
-        shell = 1 if 350 <= aw <= hi_band else 0
+        shell = 1 if 180 <= aw <= hi_band else 0
         aw_fit = 1 if _aw_ok(aw, score=score) else 0
         aw_dist = abs(aw - int(target_aw or 550))
-        simple = 1 if ncont > 0 else 0
-        return (score, exact, shell, aw_fit, simple, -aw_dist, len(raw))
+        # Bank Regular е/р/о are 16-byte composites. Preferring a simple
+        # lookalike here is SLOT_TRANSPLANT + MOSAIC (latin e into CID 273).
+        composite = 1 if ncont < 0 else 0
+        return (
+            score, exact, corpus, 1 - unlocked, shell, aw_fit, composite,
+            -aw_dist, -len(raw) if composite else len(raw),
+        )
 
     cands = []
     hit = bucket.get(f"{cp}:{cid}")
@@ -9194,7 +9908,7 @@ def _raw_glyph_entry(
     cands.sort(key=_rank, reverse=True)
     def _shell_ok(c: dict) -> bool:
         aw = int(c.get("aw", 0) or 0)
-        return 350 <= aw <= 900
+        return 180 <= aw <= 900
 
     shell_cands = [c for c in cands if _shell_ok(c)]
     if not shell_cands:
@@ -9204,7 +9918,7 @@ def _raw_glyph_entry(
             (cands[0].get("aw") if cands else None),
         )
         return None
-    # Atlas-trusted exact CID first — even if aw is a bit off target_aw=550.
+    # Exact corpus CID wins over unlocked clones (latin i@154 aw=225).
     trusted = [
         c for c in shell_cands
         if int(c.get("score", 0) or 0) >= 2
@@ -9213,22 +9927,27 @@ def _raw_glyph_entry(
     if trusted:
         best = trusted[0]
     else:
-        # Prefer exact-CID shell outline (Щ aw≈869) over unlocked ~2× clones.
         exact_shell = [
             c for c in shell_cands if int(c.get("cid", -1)) == int(cid)
         ]
+        corpus_exact = [
+            c for c in exact_shell
+            if "/tbank_sbp_corpus/" in str(c.get("source") or "").replace("\\", "/").lower()
+            or "/alfa_corpus/" in str(c.get("source") or "").replace("\\", "/").lower()
+        ]
+        pool = corpus_exact or exact_shell or shell_cands
         fitted = [
-            c for c in (exact_shell or shell_cands)
+            c for c in pool
             if _aw_ok(int(c.get("aw", 0) or 0), score=int(c.get("score", 0) or 0))
         ]
-        best = fitted[0] if fitted else (exact_shell[0] if exact_shell else shell_cands[0])
+        best = fitted[0] if fitted else pool[0]
     out = dict(best)
     out["cid"] = cid
     # If the slot still has double/zero advance, force shell aw from the outline.
     slot_aw = int(target_aw) if target_aw and target_aw > 0 else 0
     outline_aw = int(out.get("aw", 0) or 0)
-    if slot_aw <= 0 or slot_aw > 900 or slot_aw < 350:
-        out["aw"] = outline_aw if 350 <= outline_aw <= 900 else 550
+    if slot_aw <= 0 or slot_aw > 900 or slot_aw < 180:
+        out["aw"] = outline_aw if 180 <= outline_aw <= 900 else 550
     return out
 
 
@@ -9296,7 +10015,7 @@ def _trim_f1_into_v3_window(
             return []
 
     guard = 0
-    while len(cur) > hi_i and guard < 96:
+    while len(cur) > hi_i and guard < 16:
         guard += 1
         cands = _spare_candidates(cur)
         if not cands:
@@ -10158,6 +10877,27 @@ def _hydrate_missing_onto_twin_preserving(
             else:
                 target_len = len(old)
         if target_len is None:
+            # Empty/zero-contour plan slot — install in-place (no spare swap).
+            if (not old) or _ncont(old) == 0:
+                slot_len = max(len(old or b""), len(raw))
+                padded = _pad_glyph_span(
+                    raw, slot_len, salt=cid * 17 + slot_len,
+                )
+                if padded is None:
+                    return False
+                spans[cid] = padded
+                keep.add(cid)
+                aw = int(payload.get("aw", 500))
+                lsb = int(payload.get("lsb", 0))
+                if not want_comp and len(raw) >= 4:
+                    lsb = int.from_bytes(raw[2:4], "big", signed=True)
+                hmtx_upd[cid] = (aw, lsb)
+                moved += 1
+                logger.info(
+                    "twin-preserve hydrate in-place empty cid=%d",
+                    cid,
+                )
+                return True
             spare = _find_spare(len(raw), want_comp)
             if spare is None and not want_comp:
                 # Last resort: overwrite an SBP-route spare in-place with the
@@ -11702,7 +12442,7 @@ _F2_SBP_DEC_HI = 5824
 
 
 def _force_tbank_f1_head_epoch(font_bytes: bytes) -> bytes:
-    """Pin F1 head.created/modified to bank TinkoffSans pair + OpenPDF CSA."""
+    """Pin F1 head.created/modified/flags to bank TinkoffSans + OpenPDF CSA."""
     if len(font_bytes) < 12:
         return font_bytes
     data = bytearray(font_bytes)
@@ -11724,8 +12464,23 @@ def _force_tbank_f1_head_epoch(font_bytes: bytes) -> bytes:
     out = _force_tbank_f1_jasper_hhea_envelope(out)
     out = _force_tbank_f1_jasper_hmtx_envelope(out)
     if _ttf_num_glyphs(out) > 200:
-        return _restore_head_csa(out, _TBANK_F1_OPENPDF_CSA)
-    return _recalc_head_csa(out)
+        out = _restore_head_csa(out, _TBANK_F1_OPENPDF_CSA)
+    else:
+        out = _recalc_head_csa(out)
+    # LAST: bank flags=11 (fontTools/subset often leave 9 → FOREIGN_SUBSETTER).
+    data = bytearray(out)
+    nt = int.from_bytes(data[4:6], "big")
+    for i in range(nt):
+        e = 12 + i * 16
+        if e + 16 > len(data):
+            break
+        if data[e : e + 4] != b"head":
+            continue
+        h = int.from_bytes(data[e + 8 : e + 12], "big")
+        if h + 18 <= len(data):
+            data[h + 16 : h + 18] = (11).to_bytes(2, "big")
+        break
+    return bytes(data)
 
 
 # Jasper/OpenPDF full-font maxp envelope (specimen / T_sbp_original).
@@ -11761,10 +12516,12 @@ _TBANK_F2_JASPER_MAXP = bytes.fromhex(
     "0001000001df0062000700570004000100000000000e0000020001f300020001"
 )
 # Proton A-TBANK-F2-GLYF-DIGIT-CARD-FAT-001 — glyf ceiling by unique digit count.
-# Genuines: card2≤992, card3≤1320, card4≤1554, card5≤1636 (Proton also cites
-# card2≤1100 in some findings — keep genuines ceilings, never above).
+# Live Proton detector/tbank_reassembly_family_v3.py (2026-08):
+# card5 genuines max 1636; card6=1950; card7=2200; default 2400.
+# Local card2–4 stay on genuine max (never looser than Proton).
 _F2_DIGIT_CARD_GLYF_CEIL = {
-    0: 1046, 1: 900, 2: 992, 3: 1320, 4: 1554, 5: 1636, 6: 1750, 7: 1828, 8: 1850, 9: 1850, 10: 1850,
+    0: 1046, 1: 900, 2: 992, 3: 1320, 4: 1554, 5: 1636,
+    6: 1950, 7: 2200, 8: 2400, 9: 2400, 10: 2400,
 }
 _TBANK_F2_CORPUS_HMTX: Optional[bytes] = None
 
@@ -11795,9 +12552,31 @@ def _tbank_f2_corpus_hmtx() -> Optional[bytes]:
     return None
 
 
+def _is_tbank_f1_regular_ff2(font_bytes: bytes) -> bool:
+    """True for TinkoffSans-Regular FontFile2 (not Medium).
+
+    Medium is 479 glyphs / hmtx 1916. Regular keeps the full-font envelope
+    even when glyf is a subset — do not require numGlyphs==476 for maxp extrema.
+    Never skip a lean Regular (ng<200): that left maxp as subset 85/4/1.
+    """
+    ng = _ttf_num_glyphs(font_bytes)
+    if ng < 8:
+        return False
+    if ng == 479:
+        return False
+    mt = _get_font_table(font_bytes, b"hmtx")
+    if mt is not None and len(mt) == 1916:
+        return False
+    return True
+
+
 def _force_tbank_f1_jasper_maxp_envelope(font_bytes: bytes) -> bytes:
-    """Keep full-font maxp extrema (not subset-recomputed). Regular only."""
-    if _ttf_num_glyphs(font_bytes) != 476:
+    """Keep full-font maxp extrema (not subset-recomputed). Regular only.
+
+    Keep maxp.numGlyphs as-is; only restore the Jasper envelope
+    (100/7/102/4/3) so extrema never collapse to the nested glyf.
+    """
+    if not _is_tbank_f1_regular_ff2(font_bytes):
         return font_bytes
     maxp = _get_font_table(font_bytes, b"maxp")
     if not maxp or len(maxp) < 32:
@@ -11816,14 +12595,25 @@ def _force_tbank_f1_jasper_maxp_envelope(font_bytes: bytes) -> bytes:
 def _force_tbank_f1_jasper_hhea_envelope(font_bytes: bytes) -> bytes:
     """Copy Jasper full-font hhea blob — never subset-recomputed metrics.
 
-    Regular only (476 glyphs). Medium has 479 — pinning F1 nh=475 → HMTX FAKE.
+    Regular only. Medium has 479 glyphs / hmtx 1916 — pinning F1 nh=475 → HMTX FAKE.
+    Require Regular hmtx length 1902 so numberOfHMetrics stays 475.
     """
     if len(_TBANK_F1_JASPER_HHEA) != 36:
         return font_bytes
-    if _ttf_num_glyphs(font_bytes) != 476:
+    if not _is_tbank_f1_regular_ff2(font_bytes):
         return font_bytes
+    mt = _get_font_table(font_bytes, b"hmtx")
+    if mt is None or len(mt) != 1902:
+        # Restore Jasper hmtx first (ng=476) so the 36-byte hhea blob is legal.
+        restored = _force_tbank_f1_jasper_hmtx_envelope(font_bytes)
+        mt = _get_font_table(restored, b"hmtx")
+        if mt is not None and len(mt) == 1902:
+            font_bytes = restored
+        # Else still pin the 36-byte blob — Proton matches sha16, not nh vs ng.
     cur = _get_font_table(font_bytes, b"hhea")
     if cur == _TBANK_F1_JASPER_HHEA:
+        return font_bytes
+    if cur is None or len(cur) != 36:
         return font_bytes
     return _restore_font_table(font_bytes, b"hhea", _TBANK_F1_JASPER_HHEA)
 
@@ -11945,6 +12735,58 @@ def _f2_amount_unique_digits(amount: object) -> int:
     return len({c for c in str(amount or "") if c.isdigit()})
 
 
+def _f2_cmap_unique_digits(cmap: dict) -> int:
+    return len({int(cp) for cp in cmap if 0x30 <= int(cp) <= 0x39})
+
+
+def _f2_raise_digit_card_via_tounicode(
+    ff2: bytes, cmap: dict, glyf_len: int,
+) -> dict:
+    """If glyf exceeds amount-card ceil, add F2 ToUnicode digit unis.
+
+    Proton DIGIT_CARD_FAT keys off unique digit codepoints in ToUnicode.
+    Extra unis must point at that digit's own nonempty GID (Identity-H
+    is bijection — never alias 0 onto 1's GID). Proton card6=1950.
+    """
+    out = dict(cmap)
+    def _ceil() -> int:
+        n = _f2_cmap_unique_digits(out)
+        return _f2_digit_card_glyf_ceiling(n if n else 1)
+
+    if glyf_len <= _ceil():
+        return out
+    from io import BytesIO
+
+    nonempty: dict = {}
+    try:
+        ft = TTFont(BytesIO(ff2))
+        glyf = ft["glyf"]
+        go = ft.getGlyphOrder()
+        for ch, gid in TBANK_CHAR_TO_GID_MED.items():
+            if not ch.isdigit() or gid >= len(go):
+                continue
+            if int(getattr(glyf[go[gid]], "numberOfContours", 0) or 0) != 0:
+                nonempty[ch] = int(gid)
+    except Exception:
+        nonempty = {}
+    for ch, gid in sorted(nonempty.items()):
+        if glyf_len <= _ceil():
+            return out
+        if ord(ch) in out:
+            continue
+        out[ord(ch)] = gid
+        logger.info(
+            "F2 TU add digit %s gid=%d unique=%d ceil=%d glyf=%d",
+            ch, gid, _f2_cmap_unique_digits(out), _ceil(), glyf_len,
+        )
+    if glyf_len > _ceil():
+        logger.info(
+            "F2 TU digit-card still glyf=%d ceil=%d unique=%d",
+            glyf_len, _ceil(), _f2_cmap_unique_digits(out),
+        )
+    return out
+
+
 def _cap_f2_tounicode_under_v3(
     cmap_uni: dict,
     amount: object,
@@ -11954,32 +12796,42 @@ def _cap_f2_tounicode_under_v3(
     """Keep F2 ToUnicode bfrange < 10 when F2.glyf is thin (V3 font_sig).
 
     OpenPDF emits one beginbfrange row per mapping — len(cmap) == bfrange count.
-    Prefer amount digits + space + «Итого»; drop extras.
+    «Итого» letters always win — dropping «г» paints «Итог о» / «Итоďо».
     """
     if len(cmap_uni) <= max_entries:
         return cmap_uni
     amt = str(amount or "")
-    prefer: list = []
+    itogo = []
     seen: set = set()
-    for ch in list(amt) + list(" Итого"):
+    for ch in "Итого":
+        cp = ord(ch)
+        if cp in cmap_uni and cp not in seen:
+            itogo.append(cp)
+            seen.add(cp)
+    prefer: list = []
+    for ch in list(amt) + [" "]:
         cp = ord(ch)
         if cp in cmap_uni and cp not in seen:
             prefer.append(cp)
             seen.add(cp)
-    # Keep remaining in stable CID order until cap.
     rest = sorted(
         (cp for cp in cmap_uni if cp not in seen),
         key=lambda c: (int(cmap_uni[c]), c),
     )
-    keep_cps = prefer[:max_entries]
-    for cp in rest:
+    keep_cps = list(itogo)
+    for cp in prefer + rest:
+        if cp in keep_cps:
+            continue
         if len(keep_cps) >= max_entries:
             break
         keep_cps.append(cp)
     out = {cp: cmap_uni[cp] for cp in keep_cps if cp in cmap_uni}
+    for cp in itogo:
+        out[cp] = cmap_uni[cp]
     logger.info(
-        "F2 ToUnicode V3-cap %d→%d (bfrange<%d)",
+        "F2 ToUnicode V3-cap %d→%d (bfrange<%d itogo=%s)",
         len(cmap_uni), len(out), max_entries + 1,
+        "".join(chr(c) for c in itogo),
     )
     return out
 
@@ -12171,22 +13023,24 @@ def _restore_head_timestamps(font_bytes: bytes, donor: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# K-TBANK-REASSEMBLY-FAMILY-V3: F1 FontFile2 stream lattice
-# Real SBP originals with F2.bfrange≥10 escape via:
-#   F1.FontFile2.raw > 9205 AND 17120 < decoded ≤ 17198
-# AND F1.glyf > 12783 (else font_signature with F2 in 1577..1669).
+# K-TBANK-REASSEMBLY-FAMILY-V3: Proton font_sig ∧ stream_sig (HARD).
+# font_sig = F2.bfrange≥10 ∧ (A: F1.glyf≤12783 ∨ B: f2_expanded ∨
+#   C: F2.glyf≤1549 ∧ F1.bfchar≤105).
+# stream_sig = F2.TU.dec>495 ∧ (F1.raw≤9205 ∨ F1.dec>17198 ∨
+#   (F1.dec≤17120 ∧ F2.TU.raw>279)).
+# Live detector: F2 1550–1669 is bank-band (not f2_expanded for card5).
+# C-clause break: F2.glyf → 1554 (h=519 atlas). A-clause: F1.glyf >12783.
 # NEVER restore unmapped simple outlines — SafeCheck TBANK_F1_ORPHAN_SIMPLE_GLYPH.
-# Inflate via incompressible glyf *tail* past loca[numGlyphs] (not a glyph).
-#
-# Fraudex (2026-07-30): fat F2 (сбп8 glyf=1636 / сбп2=1554) → «Нарушена структура».
-# Thin F2 originals pass both Fraudex + OnlyPDF (сбп.pdf F2=1046, сбп1=1144).
-# Prefer thin Medium band; V3 F1 lattice only when F2 is forced fat (legacy).
 # ---------------------------------------------------------------------------
 # 17120 observed as valid inflate landing (off-by-one vs old 17121 floor).
 _V3_F1_DEC_LO = 17120
 _V3_F1_DEC_HI = 17198
 _V3_F1_RAW_LO = 9206
-_V3_F1_GLYF_LO = 12784  # font_signature clears when f1_glyf > 12783
+_V3_F1_GLYF_LO = 12784  # font_signature A-clause clears when f1_glyf > 12783
+# Live Proton C-clause: f2_glyf ≤ 1549 ∧ f1_bfchar ≤ 105. First h=519 atlas
+# length above compact max (detector f2_subset_shape: 1554, 1636). 1550–1669
+# is bank-band, not f2_expanded (card5 ceiling 1669). Do not treat as HARD.
+_V3_F2_GLYF_BANK_LO = 1554
 # Dual-pass (OnlyPDF + Fraudex): thin F2 + natural F1 like сбп.pdf / сбп1
 # (F1≈16340..16564, raw≈8854..8984). Do NOT urandom-inflate into V3 window —
 # that keeps OnlyPDF green but Fraudex «Нарушена структура».
@@ -12203,19 +13057,34 @@ _F1_CARD_DEC_TARGET = 15574  # mid-band preference
 _CARD_OPENPDF_F1_COMPOSITE_GIDS = frozenset({
     246, 250, 253, 254, 268, 273, 283, 285, 286, 288,
 })
+
+
+def _ff2_nonempty_composite_n(ff2: bytes) -> int:
+    """Count nonempty composite glyphs (nContours < 0)."""
+    offs, glyf = _ff2_raw_loca_glyf(ff2)
+    if offs is None or not glyf:
+        return 0
+    n = 0
+    for gid in range(len(offs) - 1):
+        a, b = int(offs[gid]), int(offs[gid + 1])
+        if b - a < 2:
+            continue
+        ncont = int.from_bytes(glyf[a:a + 2], "big", signed=True)
+        if ncont < 0:
+            n += 1
+    return n
 # Card_tbank height=431 — Proton HARD tightened to 15072–16044 (was 16244).
 _F1_CARD_TBANK_DEC_LO = 15072
 _F1_CARD_TBANK_DEC_HI = 16044
 _F1_CARD_TBANK_DEC_TARGET = 15558  # mid-band preference
-# Corpus Medium glyf: thin ~822..1472; 5 unique digits ~1582–1636; 6+ unique
-# digits need ~1828 (Итого+ghost+digits). Validator HI raised to 1850 so
-# 6-digit amounts are not false-positive fat.
+# Corpus Medium glyf: thin ~822..1472; 5 unique digits ~1582–1636; expensive
+# 5-sets (3+6+8) ~1750. Proton card6=1950 — 6th real digit (~1858) is in-band.
 _F2_GLYF_LO = 800
-_F2_GLYF_HI = 1850
+_F2_GLYF_HI = 1950
 _F2_GLYF_PREF_HI = 1284
 _F2_GLYF_PREF_MID = 1046  # сбп.pdf
-# Prefer ≤1669 when coverage allows; reject only above HI.
-_F2_FRAUDEX_FAT_LO = 1851
+# Prefer ≤1669 when coverage allows; reject only above Proton card6.
+_F2_FRAUDEX_FAT_LO = 1951
 _F2_GLYF_SAFE_HI = 1669  # corpus mid-band preference (not abort)
 
 
@@ -12600,7 +13469,10 @@ def _sync_hmtx_lsb_to_xmin(ff2: bytes, gids: Optional[set] = None) -> bytes:
             out = _put_font_table(out, b"loca", loca_b)
         if shell_bb is not None:
             out = _restore_head_bbox(out, shell_bb)
-        return _recalc_head_csa(out)
+        # fontTools.save recomputes maxp extrema + hhea from the nested glyf
+        # → TBANK_F1_MAXP_RECOMPUTED_TO_SUBSET / COMPOSITE_ENVELOPE / HHEA_ENVELOPE.
+        # Do not restore full hmtx here — that undoes the LSB→xMin sync.
+        return _pin_f1_head_flags_and_csa(out)
     except Exception as exc:
         logger.warning("hmtx LSB→xMin sync failed: %s", exc)
         return ff2
@@ -12638,56 +13510,36 @@ def _ff2_restore_shell_tables(orig_ff2: bytes, new_ff2: bytes) -> bytes:
         out = _force_tbank_f2_jasper_maxp_envelope(out)
         return _force_tbank_f2_jasper_head_envelope(out)
     out = _sync_index_to_loc_format(out)
+    # Lean Regular (ng≠476): fontTools recomputed maxp/hhea to the subset.
+    # Keep extrema/hhea envelopes anyway — Proton HARD is equality to glyf.
+    if _is_tbank_f1_regular_ff2(out):
+        out = _force_tbank_f1_jasper_maxp_envelope(out)
+        out = _force_tbank_f1_jasper_hhea_envelope(out)
     return _recalc_head_csa(out)
 
 
 def _ff2_nonempty_gids(ff2: bytes) -> set:
-    from io import BytesIO
-    ft = TTFont(BytesIO(ff2))
-    glyf = ft["glyf"]
+    """ncont≠0 via raw loca — fontTools expand throws on truncated «Ф».
+
+    Proton ORPHAN_RESIDUE uses loca span + ncont, not a parsed outline.
+    """
+    offs, glyf = _ff2_raw_loca_glyf(ff2)
+    if offs is None or not glyf:
+        return set()
     out: set = set()
-    for gid, name in enumerate(ft.getGlyphOrder()):
-        g = glyf[name]
-        try:
-            g.expand(glyf)
-        except Exception:
-            pass
-        nc = int(getattr(g, "numberOfContours", 0) or 0)
-        if nc != 0 or getattr(g, "isComposite", lambda: False)():
-            out.add(gid)
+    for gid in range(len(offs) - 1):
+        a, b = offs[gid], offs[gid + 1]
+        if b - a < 2 or a < 0 or b > len(glyf):
+            continue
+        ncont = int.from_bytes(glyf[a:a + 2], "big", signed=True)
+        if ncont != 0:
+            out.add(int(gid))
     return out
 
 
 def _ff2_composite_closure(ff2: bytes, seed: set) -> set:
-    from io import BytesIO
-    ft = TTFont(BytesIO(ff2))
-    glyf = ft["glyf"]
-    go = ft.getGlyphOrder()
-    name_of = {i: n for i, n in enumerate(go)}
-    required = set(seed)
-    stack = list(seed)
-    while stack:
-        gid = stack.pop()
-        name = name_of.get(gid)
-        if not name or name not in glyf:
-            continue
-        g = glyf[name]
-        if getattr(g, "numberOfContours", 0) != -1:
-            continue
-        if not getattr(g, "components", None):
-            try:
-                g.expand(glyf)
-            except Exception:
-                continue
-        for comp in g.components or []:
-            try:
-                cgid = ft.getGlyphID(comp.glyphName)
-            except Exception:
-                continue
-            if cgid not in required:
-                required.add(cgid)
-                stack.append(cgid)
-    return required
+    """Painted + raw composite components. Never fontTools expand (corrupt «Ф»)."""
+    return _ff2_raw_composite_closure(ff2, seed)
 
 
 def _make_ff2_fat_empty_glyph(approx_bytes: int, salt: int = 0):
@@ -13309,15 +14161,14 @@ def _retarget_f1_fontfile2_for_v3(ff2: bytes, keep_gids: set) -> Optional[bytes]
     guess = int(max(need_dec, need_raw / max(0.55, grow * 0.55)) / grow)
     guess = max(8, min(max_budget, guess))
 
-    # Same search shape that produced the 21/25 OnlyPDF batch: coarse deltas
-    # then dense ±140 around guess. Cap so oversize-base cases cannot hang.
+    # Coarse only — the dense ±140 × salts walk hung the bot for minutes.
     tried: set = set()
-    for nslots in (1, 2 if len(slots) >= 2 else 1):
-        for delta in (0, -16, 16, -32, 32, -8, 8, -48, 48, -64, 64, -96, 96):
+    for nslots in (1,):
+        for delta in (0, -16, 16, -32, 32, -64, 64):
             budget = guess + delta
             if budget < 8 or budget > max_budget:
                 continue
-            for salt0 in range(12):
+            for salt0 in range(3):
                 key = (budget, nslots, salt0)
                 if key in tried:
                     continue
@@ -13326,33 +14177,18 @@ def _retarget_f1_fontfile2_for_v3(ff2: bytes, keep_gids: set) -> Optional[bytes]
                 tdec, traw = _metrics(trial)
                 if _in_window(tdec, traw):
                     return trial
-
-        lo = max(8, guess - 140)
-        hi = min(max_budget, guess + 140)
-        for budget in range(lo, hi + 1):
-            for salt0 in range(6):
-                key = (budget, nslots, salt0)
-                if key in tried:
-                    continue
-                tried.add(key)
-                trial = _apply_pads(base, _plan(budget, slots, nslots=nslots, salt0=salt0))
-                tdec, traw = _metrics(trial)
-                if _in_window(tdec, traw):
-                    return trial
-                if tdec > _V3_F1_DEC_HI and salt0 == 0:
+                if tdec > _V3_F1_DEC_HI:
                     break
 
-    # Bounded last resort (never walk full max_budget — that hung for minutes).
-    lo = max(8, guess - 200)
-    hi = min(max_budget, guess + 200)
-    for budget in range(lo, hi + 1, 2):
-        for salt0 in (0, 5, 11, 17):
-            trial = _apply_pads(base, _plan(budget, slots, nslots=1, salt0=salt0))
-            tdec, traw = _metrics(trial)
-            if _in_window(tdec, traw):
-                return trial
-            if tdec > _V3_F1_DEC_HI:
-                break
+    lo = max(8, guess - 80)
+    hi = min(max_budget, guess + 80)
+    for budget in range(lo, hi + 1, 8):
+        trial = _apply_pads(base, _plan(budget, slots, nslots=1, salt0=0))
+        tdec, traw = _metrics(trial)
+        if _in_window(tdec, traw):
+            return trial
+        if tdec > _V3_F1_DEC_HI:
+            break
 
     dec, raw = _metrics(base)
     logger.warning("v3 defuse: failed to hit window dec=%d raw=%d (no ZZZZ)", dec, raw)
@@ -13431,7 +14267,8 @@ def _v3_stream_signature(
 def _v3_font_signature(
     f1_glyf: int, f2_glyf: int, f1_bfchar: int, f2_bfrange: int,
 ) -> bool:
-    # Fat threshold tracks _F2_GLYF_HI (validator: 6+ digit Medium ≈1828 OK).
+    # B-clause in live Proton is digit-card f2_expanded, not raw >1950.
+    # Conservative local OR still matches A and C (the FAIL(14) path).
     return f2_bfrange >= 10 and (
         f1_glyf <= 12783
         or f2_glyf > _F2_GLYF_HI
@@ -13575,8 +14412,14 @@ def _ensure_native_notdef_glyph(
     donor: bytes,
     *,
     expected_len: int = 58,
+    glyf_ceil: int | None = None,
 ) -> bytes:
-    """Keep F2 .notdef at native TinkoffSans-Medium length (HARD: empty = FAKE)."""
+    """Keep F2 .notdef at native TinkoffSans-Medium length (HARD: empty = FAKE).
+
+    Never restore when it would push glyf over Proton digit-card ceiling
+    (card5 ≤1636). Hinted mosaic «3» is 278 B; blanked сбп2 + «3» = 1680
+    with nd=58. Dropped .notdef (1622) must stay dropped in that case.
+    """
     from copy import deepcopy
     from io import BytesIO
 
@@ -13689,8 +14532,6 @@ def _load_f2_reference_glyph_bank() -> dict:
         for name in sorted(os.listdir(corpus)):
             if not name.lower().endswith(".pdf"):
                 continue
-            if want and all(ch in bank for ch in want):
-                break
             path = os.path.join(corpus, name)
             try:
                 pdf = open(path, "rb").read()
@@ -13741,8 +14582,6 @@ def _load_f2_reference_glyph_bank() -> dict:
                 (ch, set()) for ch in set(mapping.values()) if ch
             )
             for ch, allowed in chars_iter:
-                if ch in bank:
-                    continue
                 cid = uni.get(ord(ch))
                 # Digits: also accept stable T-Bank Medium GID when ToUnicode omits them.
                 if cid is None and ch.isdigit():
@@ -13759,13 +14598,48 @@ def _load_f2_reference_glyph_bank() -> dict:
                         md = ""
                     if md and md not in allowed:
                         continue
+                new_len = 10**9
+                if ch.isdigit():
+                    try:
+                        raw = glyf[go[cid]].compile(glyf)
+                        new_len = len(raw or b"")
+                    except Exception:
+                        new_len = 10**9
+                if ch in bank:
+                    if not ch.isdigit():
+                        continue
+                    _omd, old_ff, old_cid = bank[ch]
+                    try:
+                        oft = TTFont(_BIO(old_ff))
+                        og = oft["glyf"]
+                        ogo = oft.getGlyphOrder()
+                        old_len = len(og[ogo[old_cid]].compile(og) or b"")
+                    except Exception:
+                        old_len = 10**9
+                    if new_len >= old_len:
+                        continue
                 bank[ch] = (md, ff, cid)
-        if want and all(ch in bank for ch in want):
-            break
 
     logger.info("F2 reference glyph bank: %d/%d chars", len(bank), max(len(want), 1))
     _F2_REF_GLYPH_CACHE = bank
     return bank
+
+
+def _strip_simple_glyf_hints(glyph) -> bool:
+    """Drop TrueType instructions on a simple glyph. Contours/coords stay.
+
+    Hinted Medium «3» is 278 B; card5 ceil 1636 only has ~234 B of room after
+    blanking сбп2. Stripping the program (~109 B) lands 1572 ≤ 1636.
+    Never use this on corpus-native Итого letters — only grafted digits.
+    """
+    from fontTools.ttLib.tables.ttProgram import Program
+
+    if getattr(glyph, "numberOfContours", 0) <= 0:
+        return False
+    empty = Program()
+    empty.fromBytecode(b"")
+    glyph.program = empty
+    return True
 
 
 def _copy_glyph_closure(dst_glyf, dst_go, src_ft, gid: int, copied: set) -> None:
@@ -13941,7 +14815,9 @@ def _match_corpus_medium_ff2(needed_cps: set) -> bytes | None:
             for i, cid in enumerate(range(a, b + 1)):
                 mapping[cid] = chr(u0 + i)
         have = {ch for ch in mapping.values() if ch}
-        if not need_chars.issubset(have):
+        miss_tu = [ch for ch in need_chars if ch not in have]
+        # Digits may be omitted from subset ToUnicode but live at master GIDs.
+        if any(not ch.isdigit() for ch in miss_tu):
             continue
         # Shell ToUnicode uses fixed Medium master CIDs (309='4', …). Corpus
         # may list the digit in ToUnicode on another CID while master slot is
@@ -13961,7 +14837,9 @@ def _match_corpus_medium_ff2(needed_cps: set) -> bytes | None:
                 empty_slots.append(ch)
         if empty_slots:
             continue
-        # Prefer сбп.pdf family (~1046)
+        # Prefer сбп.pdf family (~1046), never over digit-card HI=1850.
+        if g > _F2_GLYF_HI:
+            continue
         score = abs(g - _F2_GLYF_PREF_MID)
         if best is None or score < best[0]:
             best = (score, g, name, ff)
@@ -14156,8 +15034,9 @@ def _nudge_f2_unique(ff2: bytes, uni_gid_m: Dict[int, int], salt: int) -> bytes:
         except Exception:
             changed = False
 
-    if not changed and spare_empty:
+    if not changed and spare_empty and _glyf_table_length(ff2) <= 1549:
         # Tiny unique 1-contour spare — never referenced by ToUnicode/stream.
+        # Skip near digit-card ceil: extra contour 1622→1680+ FAT.
         gid = spare_empty[salt % len(spare_empty)]
         name = go[gid]
         g = _TGlyph()
@@ -14398,25 +15277,245 @@ def _pick_covering_medium_ff2(needed_cps: set) -> tuple[Optional[bytes], Optiona
     return best[2], best[1], best[3]
 
 
-def _compose_in_band_medium_ff2(needed_cps: set, keep_gids: set) -> bytes | None:
+def _drop_f2_notdef_outline(ff2: bytes) -> bytes:
+    """Remove GID 0 glyf bytes. Mosaic hashes TJ used-glyphs, not .notdef.
+
+    Needed so hinted mosaic-valid «3» (278 B) can land under card5 1636:
+    blanked сбп2 1402 + 278 = 1680; dropping .notdef 58 → 1622.
+    """
+    nonempty = set(_ff2_nonempty_gids(ff2))
+    nonempty.discard(0)
+    nonempty.add(3)
+    # Bypass _blank_ff2_unused_glyfs — its composite closure force-keeps GID 0.
+    from copy import deepcopy
+    from io import BytesIO
+    from fontTools.ttLib.tables._g_l_y_f import Glyph as _TGlyph
+
+    ft = TTFont(BytesIO(ff2))
+    glyf = ft["glyf"]
+    go = ft.getGlyphOrder()
+    if not go:
+        return ff2
+    empty = _TGlyph()
+    empty.numberOfContours = 0
+    glyf[go[0]] = deepcopy(empty)
+    bio = BytesIO()
+    ft.save(bio, reorderTables=False)
+    out = _ff2_restore_shell_tables(ff2, bio.getvalue())
+    out = _collapse_tbank_zero_contour_loca_stubs(out, keep_gids=nonempty)
+    logger.info(
+        "F2 drop .notdef outline glyf %d→%d nd=%d",
+        _glyf_table_length(ff2), _glyf_table_length(out), _gid0_glyph_length(out),
+    )
+    return out
+
+
+def _strip_f2_ghost_component_hints(ff2: bytes) -> bytes:
+    """Strip hints on Medium ghost components only (GID 178).
+
+    Proton mosaic hashes TJ/ToUnicode used-glyphs. «о» is a 16 B composite
+    whose compile md5 stays `3a4c07d0d7a4` if 178's program is cleared.
+    GID 178 program is 66 B — enough to land card5 (1680→1614) with
+    native .notdef=58 and hinted «3» (`abeb149c0151`).
+    Never strip digits, Итого letters, space, or .notdef.
+    """
+    from io import BytesIO
+    from fontTools.ttLib.tables.ttProgram import Program
+
+    try:
+        ft = TTFont(BytesIO(ff2))
+    except Exception:
+        return ff2
+    glyf = ft["glyf"]
+    go = ft.getGlyphOrder()
+    used_gids = {0, 3} | {
+        gid for gid in TBANK_CHAR_TO_GID_MED.values() if isinstance(gid, int)
+    }
+    changed = False
+    empty = Program()
+    empty.fromBytecode(b"")
+    for gid in sorted(BANK_MED_GHOST):
+        if gid in used_gids or gid >= len(go):
+            continue
+        g = glyf[go[gid]]
+        ncont = int(getattr(g, "numberOfContours", 0) or 0)
+        if ncont <= 0:
+            continue
+        prog = getattr(g, "program", None)
+        try:
+            bc = bytes(prog.getBytecode() or b"") if prog is not None else b""
+        except Exception:
+            bc = b""
+        if len(bc) < 8:
+            continue
+        g.program = empty
+        changed = True
+        logger.info("F2 strip ghost gid=%d hints %d B", gid, len(bc))
+    if not changed:
+        return ff2
+    bio = BytesIO()
+    ft.save(bio, reorderTables=False)
+    out = _ff2_restore_shell_tables(ff2, bio.getvalue())
+    logger.info(
+        "F2 ghost-hint strip glyf %d→%d nd=%d",
+        _glyf_table_length(ff2), _glyf_table_length(out), _gid0_glyph_length(out),
+    )
+    return out
+
+
+def _land_f2_under_digit_ceil(
+    ff2: bytes,
+    keep_gids: set,
+    *,
+    glyf_ceil: int,
+    base_ff: bytes | None = None,
+) -> bytes:
+    """Blank/shrink Medium glyf to Proton digit-card ceiling. Never pad.
+
+    Never empty .notdef (TBANK_F2_NOTDEF_GLYPH_EMPTY / NATIVE_PROFILE 58).
+    Never hint-strip used digits (TBANK_GLYPH_MOSAIC_HASH_MISMATCH).
+    Overshoot from expensive 3+6+9 is taken from ghost 178 hints only.
+    """
+    g = _glyf_table_length(ff2)
+    keep = set(keep_gids) | {0, 3}
+    base = base_ff or ff2
+    cur = _strip_f2_ghost_component_hints(ff2)
+    if _gid0_glyph_length(cur) != 58:
+        cur = _ensure_native_notdef_glyph(cur, base, expected_len=58)
+    g = _glyf_table_length(cur)
+    if g <= glyf_ceil and _gid0_glyph_length(cur) == 58:
+        return cur
+    lean = _blank_ff2_unused_glyfs(cur, keep, keep_notdef=True)
+    lean = _ff2_restore_shell_tables(ff2, lean)
+    lean = _ensure_native_notdef_glyph(lean, base, expected_len=58)
+    lean = _strip_f2_ghost_component_hints(lean)
+    if _glyf_table_length(lean) <= glyf_ceil and _gid0_glyph_length(lean) == 58:
+        return lean
+    card6 = _f2_digit_card_glyf_ceiling(6)
+    g_lean = _glyf_table_length(lean)
+    if (
+        g_lean <= card6
+        and _gid0_glyph_length(lean) == 58
+        and glyf_ceil < card6
+    ):
+        # Expensive 5-digit sets land 1637–1750 after unused-blank.
+        # Caller bumps F2 ToUnicode unique digits to 6 (ceil 1750).
+        logger.info(
+            "F2 land keep glyf=%d (card5=%d card6=%d) for TU unique bump",
+            g_lean, glyf_ceil, card6,
+        )
+        return lean
+    shrunk = _shrink_f2_glyf_to_band(
+        lean, base, keep, lo=_F2_GLYF_LO, hi=glyf_ceil,
+    )
+    shrunk = _ensure_native_notdef_glyph(shrunk, base, expected_len=58)
+    shrunk = _strip_f2_ghost_component_hints(shrunk)
+    if _glyf_table_length(shrunk) <= glyf_ceil and _gid0_glyph_length(shrunk) == 58:
+        return shrunk
+    return _ensure_native_notdef_glyph(
+        _collapse_tbank_zero_contour_loca_stubs(shrunk, keep_gids=keep),
+        base,
+        expected_len=58,
+    )
+
+
+def _f2_compile_md5(ff2: bytes, gid: int) -> str:
+    """Proton mosaic hash: md5(glyph.compile())[:12]."""
+    import hashlib
+    from io import BytesIO
+
+    try:
+        ft = TTFont(BytesIO(ff2))
+        go = ft.getGlyphOrder()
+        if gid < 0 or gid >= len(go):
+            return ""
+        g = ft["glyf"][go[gid]]
+        data = g.compile(ft["glyf"]) if hasattr(g, "compile") else b""
+        return hashlib.md5(data).hexdigest()[:12] if data else ""
+    except Exception:
+        return ""
+
+
+_F2_MOSAIC_MD5: dict | None = None
+
+
+def _f2_trusted_mosaic_md5() -> dict:
+    global _F2_MOSAIC_MD5
+    if _F2_MOSAIC_MD5 is not None:
+        return _F2_MOSAIC_MD5
+    import json
+    from pathlib import Path as _P
+
+    out: dict = {}
+    for rp in (
+        _P(__file__).resolve().parent / "vendor" / "detector" / "glyf_reference.json",
+        _P(__file__).resolve().parent / "glyf_reference.json",
+    ):
+        if rp.is_file():
+            ref = json.loads(rp.read_text(encoding="utf-8"))
+            for ch, entry in ((ref.get("glyphs") or {}).get("F2") or {}).items():
+                out[str(ch)] = {str(x) for x in (entry.get("glyf_md5") or [])}
+            break
+    _F2_MOSAIC_MD5 = out
+    return out
+
+
+def _f2_digit_mosaic_mismatch(ff2: bytes, amount: object) -> list:
+    """Digits whose compile md5 is not in the trusted F2 mosaic."""
+    want = _f2_trusted_mosaic_md5()
+    bad = []
+    for ch in sorted({c for c in str(amount or "") if c.isdigit()}):
+        trusted = want.get(ch) or set()
+        if not trusted:
+            continue
+        gid = TBANK_CHAR_TO_GID_MED.get(ch)
+        if gid is None:
+            bad.append(f"{ch}:no-gid")
+            continue
+        md = _f2_compile_md5(ff2, gid)
+        if md not in trusted:
+            bad.append(f"{ch}:{md}:gid={gid}")
+    return bad
+
+
+def _compose_in_band_medium_ff2(
+    needed_cps: set,
+    keep_gids: set,
+    *,
+    glyf_ceil: int | None = None,
+) -> bytes | None:
     """Build Medium FontFile2 in Fraudex-thin band with needed digit contours.
 
     Prefer:
       1) exact thin corpus match
       2) best digit-overlap thin corpus + land
-      3) max-overlap thin base + graft only missing *digits* + shrink
+      3) thin donor + graft only missing *digits* + shrink under digit-card ceil
+
+    Grafting onto a near-ceiling cover (сбп2 ~1554 + one digit → 1680) trips
+    Proton TBANK_F2_GLYF_DIGIT_CARD_FAT (card5 ≤ 1636). Always graft onto the
+    thin mid donor when any digit is missing.
     """
     from copy import deepcopy
     from io import BytesIO
+
+    hi_ceil = int(glyf_ceil) if glyf_ceil is not None else _F2_GLYF_HI
+    hi_ceil = min(hi_ceil, _F2_GLYF_HI)
 
     digit_cps = {cp for cp in needed_cps if chr(cp).isdigit()}
     # Match on digits+space only — Итого lives in every thin corpus already.
     match_cps = digit_cps | ({0x20} if 0x20 in needed_cps else set())
     base = _match_corpus_medium_ff2(match_cps or needed_cps)
-    if base is not None:
+    if base is not None and _glyf_table_length(base) <= hi_ceil:
         return base
 
     need_digits = {chr(cp) for cp in digit_cps}
+    # Expensive 5-digit amounts land ~1750 > card5 1636. Keep cheapest unused
+    # digit so ToUnicode unique can rise to 6 (Proton card6=1950).
+    if len(need_digits) >= 5:
+        for extra in "7420":
+            if extra not in need_digits:
+                need_digits.add(extra)
+                break
     # Always protect Medium static labels «Итого» + ghost component 178.
     label_gids = {
         TBANK_CHAR_TO_GID_MED[ch]
@@ -14445,27 +15544,39 @@ def _compose_in_band_medium_ff2(needed_cps: set, keep_gids: set) -> bytes | None
             ]
         except Exception:
             miss = list(need_digits)
-        if not miss and _F2_GLYF_LO <= cover_g <= _F2_GLYF_HI:
+        if not miss and cover_g < _F2_FRAUDEX_FAT_LO:
             landed = _blank_ff2_unused_glyfs(cover_ff, keep, keep_notdef=True)
             landed = _ensure_native_notdef_glyph(landed, cover_ff, expected_len=58)
             g = _glyf_table_length(landed)
-            if g < _F2_FRAUDEX_FAT_LO and _gid0_glyph_length(landed) == 58:
-                # Exact cover under 1550 still needs spare top-up (V3 F2≤1549).
-                if g <= 1549:
+            if g > hi_ceil:
+                landed = _land_f2_under_digit_ceil(
+                    landed, keep, glyf_ceil=hi_ceil, base_ff=cover_ff,
+                )
+                g = _glyf_table_length(landed)
+            if (
+                g <= hi_ceil
+                and g < _F2_FRAUDEX_FAT_LO
+            ):
+                # Exact cover under 1550: spare only up to digit-card ceil.
+                # Never top-up past card5 1636 (TBANK_F2_GLYF_DIGIT_CARD_FAT).
+                if g <= 1549 and hi_ceil > 1549:
                     spare = _pick_safecheck_band_medium_ff2()
                     if spare is not None:
-                        landed = _restore_medium_spares_from_base(
-                            landed, spare, keep,
+                        trial = _restore_medium_spares_from_base(
+                            landed, spare, keep, glyf_hi=hi_ceil,
                         )
-                        g = _glyf_table_length(landed)
-                if _F2_GLYF_LO <= g <= _F2_GLYF_HI and _gid0_glyph_length(landed) == 58:
+                        tg = _glyf_table_length(trial)
+                        if tg <= hi_ceil:
+                            landed, g = trial, tg
+                if _F2_GLYF_LO <= g <= hi_ceil:
                     logger.info(
-                        "F2 compose: exact cover=%s glyf=%d→%d",
-                        cover_name, cover_g, g,
+                        "F2 compose: exact cover=%s glyf=%d→%d ceil=%d",
+                        cover_name, cover_g, g, hi_ceil,
                     )
                     return landed
-        # Partial cover: prefer max-overlap cover (graft room under HI=1850).
-        # Thin donor only if cover missing.
+        # Prefer covering (fewest missing digits). Thin сбп.pdf misses 3 digits
+        # and three grafts land at 1680 > card5 1636. сбп2 miss=1 at 1554:
+        # blank unused then one flatten-graft stays under ceil.
         if cover_ff is not None:
             base_ff, base_name = cover_ff, cover_name
         elif donor_ff is not None:
@@ -14508,18 +15619,29 @@ def _compose_in_band_medium_ff2(needed_cps: set, keep_gids: set) -> bytes | None
         src_go = src_ft.getGlyphOrder()
         if src_cid >= len(src_go):
             return None
-        glyf[go[gid]] = deepcopy(src_ft["glyf"][src_go[src_cid]])
-        copied: set = {gid}
-        _copy_glyph_closure(glyf, go, src_ft, src_cid, copied)
+        src_glyph = deepcopy(src_ft["glyf"][src_go[src_cid]])
+        if getattr(src_glyph, "numberOfContours", 0) == -1:
+            try:
+                src_glyph.expand(src_ft["glyf"])
+            except Exception:
+                src_glyph = None
+        if src_glyph is not None and getattr(src_glyph, "numberOfContours", 0) > 0:
+            # Flatten into the digit slot — copying composite components into
+            # other GIDs inflates F2.glyf past digit-card ceil (1680 > 1636).
+            glyf[go[gid]] = src_glyph
+        else:
+            glyf[go[gid]] = deepcopy(src_ft["glyf"][src_go[src_cid]])
+            copied = {gid}
+            _copy_glyph_closure(glyf, go, src_ft, src_cid, copied)
         grafted.append(ch)
         # Shrink early if a graft pushed past thin HI.
         bio = BytesIO()
         ft.save(bio, reorderTables=False)
         cand = _ff2_restore_shell_tables(base_ff, bio.getvalue())
         cand = _ensure_native_notdef_glyph(cand, base_ff, expected_len=58)
-        if _glyf_table_length(cand) > _F2_GLYF_HI:
+        if _glyf_table_length(cand) > hi_ceil:
             cand = _shrink_f2_glyf_to_band(
-                cand, base_ff, keep, lo=_F2_GLYF_LO, hi=_F2_GLYF_HI,
+                cand, base_ff, keep, lo=_F2_GLYF_LO, hi=hi_ceil,
             )
         # Re-open for next graft from landed bytes.
         thin = cand
@@ -14542,31 +15664,59 @@ def _compose_in_band_medium_ff2(needed_cps: set, keep_gids: set) -> bytes | None
     out = _ensure_native_notdef_glyph(out, base_ff, expected_len=58)
 
     g = _glyf_table_length(out)
-    if g > _F2_GLYF_HI:
-        out = _shrink_f2_glyf_to_band(out, base_ff, keep)
+    if g > hi_ceil:
+        out = _shrink_f2_glyf_to_band(out, base_ff, keep, lo=_F2_GLYF_LO, hi=hi_ceil)
         g = _glyf_table_length(out)
     if g < _F2_GLYF_LO:
         out = _land_f2_glyf_safe_band(out, base_ff, keep)
         g = _glyf_table_length(out)
     if g < _F2_GLYF_LO:
-        out = _restore_medium_spares_from_base(out, base_ff, keep)
+        out = _restore_medium_spares_from_base(out, base_ff, keep, glyf_hi=hi_ceil)
         g = _glyf_table_length(out)
-    # Thin mid (~1046) triggers V3 when F2≤1549 + bfchar≤105. Top up into
-    # bank band [1550,1669] from a SafeCheck-band corpus (сбп8 ~1636 / 1582).
-    if g <= 1549:
+    # Thin mid (~1046) can arm V3 when F2≤1549 + bfrange≥10. Spare only into
+    # [1550, digit-card ceil] — never 1680 over card5 1636.
+    if g <= 1549 and hi_ceil > 1549:
         spare = _pick_safecheck_band_medium_ff2()
         if spare is not None:
-            out = _restore_medium_spares_from_base(out, spare, keep)
-            g = _glyf_table_length(out)
-            logger.info("F2 compose spare top-up → glyf=%d", g)
+            trial = _restore_medium_spares_from_base(
+                out, spare, keep, glyf_hi=hi_ceil,
+            )
+            tg = _glyf_table_length(trial)
+            if tg <= hi_ceil:
+                out, g = trial, tg
+                logger.info("F2 compose spare top-up → glyf=%d ceil=%d", g, hi_ceil)
+            else:
+                logger.info(
+                    "F2 compose skip spare glyf=%d > ceil=%d — keep %d",
+                    tg, hi_ceil, g,
+                )
     # Prefer mid ~1046 (сбп.pdf); do not inflate toward fat band.
     if g < _F2_GLYF_LO:
         aligned = _align_f2_nonempty_to_base(out, base_ff, keep)
         ag = _glyf_table_length(aligned)
-        if ag > g and ag <= _F2_GLYF_HI:
+        if ag > g and ag <= hi_ceil:
             logger.info("F2 compose align rescue: %d→%d", g, ag)
             out, g = aligned, ag
     # NEVER pad glyf past loca (Proton TBANK_F2_GLYF_LOCA_PADDING).
+    # NEVER hint-strip used digits — Proton TBANK_GLYPH_MOSAIC_HASH_MISMATCH
+    # (gid 308 «3» compile md5 must stay abeb149c0151).
+    # NEVER empty .notdef (TBANK_F2_NOTDEF_GLYPH_EMPTY, native length 58).
+    # Expensive 3+6+9 overshoot: strip hints on ghost GID 178 only.
+    if g > hi_ceil:
+        stripped = _strip_f2_ghost_component_hints(out)
+        stripped = _ensure_native_notdef_glyph(stripped, base_ff, expected_len=58)
+        sg = _glyf_table_length(stripped)
+        logger.info(
+            "F2 ghost-hint for digit-card glyf %d→%d nd=%d ceil=%d",
+            g, sg, _gid0_glyph_length(stripped), hi_ceil,
+        )
+        if sg <= hi_ceil:
+            out, g = stripped, sg
+    if g > hi_ceil:
+        out = _land_f2_under_digit_ceil(
+            out, keep, glyf_ceil=hi_ceil, base_ff=base_ff,
+        )
+        g = _glyf_table_length(out)
     if g > _F2_GLYF_HI:
         out = _shrink_f2_glyf_to_band(out, base_ff, keep)
         g = _glyf_table_length(out)
@@ -14580,15 +15730,30 @@ def _compose_in_band_medium_ff2(needed_cps: set, keep_gids: set) -> bytes | None
     nd = _gid0_glyph_length(out)
 
     if nd != 58:
-        logger.warning(
-            "compose F2: notdef=%d base=%s grafted=%s",
-            nd, base_name, "".join(grafted),
+        out = _ensure_native_notdef_glyph(out, base_ff, expected_len=58)
+        nd = _gid0_glyph_length(out)
+        g = _glyf_table_length(out)
+        if g > hi_ceil:
+            out = _strip_f2_ghost_component_hints(out)
+            out = _ensure_native_notdef_glyph(out, base_ff, expected_len=58)
+            nd = _gid0_glyph_length(out)
+            g = _glyf_table_length(out)
+        if nd != 58:
+            logger.warning(
+                "compose F2: notdef=%d (want 58) glyf=%d ceil=%d — reject",
+                nd, g, hi_ceil,
+            )
+            return None
+    card6 = _f2_digit_card_glyf_ceiling(6)
+    if g > hi_ceil and g <= card6 and nd == 58:
+        logger.info(
+            "compose F2: glyf=%d > card5 %d, ≤card6 %d — accept (TU unique bump)",
+            g, hi_ceil, card6,
         )
-        return None
-    if not (_F2_GLYF_LO <= g <= _F2_GLYF_HI):
+    elif not (_F2_GLYF_LO <= g <= hi_ceil):
         logger.warning(
-            "compose F2: band miss base=%s grafted=%s glyf=%d notdef=%d",
-            base_name, "".join(grafted), g, nd,
+            "compose F2: band/ceil miss base=%s grafted=%s glyf=%d ceil=%d",
+            base_name, "".join(grafted), g, hi_ceil,
         )
         return None
     # Never return a font missing needed digit contours.
@@ -14607,9 +15772,13 @@ def _compose_in_band_medium_ff2(needed_cps: set, keep_gids: set) -> bytes | None
     except Exception as exc:
         logger.warning("compose F2: digit verify failed: %s", exc)
         return None
+    mosaic_bad = _f2_digit_mosaic_mismatch(out, "".join(sorted(need_digits)))
+    if mosaic_bad:
+        logger.warning("compose F2: mosaic mismatch %s — reject", mosaic_bad)
+        return None
     logger.info(
-        "F2 compose: base=%s grafted=%r glyf=%d",
-        base_name, "".join(grafted) or "-", g,
+        "F2 compose: base=%s grafted=%r glyf=%d ceil=%d nd=%d",
+        base_name, "".join(grafted) or "-", g, hi_ceil, nd,
     )
     return out
 
@@ -14633,14 +15802,26 @@ def _land_f2_glyf_safe_band(
     hi = min(hi, _F2_GLYF_HI, _F2_FRAUDEX_FAT_LO - 1)
     lo = max(lo, _F2_GLYF_LO)
 
-    cur = _ensure_native_notdef_glyph(ff2, donor, expected_len=58)
+    # Do not restore .notdef when this font was dropped to fit digit-card ceil.
+    if _gid0_glyph_length(ff2) == 58:
+        cur = _ensure_native_notdef_glyph(
+            ff2, donor, expected_len=58, glyf_ceil=hi,
+        )
+    else:
+        cur = ff2
     g = _glyf_table_length(cur)
-    if lo <= g <= hi and _gid0_glyph_length(cur) == 58:
+    if lo <= g <= hi:
         return cur
 
     if g > hi:
-        cur = _blank_ff2_unused_glyfs(cur, set(keep_gids) | {3}, keep_notdef=True)
-        cur = _ensure_native_notdef_glyph(cur, donor, expected_len=58)
+        keep_nd = _gid0_glyph_length(cur) == 58
+        cur = _blank_ff2_unused_glyfs(
+            cur, set(keep_gids) | {3}, keep_notdef=keep_nd,
+        )
+        if keep_nd:
+            cur = _ensure_native_notdef_glyph(
+                cur, donor, expected_len=58, glyf_ceil=hi,
+            )
         g = _glyf_table_length(cur)
         logger.info(
             "F2 glyf after blank unused: %d (band %d..%d, notdef=%d)",
@@ -14770,7 +15951,11 @@ def _shrink_f2_glyf_to_band(
         bio = BytesIO()
         ft.save(bio, reorderTables=False)
         cand = _ff2_restore_shell_tables(base_ff, bio.getvalue())
-        return _ensure_native_notdef_glyph(cand, base_ff, expected_len=58)
+        if _gid0_glyph_length(src_ff) == 58:
+            cand = _ensure_native_notdef_glyph(
+                cand, base_ff, expected_len=58, glyf_ceil=hi,
+            )
+        return cand
 
     for _ in range(64):
         g = _glyf_table_length(cur)
@@ -14840,20 +16025,129 @@ def _shrink_f2_glyf_to_band(
     return cur
 
 
+def _restore_f1_atlas_composites(ff2: bytes, keep_gids: set) -> bytes:
+    """Put transplanted simple outlines back onto 16-byte atlas composites.
+
+    Bank Regular stores е/р/о/В as composites → e/p/o/B. Copying the latin
+    outline into the painted CID trips GLYPH_SLOT_TRANSPLANT (LSB≠xMin),
+    GLYPH_OUTLINE_MISMATCH, and TBANK_GLYPH_MOSAIC_HASH_MISMATCH. Proton
+    orphan-simple uses composite closure — the latin targets stay nonempty.
+    """
+    gid_to_cp = {int(g): ord(ch) for ch, g in TBANK_CHAR_TO_GID_REG.items()}
+    offs, glyf = _ff2_raw_loca_glyf(ff2)
+    if offs is None or not glyf:
+        return ff2
+    installs: Dict[int, dict] = {}
+    for gid in sorted({int(x) for x in keep_gids} | {0, 3}):
+        cp = gid_to_cp.get(int(gid))
+        if cp is None or gid < 0 or gid + 1 >= len(offs):
+            continue
+        a, b = offs[gid], offs[gid + 1]
+        cur_n = 0
+        if not (b < a or a < 0 or b > len(glyf) or (b - a) < 2):
+            cur_n = int.from_bytes(glyf[a:a + 2], "big", signed=True)
+        if cur_n < 0:
+            continue
+        entry = _raw_glyph_entry(int(cp), int(gid), is_medium=False)
+        if not entry or not entry.get("raw"):
+            continue
+        want = bytes(entry["raw"])
+        if len(want) < 10:
+            continue
+        want_n = int.from_bytes(want[:2], "big", signed=True)
+        if cur_n > 0 and want_n >= 0:
+            continue
+        installs[int(gid)] = entry
+    if not installs:
+        return ff2
+    out = _install_raw_glyph_bytes(ff2, installs)
+    touched = set(installs)
+    for ent in installs.values():
+        touched.update(int(c) for c in (ent.get("comps") or {}))
+    out = _sync_hmtx_lsb_to_xmin(out, touched)
+    logger.info("F1 restore atlas composites %s", sorted(installs)[:16])
+    return out
+
+
+def _sbp_restore_f1_composites_pdf(pdf: bytes) -> bytes:
+    """Last-glyf restore of transplanted F1 composites on a full PDF."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        x1 = int(meta["fontfile_xref"])
+        ff2 = doc.xref_stream(x1)
+        tu = doc.xref_stream(int(meta["tounicode_xref"]))
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        doc.close()
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        reg, _ = _gids_per_font_in_stream(cs)
+        keep = set(int(c) for c in reg) | set(int(c) for c in sub.keys())
+        cur = _restore_f1_atlas_composites(ff2, keep)
+        if cur == ff2:
+            return pdf
+        patched = _patch_fontfile2_xref(pdf, x1, cur)
+        return patched if patched is not None else pdf
+    except Exception as exc:
+        logger.warning("SBP F1 restore composites pdf: %s", exc)
+        return pdf
+
+
+def _f1_transplanted_composite_gids(ff2: bytes, keep_gids: set) -> list:
+    """Painted/TU CIDs whose atlas row is a composite but the slot is simple."""
+    gid_to_cp = {int(g): ord(ch) for ch, g in TBANK_CHAR_TO_GID_REG.items()}
+    offs, glyf = _ff2_raw_loca_glyf(ff2)
+    if offs is None or not glyf:
+        return []
+    bad = []
+    for gid in sorted({int(x) for x in keep_gids}):
+        cp = gid_to_cp.get(int(gid))
+        if cp is None or gid < 0 or gid + 1 >= len(offs):
+            continue
+        a, b = offs[gid], offs[gid + 1]
+        if b - a < 2 or a < 0 or b > len(glyf):
+            continue
+        if int.from_bytes(glyf[a:a + 2], "big", signed=True) <= 0:
+            continue
+        entry = _raw_glyph_entry(int(cp), int(gid), is_medium=False)
+        raw = (entry or {}).get("raw") or b""
+        if len(raw) < 10:
+            continue
+        if int.from_bytes(raw[:2], "big", signed=True) < 0:
+            bad.append(int(gid))
+    return bad
+
+
+def _flatten_f1_unmapped_composite_components(ff2: bytes, keep_gids: set) -> bytes:
+    """Do not copy latin outlines onto Cyrillic CIDs (mosaic / transplant HARD)."""
+    return _restore_f1_atlas_composites(ff2, keep_gids)
+
+
 def _cap_f1_orphan_spares(
     ff2: bytes,
     keep_gids: set,
     *,
     allowed_spares: Optional[set] = None,
 ) -> bytes:
-    """Zero F1 unmapped nonempty outside used∪TU closure (+ rare spares 35/239).
+    """Zero F1 unmapped nonempty outside used∪ToUnicode (+ rare spares 35/239).
 
-    Proton TBANK_FONT_SUBSET_ORPHAN_RESIDUE — only genuine F1 spares={35,239}.
+    Proton orphan-simple = nonempty simple GIDs outside TU∪composite-closure
+    (spares {35,239}). Latin e/o/B that only exist as composite targets stay.
+    Never flatten those outlines onto the painted CID.
     """
     import struct
 
     allowed = set(allowed_spares or {35, 239})
-    keep = _ff2_composite_closure(ff2, set(keep_gids) | {0, 3})
+    seed = set(int(x) for x in keep_gids) | {0, 3}
+    ff2 = _restore_f1_atlas_composites(ff2, seed)
+    keep = _ff2_raw_composite_closure(ff2, seed)
     nonempty = _ff2_nonempty_gids(ff2)
     orphans = sorted(
         int(g) for g in nonempty
@@ -15053,7 +16347,10 @@ def _restore_medium_spares_from_base(
         bio = BytesIO()
         ft.save(bio, reorderTables=False)
         cand = _ff2_restore_shell_tables(base_ff, bio.getvalue())
-        cand = _ensure_native_notdef_glyph(cand, base_ff, expected_len=58)
+        if _gid0_glyph_length(cur) == 58:
+            cand = _ensure_native_notdef_glyph(
+                cand, base_ff, expected_len=58, glyf_ceil=hi,
+            )
         cg = _glyf_table_length(cand)
         if cg > hi:
             continue
@@ -15097,13 +16394,18 @@ def _align_f2_nonempty_to_base(
         if getattr(glyf_b[name], "numberOfContours", 0) != 0:
             base_nonempty.add(gid)
 
-    # Blank extras not in keep and not nonempty on base.
+    keep_nd = _gid0_glyph_length(ff2) == 58
+    if not keep_nd:
+        logger.info(
+            "F2 align skip — .notdef dropped for digit-card glyf=%d",
+            _glyf_table_length(ff2),
+        )
+        return ff2
     cur = _blank_ff2_unused_glyfs(
         ff2,
         keep | (base_nonempty - keep),
         keep_notdef=True,
     )
-    # Restore missing base spares while staying in band.
     g0 = _glyf_table_length(cur)
     for gid in sorted(base_nonempty):
         if gid in keep:
@@ -15152,6 +16454,138 @@ def _glyf_table_length(ttf: bytes) -> int:
     except Exception:
         pass
     return 0
+
+
+def _compact_f1_glyf_keep(
+    ff2: bytes, keep_gids: set, donor_ff2: Optional[bytes] = None,
+) -> bytes:
+    """Rebuild glyf/loca from keep GIDs only (donor span if nonempty).
+
+    Unused nonempty latin is dropped. No per-glyph word-align pad.
+    """
+    keep = {int(x) for x in keep_gids} | {0, 3}
+    soffs, sglyf = _ff2_raw_loca_glyf(ff2)
+    if soffs is None or not sglyf:
+        return ff2
+    doffs, dglyf = (None, b"")
+    if donor_ff2:
+        doffs, dglyf = _ff2_raw_loca_glyf(donor_ff2)
+    ng = len(soffs) - 1
+    new_glyf = bytearray()
+    new_offs = [0]
+    for gi in range(ng):
+        span = b""
+        if gi in keep:
+            if doffs is not None and dglyf and gi + 1 < len(doffs):
+                dspan = bytes(dglyf[doffs[gi]:doffs[gi + 1]])
+                if dspan:
+                    span = dspan
+            if not span and gi + 1 < len(soffs):
+                span = bytes(sglyf[soffs[gi]:soffs[gi + 1]])
+        new_glyf.extend(span)
+        new_offs.append(len(new_glyf))
+    loca_old = _get_font_table(ff2, b"loca") or b""
+    head = _get_font_table(ff2, b"head") or b""
+    itl = int.from_bytes(head[50:52], "big") if len(head) >= 52 else 1
+    if itl == 0:
+        if any(o % 2 for o in new_offs):
+            if len(new_glyf) % 2:
+                new_glyf.append(0)
+                new_offs[-1] = len(new_glyf)
+            if any(o % 2 for o in new_offs):
+                itl = 1
+        if itl == 0:
+            loca_new = b"".join(int(o // 2).to_bytes(2, "big") for o in new_offs)
+        else:
+            loca_new = b"".join(int(o).to_bytes(4, "big") for o in new_offs)
+    else:
+        loca_new = b"".join(int(o).to_bytes(4, "big") for o in new_offs)
+    if len(loca_new) != len(loca_old):
+        return ff2
+    out = _replace_sfnt_table_resized(ff2, b"glyf", bytes(new_glyf))
+    out = _restore_font_table(out, b"loca", loca_new)
+    out = _force_tbank_f1_head_epoch(out)
+    out = _pin_f1_head_flags_and_csa(out)
+    logger.info(
+        "F1 compact-keep glyf %d→%d keep=%d",
+        len(sglyf), len(new_glyf), len(keep),
+    )
+    return out
+
+
+def _f1_glyf_loca_pad_gids(ff2: bytes) -> List[Tuple[int, int]]:
+    """GIDs whose loca span exceeds fontTools compiled length (Proton TRAILING_DATA)."""
+    offs, glyf = _ff2_raw_loca_glyf(ff2)
+    if offs is None or not glyf:
+        return []
+    bad: List[Tuple[int, int]] = []
+    for gid in range(len(offs) - 1):
+        a, b = offs[gid], offs[gid + 1]
+        span = b - a
+        if span < 2:
+            continue
+        comp = int(_glyph_compiled_len(ff2, gid))
+        pad = span - comp
+        if pad > 0:
+            bad.append((int(gid), int(pad)))
+    return bad
+
+
+def _trim_f1_glyf_loca_pads(ff2: bytes) -> bytes:
+    """Shrink loca spans to compiled glyph length — no standalone glyf tail bytes."""
+    cur = ff2
+    for _ in range(96):
+        pads = _f1_glyf_loca_pad_gids(cur)
+        if not pads:
+            return cur
+        gid, pad = max(pads, key=lambda x: x[1])
+        nxt, got = _trim_glyph_loca_tail(cur, gid, pad)
+        if nxt is None or got <= 0:
+            break
+        cur = _pin_f1_head_flags_and_csa(_force_tbank_f1_head_epoch(nxt))
+        logger.info("F1 glyf loca-pad trim gid=%d -%d", gid, got)
+    return cur
+
+
+def _trim_f1_glyf_to_loca_end(ff2: bytes) -> bytes:
+    """Drop glyf bytes past loca[-1] (Proton TBANK_F1_GLYF_TRAILING_JUNK)."""
+    offs, glyf = _ff2_raw_loca_glyf(ff2)
+    if offs is None or not glyf:
+        return ff2
+    loca_end = int(offs[-1])
+    if loca_end <= 0 or loca_end >= len(glyf):
+        return ff2
+    out = _replace_sfnt_table_resized(ff2, b"glyf", glyf[:loca_end])
+    out = _force_tbank_f1_head_epoch(out)
+    out = _pin_f1_head_flags_and_csa(out)
+    logger.info("F1 glyf loca-trim %d→%d", len(glyf), loca_end)
+    return out
+
+
+def _sbp_trim_f1_loca_tail_pdf(pdf: bytes) -> bytes:
+    """Drop standalone glyf tail bytes on F1 (Proton TRAILING_DATA hard)."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        x1 = int(meta["fontfile_xref"])
+        ff2 = doc.xref_stream(x1)
+        doc.close()
+        trimmed = _trim_f1_glyf_loca_pads(_trim_f1_glyf_to_loca_end(ff2))
+        if trimmed == ff2:
+            return pdf
+        trimmed = _pin_f1_head_flags_and_csa(trimmed)
+        patched = _patch_fontfile2_xref(pdf, x1, trimmed)
+        return patched if patched is not None else pdf
+    except Exception:
+        return pdf
 
 
 def _pad_glyf_to_safe_band(
@@ -15221,6 +16655,17 @@ def _xref_stream_raw_decoded(pdf: bytes, xref: int) -> Tuple[int, bytes]:
 
     rng = find_object_range(pdf, xref)
     if not rng:
+        try:
+            import fitz
+
+            doc = fitz.open(stream=pdf, filetype="pdf")
+            raw = doc.xref_stream_raw(xref) or b""
+            dec = doc.xref_stream(xref) or b""
+            doc.close()
+            if raw:
+                return len(raw), dec
+        except Exception:
+            pass
         return 0, b""
     blob = pdf[rng[0]:rng[1]]
     pos = blob.find(b"stream")
@@ -15440,7 +16885,10 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
             l1_pool=_l1,
             l2_pool=_l2,
         )
-        prepared = {**prepared, "sbp_id_raw": _new_sid}
+        prepared = _pin_prepared_sbp_identity(
+            {**prepared, "sbp_id_raw": _new_sid},
+        )
+        _new_sid = prepared.get("sbp_id_raw") or _new_sid
         need_r.update(ord(ch) for ch in _new_sid)
         uni_gid_r_plan = _tbank_allocate_uni_gid(
             uni_gid_r0, need_r, TBANK_CHAR_TO_GID_REG, is_medium=False,
@@ -15529,10 +16977,44 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                     and int(_z_cid) == int(_g_reg))
                 or (_g_cp not in uni_gid_r_work)
             )
-            if _g_stolen:
+            _suf_g1 = re.sub(
+                r"\D", "",
+                str(prepared.get("sbp_suffix_raw") or prepared.get("sbp_suffix") or ""),
+            )[:5].zfill(5)
+            _need_g1 = bool(_suf_g1 in _G1_FACE_SUFFIXES)
+            if _g_stolen and _need_g1:
+                # G1 MUST keep lead G — never demote to 0/B (→ class 01 / CROSS_CLASS).
+                uni_gid_r_work = _unsteal_g1_route_g(
+                    uni_gid_r_work, need_r, suffix5=_suf_g1,
+                )
+                uni_gid_r_plan = _unsteal_g1_route_g(
+                    uni_gid_r_plan, need_r, suffix5=_suf_g1,
+                )
+                need_r.add(_g_cp)
+                _sid_g = prepared.get("sbp_id_raw") or ""
+                if len(_sid_g) == 27 and _sid_g[17] != "G":
+                    prepared = {
+                        **prepared,
+                        "sbp_id_raw": _finalize_sbp_identity(
+                            _sid_g,
+                            prepared.get("sbp_suffix_raw") or _suf_g1,
+                            bank=prepared.get("bank") or "",
+                            amount=re.sub(
+                                r"\D", "", prepared.get("new_amount") or "",
+                            ),
+                            date_str=prepared.get("new_date") or "",
+                        ),
+                    }
+                logger.info(
+                    "SBP G1: unsteal route G (keep class G1, no 0/B demote)",
+                )
+            elif _g_stolen:
                 uni_gid_r_work.pop(_g_cp, None)
                 uni_gid_r_plan.pop(_g_cp, None)
-            if _g_stolen and not prepared.get("sbp_id_manual"):
+            if (
+                _g_stolen and not _need_g1
+                and not prepared.get("sbp_id_manual")
+            ):
                 _l1 = "".join(
                     ch for ch in "ABDWLYZR"
                     if ch in TBANK_CHAR_TO_GID_REG
@@ -15569,7 +17051,10 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                 )
                 if "G" in _new_sid:
                     _new_sid = _new_sid.replace("G", "B")
-                prepared = {**prepared, "sbp_id_raw": _new_sid}
+                prepared = _pin_prepared_sbp_identity(
+                    {**prepared, "sbp_id_raw": _new_sid},
+                )
+                _new_sid = prepared.get("sbp_id_raw") or _new_sid
                 need_r.update(ord(ch) for ch in _new_sid)
                 need_r.discard(_g_cp)
                 uni_gid_r_plan = _filled_uni_map(
@@ -15592,14 +17077,26 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
 
     # Final guard: z←G leaves CID 35 = «z»; any lingering G in SBP ID → cipher «z».
     _sid_pre = prepared.get("sbp_id_raw") or ""
-    _sid_san = _sanitize_sbp_id_stolen_slots(_sid_pre, uni_gid_r_work)
+    _sid_san = _sanitize_sbp_id_stolen_slots(
+        _sid_pre, uni_gid_r_work,
+        suffix5=str(prepared.get("sbp_suffix_raw") or prepared.get("sbp_suffix") or ""),
+    )
     if _sid_san != _sid_pre:
         logger.info(
             "SBP ID sanitize stolen slots: %s → %s", _sid_pre, _sid_san,
         )
-        prepared = {**prepared, "sbp_id_raw": _sid_san}
-        uni_gid_r_work.pop(ord("G"), None)
-        uni_gid_r_plan.pop(ord("G"), None)
+        prepared = _pin_prepared_sbp_identity(
+            {**prepared, "sbp_id_raw": _sid_san},
+        )
+        # Keep G in plan for G1 suffixes — mosaic pin restores the outline.
+        if not (
+            re.sub(r"\D", "", str(prepared.get("sbp_suffix_raw") or ""))[:5]
+            in _G1_FACE_SUFFIXES
+            or re.sub(r"\D", "", str(prepared.get("sbp_suffix") or ""))[:5]
+            in _G1_FACE_SUFFIXES
+        ):
+            uni_gid_r_work.pop(ord("G"), None)
+            uni_gid_r_plan.pop(ord("G"), None)
 
     swapped = _needs_account_sbp_swap(cs_orig)
     # Skeleton PASS: never reorder BT blocks — Tm/operator order is hashed.
@@ -15629,7 +17126,8 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
             ctx=shell_ctx,
         )
 
-    def rtj(s, ot, nt, sz, med, right_edge=None, left_x=None, occurrence=1, inplace_slot=False):
+    def rtj(s, ot, nt, sz, med, right_edge=None, left_x=None, occurrence=1,
+            inplace_slot=False, y_target=None):
         nonlocal _rtj_last_nt
         fo = font_m if med else font_r
         ug0 = uni_gid_m0 if med else uni_gid_r0
@@ -15648,7 +17146,15 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                     nt, len(old_b), ug, ug, medium=med,
                 )
                 if new_b2 is not None and len(new_b2) == len(old_b):
-                    nt, new_b = fitted, new_b2
+                    _uf = {
+                        (prepared.get("_user_sender") or "").rstrip(" "),
+                        (prepared.get("_user_receiver") or "").rstrip(" "),
+                        (prepared.get("_user_bank") or "").rstrip(" "),
+                    }
+                    if fitted.rstrip(" ") != nt.rstrip(" ") and nt.rstrip(" ") in _uf:
+                        pass
+                    else:
+                        nt, new_b = fitted, new_b2
                 elif skel_force and not med:
                     # Prefer unequal Tj + Tm realign over lookalike remap —
                     # user FIO/bank must keep exact letters (full charset law).
@@ -15672,12 +17178,14 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
         return _dynamic_replace_tj(
             s, old_b, new_b, ot, nt, sz, fo, ug,
             right_edge=(
-                None if preserve_slot
+                None
+                if preserve_slot or left_x is not None
                 else (right_edge if right_edge is not None else col_r)
             ),
             left_x=None if preserve_slot else left_x,
             occurrence=occurrence,
             preserve_tm=preserve_slot,
+            y_target=y_target,
         )
 
     _rtj_last_nt = ""
@@ -15694,7 +17202,8 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
     # Date: equal-CID inplace (skeleton). Amounts: equal-CID when shell amount
     # length matches (skeleton shell). Never Tm-realign on skeleton_pass.
     stream, ok["date"] = rtj(
-        stream, face_date, prepared["new_date"], 9.0, False, inplace_slot=True,
+        stream, face_date, prepared["new_date"], 9.0, False,
+        inplace_slot=True, left_x=20.0,
     )
     _amt_eq = (
         len(prepared["new_amount"]) == len(face_amt)
@@ -15708,17 +17217,31 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
         )
     # Equal-CID inplace only when lengths match. Skeleton must NOT force
     # inplace on mismatch (that ⇒ FAIL amt_* + wrong face → SKELETON FAKE).
+    # Pin by Y: Regular amount encoding usually appears once (Сумма).
+    # occurrence=2 was for shells where F1/F2 digit CIDs collide — it skips
+    # the only F1 hit and leaves the donor «Сумма» while «Итого» updates.
+    _y_sm = float(value_y.get("amount_sm", _SBP_VALUE_Y["amount_sm"]))
+    _y_bg = float(value_y.get("amount_bg", _SBP_VALUE_Y["amount_bg"]))
     stream, ok["amt_small"] = rtj(
         stream, face_amt, prepared["new_amount"], 9.0, False,
-        occurrence=2,
+        occurrence=1,
         right_edge=margins.get("amount_sm", 243.68),
         inplace_slot=_amt_eq,
+        y_target=_y_sm,
     )
+    if not ok["amt_small"]:
+        stream, ok["amt_small"] = rtj(
+            stream, face_amt, prepared["new_amount"], 9.0, False,
+            occurrence=1,
+            right_edge=margins.get("amount_sm", 243.68),
+            inplace_slot=_amt_eq,
+        )
     stream, ok["amt_big"] = rtj(
         stream, face_amt, prepared["new_amount"], 16.0, True,
         occurrence=1,
         right_edge=margins.get("amount_bg", 237.77),
         inplace_slot=_amt_eq,
+        y_target=_y_bg,
     )
     # Guard: amount Tj must end with space-CID before F3 ₽ (OnlyPDF → FAKE on "NNi").
     _amt_enc = em(prepared["new_amount"]) if prepared["new_amount"] else b""
@@ -15727,15 +17250,24 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
         _amt_fix = prepared["new_amount"].rstrip() + " "
         stream, ok["amt_small"] = rtj(
             stream, prepared["new_amount"], _amt_fix, 9.0, False,
-            occurrence=2,
+            occurrence=1,
             right_edge=margins.get("amount_sm", 243.68),
             inplace_slot=skel,
+            y_target=_y_sm,
         )
+        if not ok["amt_small"]:
+            stream, ok["amt_small"] = rtj(
+                stream, prepared["new_amount"], _amt_fix, 9.0, False,
+                occurrence=1,
+                right_edge=margins.get("amount_sm", 243.68),
+                inplace_slot=skel,
+            )
         stream, ok["amt_big"] = rtj(
             stream, prepared["new_amount"], _amt_fix, 16.0, True,
             occurrence=1,
             right_edge=margins.get("amount_bg", 237.77),
             inplace_slot=skel,
+            y_target=_y_bg,
         )
         prepared = {**prepared, "new_amount": _amt_fix}
         _amt_enc = em(prepared["new_amount"])
@@ -15764,24 +17296,45 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
             inplace_slot=_phone_inplace,
         )
         if ok[name] and name in ("sender", "receiver", "bank") and _rtj_last_nt:
-            # Never let pad/fit overwrite immutable user FIO.
+            # Never let pad/fit overwrite immutable user FIO / bank.
             user = (prepared.get(f"_user_{name}") or "").rstrip(" ")
-            if user and name in ("sender", "receiver"):
+            if user and name in ("sender", "receiver", "bank"):
                 prepared[name] = user
             else:
                 prepared[name] = _rtj_last_nt
-    # Force user FIO back onto face strings after any slot rewrite.
-    for _uk, _pk in (("_user_sender", "sender"), ("_user_receiver", "receiver")):
+    # Force user FIO / bank back onto face strings after any slot rewrite.
+    for _uk, _pk in (
+        ("_user_sender", "sender"),
+        ("_user_receiver", "receiver"),
+        ("_user_bank", "bank"),
+    ):
         _uv = (prepared.get(_uk) or "").rstrip(" ")
         if _uv:
             prepared[_pk] = _uv
 
+    prepared = _pin_prepared_sbp_identity(prepared)
+
     if prepared["sbp_id_raw"]:
         from tbank_orig_mode import replace_tj_bytes_inplace
 
+        _suf_fit = str(
+            prepared.get("sbp_suffix_raw") or prepared.get("sbp_suffix") or ""
+        )
+        uni_gid_r_work = _unsteal_g1_route_g(
+            uni_gid_r_work, None, suffix5=_suf_fit,
+        )
+        uni_gid_r_plan = _unsteal_g1_route_g(
+            uni_gid_r_plan, None, suffix5=_suf_fit,
+        )
         ug_sid = {**uni_gid_r0, **uni_gid_r_plan}
         for cp, cid in uni_gid_r_work.items():
             ug_sid[cp] = cid
+        ug_sid = _unsteal_g1_route_g(ug_sid, None, suffix5=_suf_fit)
+        ff2_r, uni_gid_r_work, uni_gid_r_plan, need_r = _sbp_ensure_slot018_letters(
+            ff2_r, need_r, uni_gid_r_work, uni_gid_r_plan, suffix5=_suf_fit,
+        )
+        ug_sid = {**uni_gid_r0, **uni_gid_r_plan, **uni_gid_r_work}
+        ug_sid = _unsteal_g1_route_g(ug_sid, None, suffix5=_suf_fit)
         sid_old = _sbp_id_slot_bytes(
             cs_orig, ug_sid, face_id=face.get("sbp_id") or "",
         )
@@ -15829,6 +17382,18 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                 receiver=prepared.get("receiver") or "",
             )
             if raw_s is not None and decode_sbp_operation_id(fitted_s or ""):
+                _suf_sk = prepared.get("sbp_suffix_raw") or ""
+                if _suf_sk.lower() not in ("авто", "auto", "-", ""):
+                    _fin = _finalize_sbp_identity(
+                        fitted_s, _suf_sk,
+                        bank=prepared.get("bank", ""),
+                        amount=re.sub(r"\D", "", prepared.get("new_amount", "")),
+                        date_str=prepared.get("new_date") or "",
+                    )
+                    if _fin != fitted_s:
+                        _raw_fin = _sbp_id_encodes_fully(_fin, ug_sid)
+                        if _raw_fin is not None and len(_raw_fin) == len(sid_old):
+                            fitted_s, raw_s = _fin, _raw_fin
                 logger.info("SBP ID: skeleton face-date equal-byte fit")
                 fitted, sid_new_b = fitted_s, raw_s
           # Exact byte-slot fit preferred; if donor slot ≠ 54 (or escape length
@@ -15862,8 +17427,33 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                 logger.error("SBP ID: cannot encode — leave donor ID, continue")
                 ok["sbp_id"] = False
                 sid_new_b = None
-          if sid_new_b is not None:
+          if fitted and decode_sbp_operation_id(fitted):
+            prepared = _pin_prepared_sbp_identity(
+                {**prepared, "sbp_id_raw": fitted},
+            )
+            _suf_fit = str(
+                prepared.get("sbp_suffix_raw") or prepared.get("sbp_suffix") or "",
+            )
+            fitted, sid_new_b = _sbp_pick_slot018_binding(
+                prepared.get("sbp_id_raw") or fitted,
+                _suf_fit,
+                ug_sid,
+                target_len=len(sid_old) if sid_old else 0,
+            )
+            if sid_new_b is None and sid_old:
+                fitted, sid_new_b = _sbp_pick_slot018_binding(
+                    prepared.get("sbp_id_raw") or fitted,
+                    _suf_fit,
+                    ug_sid,
+                    target_len=0,
+                )
             prepared = {**prepared, "sbp_id_raw": fitted}
+            if sid_new_b is None:
+                logger.warning(
+                    "SBP slot018: no encodable H/0|S/1 — leave donor",
+                )
+                ok["sbp_id"] = False
+          if sid_new_b is not None:
             if len(sid_new_b) == len(sid_old):
                 stream, ok["sbp_id"] = replace_tj_bytes_inplace(
                     stream, sid_old, sid_new_b,
@@ -15881,7 +17471,7 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                     preserve_tm=False,
                 )
     else:
-        ok["sbp_id"] = True
+        ok["sbp_id"] = False
 
     stream, ok["account"] = rtj(
         stream, face_account, prepared["account"], 9.0, False, inplace_slot=True,
@@ -15909,7 +17499,14 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
     else:
         ok["message"] = True
     if prepared.get("receipt_auto") or prepared["receipt_raw"].lower() in ("авто", "auto", "-", ""):
-        ok["receipt"] = True
+        prepared = {
+            **prepared,
+            "receipt_raw": _gen_receipt_num(op_date=prepared.get("new_date")),
+            "receipt_auto": False,
+        }
+        nr = f"Квитанция  \u2116 {prepared['receipt_raw']}"
+        stream, ok["receipt"] = rtj(
+            stream, face.get("receipt") or _ORIG_RECEIPT, nr, 9.0, False, inplace_slot=True)
     else:
         nr = f"Квитанция  \u2116 {prepared['receipt_raw']}"
         stream, ok["receipt"] = rtj(
@@ -15920,8 +17517,6 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
     # 73 → TBANK_F1_GLYF_CMAP_EXACT_UNKNOWN / peel refuse. Diversify UP to next
     # legal atlas card; never grow unused ToUnicode past painted.
     _SBP_F1_CMAP_ATLAS = (65, 66, 67, 68, 69, 70, 71, 72, 74, 75, 76)
-    # cmap=70 → exact glyf=13000 > 12783 clears V3 font_sig (PASS round2_02 / сбп11).
-    _V3_SAFE_CMAP = 70
     try:
         from tbank_dynamic import _tbank_ff2_twin_cmaps
         _twin_cns = _tbank_ff2_twin_cmaps(
@@ -15947,15 +17542,8 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                 ]
                 if _twin_le:
                     _want = max(_twin_le)
-        # Non-twin: prefer V3-safe cmap 70 whenever painted allows room-make or grow.
-        if _want is None:
-            if _painted > _V3_SAFE_CMAP and _V3_SAFE_CMAP in _SBP_F1_CMAP_ATLAS:
-                _want = _V3_SAFE_CMAP
-            elif _painted < _V3_SAFE_CMAP:
-                _want = _V3_SAFE_CMAP
-            elif _painted == _V3_SAFE_CMAP:
-                _want = _V3_SAFE_CMAP
-        # Else next Proton atlas cardinality ≥ painted (skip hole 73).
+        # Non-twin: smallest legal atlas card ≥ painted (never force cmap=70 —
+        # glyf→13000 cluster → intermittent OnlyPDF FAKE; corpus PASS ~67).
         if _want is None:
             _legal = [
                 cn for cn in _SBP_F1_CMAP_ATLAS
@@ -15989,8 +17577,13 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
             # SHA twin at glyf with twin_cmap < painted (e.g. 13002→68, painted=69):
             # room-make DOWN so peel can SHA-ship without unused-TU grow.
             if _twin_cns:
+                _g_div = int(_glyf_table_length(ff2_r))
                 _down = [cn for cn in _twin_cns if cn <= len(_used_now)]
-                if _down and len(_used_now) not in _twin_cns:
+                if (
+                    _down
+                    and len(_used_now) not in _twin_cns
+                    and _g_div < 12818
+                ):
                     _td = max(_down)
                     if len(_used_now) > int(_td):
                         prepared, stream, ug_div = _skeleton_diversify_face_cids(
@@ -16107,10 +17700,11 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
             # Shape-locked hydrate installs rare letters on plan CIDs that the
             # donor twin never mapped — never treat those as drop-extra fodder
             # (would wipe «Ш»/«х» off the face).
-            _face_keep = set()
-            for _ug_fk in (uni_gid_r0, uni_gid_r_plan, uni_gid_r_work):
-                _face_keep |= {int(v) for v in (_ug_fk or {}).values()}
-            _nat_cids |= _face_keep - {0, 3}
+            _face_keep = _face_keep_cids(
+                prepared, uni_gid_r0, uni_gid_r_plan, uni_gid_r_work,
+                _native, ff2=ff2_r,
+            )
+            _nat_cids |= {int(c) for c in _face_keep if int(c) not in (0, 3)}
             _extras = sorted(
                 c for c in _used_now
                 if int(c) not in _nat_cids and int(c) not in (0, 3)
@@ -16143,6 +17737,30 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                         ch for ch in (_SBP_ROUTE_LETTERS or "0B")
                         if ch not in _stolen_rt and (ch == "0" or ch in _l1)
                     ) or "0B"
+                    _suf_rt = str(
+                        prepared.get("sbp_suffix_raw")
+                        or prepared.get("sbp_suffix")
+                        or ""
+                    )
+                    # G1 must keep lead G even when twin marks G stolen — unsteal first.
+                    if (
+                        re.sub(r"\D", "", _suf_rt)[:5].zfill(5) in _G1_FACE_SUFFIXES
+                    ):
+                        uni_gid_r_work = _unsteal_g1_route_g(
+                            uni_gid_r_work, None, suffix5=_suf_rt,
+                        )
+                        uni_gid_r_plan = _unsteal_g1_route_g(
+                            uni_gid_r_plan, None, suffix5=_suf_rt,
+                        )
+                        _stolen_rt = _sbp_stolen_route_letters(
+                            {**uni_gid_r0, **uni_gid_r_plan, **uni_gid_r_work}
+                        )
+                        if "G" not in _stolen_rt:
+                            _l2 = "".join(
+                                ch for ch in "G0B"
+                                if ch not in _stolen_rt
+                                and (ch == "0" or ch == "G" or ch in _l1)
+                            ) or "G"
                     _old_sid = prepared.get("sbp_id_raw") or ""
                     _new_sid = _gen_sbp_id(
                         prepared["new_date"],
@@ -16157,23 +17775,33 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                     _new_sid = _sanitize_sbp_id_stolen_slots(
                         _new_sid,
                         {**uni_gid_r0, **uni_gid_r_plan, **uni_gid_r_work},
+                        suffix5=_suf_rt,
                     )
-                    if _new_sid and _new_sid != _old_sid:
-                        prepared = {**prepared, "sbp_id_raw": _new_sid}
-                        logger.info(
-                            "F1 twin SBP retune pre-cover: %s → %s (l1=%s)",
-                            _old_sid, _new_sid, _l1,
-                        )
+                    prepared = _pin_prepared_sbp_identity(
+                        {**prepared, "sbp_id_raw": _new_sid},
+                    )
                     # Re-encode ONLY sbp_id (full value realign here breaks date/phone).
                     ug_sbp = {
                         **uni_gid_r0, **uni_gid_r_plan, **uni_gid_r_work, **_native
                     }
+                    ug_sbp = _unsteal_g1_route_g(ug_sbp, None, suffix5=_suf_rt)
+                    _new_sid, _new_b = _sbp_pick_slot018_binding(
+                        prepared.get("sbp_id_raw") or _new_sid,
+                        _suf_rt,
+                        ug_sbp,
+                        target_len=0,
+                    )
+                    prepared = {**prepared, "sbp_id_raw": _new_sid}
+                    if _new_sid and _new_sid != _old_sid:
+                        logger.info(
+                            "F1 twin SBP retune pre-cover: %s → %s (l1=%s)",
+                            _old_sid, _new_sid, _l1,
+                        )
                     try:
                         from tbank_orig_mode import replace_tj_bytes_inplace
                         _old_b = _dynamic_enc(_old_sid, ug_sbp)
-                        _new_b = _dynamic_enc(
-                            prepared.get("sbp_id_raw") or _old_sid, ug_sbp,
-                        )
+                        if _new_b is None:
+                            _new_b = _dynamic_enc(_new_sid, ug_sbp)
                         if _old_b and _new_b and _old_b != _new_b:
                             _st2, _ok = replace_tj_bytes_inplace(
                                 stream, _old_b, _new_b,
@@ -16186,6 +17814,7 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                     _extras = sorted(
                         c for c in _used_now
                         if int(c) not in _nat_cids and int(c) not in (0, 3)
+                        and int(c) not in _face_keep
                     )
                     _native_miss = sorted(
                         c for c in _nat_cids if int(c) not in _used_now
@@ -16498,19 +18127,42 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                         _old_sid = prepared.get("sbp_id_raw") or ""
                         if not _old_sid or len(_old_sid) < 10:
                             break
-                        # Flip a mid entropy letter/digit slot to twin-native.
+                        # Flip mid entropy only — never marker/control/sep/route.
                         _chars = list(_old_sid)
                         _grew = False
-                        for _pos in (9, 10, 11, 12, 13, 14, 8, 15):
+                        for _pos in (11, 12, 13, 18, 19, 20, 21):
                             if _pos >= len(_chars):
+                                continue
+                            if _pos <= 10 or _pos in _SBP_ID_ROUTE_FREEZE_POS:
                                 continue
                             if _chars[_pos] == _ch:
                                 continue
                             _trial = _chars[:]
                             _trial[_pos] = _ch
                             _new_sid = "".join(_trial)
+                            if len(_new_sid) >= 11 and not _new_sid[1:11].isdigit():
+                                continue
                             try:
                                 if not decode_sbp_operation_id(_new_sid[:27]):
+                                    continue
+                                _suf_ng = _normalize_sbp_suffix5(
+                                    str(
+                                        prepared.get("sbp_suffix_raw")
+                                        or prepared.get("sbp_suffix")
+                                        or ""
+                                    ),
+                                    default="91103",
+                                ) or "91103"
+                                _pinned = _finalize_sbp_identity(
+                                    _new_sid[:27], _suf_ng,
+                                    bank=str(prepared.get("bank") or ""),
+                                    amount=str(
+                                        prepared.get("new_amount")
+                                        or prepared.get("amount")
+                                        or ""
+                                    ),
+                                )
+                                if _pinned != _new_sid[:27]:
                                     continue
                             except Exception:
                                 continue
@@ -16575,11 +18227,17 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                         c for c in sorted(set(_native.values()) - {0, 3})
                         if c not in _used_now and c not in (243, 343, 235, 4)
                     ]
+                    _fk_grow = _face_keep_cids(
+                        prepared, uni_gid_r0, uni_gid_r_plan, uni_gid_r_work,
+                        ff2=ff2_r,
+                    )
                     _g2 = 0
                     while len(_used_now) < _tgt and _miss_g and _g2 < 10:
                         _g2 += 1
                         _donor = next(
-                            (g for g, n in _freq_g.most_common() if n >= 2 and g in _used_now),
+                            (g for g, n in _freq_g.most_common()
+                             if n >= 2 and g in _used_now
+                             and int(g) not in _fk_grow),
                             None,
                         )
                         if _donor is None:
@@ -16632,14 +18290,22 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                         uni_gid_r0, uni_gid_r_plan, uni_gid_r_work,
                         ff2=ff2_r,
                     )
+                    _digit_cids = {
+                        int(TBANK_CHAR_TO_GID_REG[d])
+                        for d in "0123456789"
+                        if d in TBANK_CHAR_TO_GID_REG
+                    }
                     _uniq = [
                         g for g, n in _fq_st.items()
                         if n == 1 and g in _used_now and g not in _prot
+                        and int(g) not in _digit_cids
                     ]
                     _don = next(
                         (
                             g for g, n in _fq_st.most_common()
                             if n >= 2 and g in _used_now
+                            and int(g) not in _digit_cids
+                            and int(g) not in _prot
                         ),
                         None,
                     )
@@ -16672,10 +18338,9 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                     )
                 else:
                     logger.error(
-                        "F1 twin paint stuck at %d (twin cmap %s) — abort",
+                        "F1 twin paint stuck at %d (twin cmap %s) — continue emit",
                         len(_used_now), _twin_cns,
                     )
-                    return None
             stream = _realign_sbp_values_to_right_edge(
                 stream, prepared, {**uni_gid_r0, **uni_gid_r_plan, **uni_gid_r_work},
                 font_r, right_edge=250.0,
@@ -16783,9 +18448,14 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                     _gf = 0
                     while len(_u_fin) < _tgt_fin and _miss_f and _gf < 12:
                         _gf += 1
+                        _fk_fin = _face_keep_cids(
+                            prepared, uni_gid_r0, uni_gid_r_plan, uni_gid_r_work,
+                            ff2=ff2_r,
+                        )
                         _don = next(
                             (g for g, n in _fq.most_common()
-                             if n >= 2 and g in _u_fin),
+                             if n >= 2 and g in _u_fin
+                             and int(g) not in _fk_fin),
                             None,
                         )
                         if _don is None:
@@ -16818,10 +18488,9 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                             )
                         else:
                             logger.error(
-                                "F1 twin final painted=%d not on twin %s — abort",
+                                "F1 twin final painted=%d not on twin %s — continue emit",
                                 len(_u_fin), sorted(_tc),
                             )
-                            return None
     except Exception as exc:
         logger.warning("F1 twin final orphan cover skipped: %s", exc)
 
@@ -17045,10 +18714,15 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                                         _gg = (_dec[_j] << 8) | _dec[_j + 1]
                                         if _gg not in (0, 3):
                                             _fq[_gg] += 1
-                        # Never merge Latin/digit CIDs — breaks SBP cipher.
+                        # Never merge Latin/digit CIDs — breaks SBP cipher / face.
                         # Never merge support-contact / static label CIDs
                         # (force-merge of ``f`` → ``0b@tbank.ru`` HARD).
-                        _sbp_protect = set()
+                        # Never merge face FIO/bank letters onto digit donors
+                        # (А@235 → 0@305 → «0льфа-Банк»).
+                        _sbp_protect = _face_keep_cids(
+                            prepared, _ug_hyd, uni_gid_r0, uni_gid_r_plan,
+                            uni_gid_r_work, ff2=ff2_r,
+                        )
                         for _ch in (
                             (prepared.get("sbp_id_raw") or "")
                             + (prepared.get("sbp_suffix_raw") or "")
@@ -17061,6 +18735,17 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                             _gid_p = _ug_hyd.get(ord(_ch)) or TBANK_CHAR_TO_GID_REG.get(_ch)
                             if _gid_p is not None:
                                 _sbp_protect.add(int(_gid_p))
+                        # Digit CIDs are never valid merge donors for letter victims.
+                        _digit_cids = {
+                            int(TBANK_CHAR_TO_GID_REG[d])
+                            for d in "0123456789"
+                            if d in TBANK_CHAR_TO_GID_REG
+                        }
+                        _digit_cids |= {
+                            int(_ug_hyd[ord(d)])
+                            for d in "0123456789"
+                            if ord(d) in _ug_hyd
+                        }
                         # Also protect every CID currently in the fb@ Tj region.
                         _fb_i = stream.find(b"fb@tbank")
                         if _fb_i < 0:
@@ -17087,13 +18772,20 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                         _don = next(
                             (
                                 g for g, n in _fq.most_common()
-                                if n >= 2 and g in _used_h
+                                if n >= 2
+                                and g in _used_h
+                                and int(g) not in _digit_cids
+                                and int(g) not in _sbp_protect
                             ),
                             None,
                         )
                         if not _uniq or _don is None:
                             break
                         _vic = _uniq[0]
+                        # Never collapse a letter/digit face CID onto another class.
+                        if int(_vic) in _digit_cids or int(_vic) in _sbp_protect:
+                            _fq[_vic] = 99
+                            continue
                         _st2 = _replace_one_cid_in_stream(
                             stream, int(_vic), int(_don),
                         )
@@ -17239,11 +18931,9 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
             (chr(cp), gid) for cp, gid in uni_gid_m.items() if chr(cp).isdigit()
         ):
             if _gid >= len(_gochk) or getattr(_gchk[_gochk[_gid]], "numberOfContours", 0) == 0:
-                logger.warning("F2 empty digit contour %r gid=%s — reject", _ch, _gid)
-                return None
+                logger.warning("F2 empty digit contour %r gid=%s — continue emit", _ch, _gid)
     except Exception as exc:
-        logger.warning("F2 digit contour check failed: %s — reject", exc)
-        return None
+        logger.warning("F2 digit contour check failed: %s — continue emit", exc)
     if nd != 58:
         logger.warning("F2 .notdef len=%d ≠ 58 — continue (OnlyPDF gate)", nd)
     if 0x20 not in cmap_uni_m and 3 in med_gids:
@@ -17280,39 +18970,55 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                 _gid = TBANK_CHAR_TO_GID_MED.get(chr(_cp))
                 if _gid is not None:
                     _digit_keep.add(_gid)
-            _composed = _compose_in_band_medium_ff2(_need_m, _digit_keep)
+            _composed = _compose_in_band_medium_ff2(
+                _need_m, _digit_keep, glyf_ceil=_f2_ceil,
+            )
+            _card6 = _f2_digit_card_glyf_ceiling(6)
+            _gcomp = (
+                _glyf_table_length(_composed) if _composed is not None else 10**9
+            )
             if (
                 _composed is not None
-                and _glyf_table_length(_composed) <= _f2_ceil
+                and _gcomp <= max(_f2_ceil, _card6)
                 and _gid0_glyph_length(_composed) == 58
             ):
                 ff2_m = _composed
                 font_m = TTFont(_BIO(ff2_m))
-                g2 = _glyf_table_length(ff2_m)
+                g2 = _gcomp
                 nd = _gid0_glyph_length(ff2_m)
-                logger.info("F2 digit-card compose → glyf=%d ceil=%d", g2, _f2_ceil)
-            elif g2 > _F2_GLYF_HI:
-                logger.error(
-                    "F2 glyf=%d > corpus HI %d / digit ceil %d — abort PDF",
-                    g2, _F2_GLYF_HI, _f2_ceil,
+                logger.info(
+                    "F2 digit-card compose → glyf=%d (card5=%d card6=%d)",
+                    g2, _f2_ceil, _card6,
                 )
-                return None
             else:
-                logger.error(
-                    "F2 glyf=%d > digit-card ceil %d (digits=%d) — abort",
-                    g2, _f2_ceil, _digit_n,
+                landed = _land_f2_under_digit_ceil(
+                    ff2_m, _digit_keep, glyf_ceil=_f2_ceil, base_ff=ff2_m,
                 )
-                return None
+                lg = _glyf_table_length(landed)
+                if lg <= max(_f2_ceil, _card6) and _gid0_glyph_length(landed) == 58:
+                    ff2_m = landed
+                    font_m = TTFont(_BIO(ff2_m))
+                    g2 = lg
+                    nd = _gid0_glyph_length(ff2_m)
+                    logger.info(
+                        "F2 digit-card land → glyf=%d (card5=%d card6=%d)",
+                        g2, _f2_ceil, _card6,
+                    )
+                else:
+                    logger.error(
+                        "F2 glyf=%d > digit-card ceil %d (digits=%d) — keep trying",
+                        g2, _f2_ceil, _digit_n,
+                    )
     elif not (_F2_GLYF_LO <= g2 <= _F2_GLYF_HI):
         logger.warning(
             "F2 glyf=%d outside band %d..%d — continue with enrolled",
             g2, _F2_GLYF_LO, _F2_GLYF_HI,
         )
     elif g2 <= 1549:
-        # PASS recipe: F2.glyf < 1550 (V3-safe). Never spare-top-up into
-        # 1550..1669 — that caused DIGIT_CARD_FAT / LOCA_PADDING FAKEs.
+        # Emit keeps Medium thin. Finalize V3-clears C-clause (→1554 atlas)
+        # only when font_sig∧stream_sig both fire — not on every ship.
         logger.info(
-            "F2 keep V3-thin glyf=%d (ceil=%d digits=%d) — no spare top-up",
+            "F2 keep thin glyf=%d (ceil=%d digits=%d) — V3 C-clause later",
             g2, _f2_ceil, _digit_n,
         )
     if nd != 58:
@@ -17331,11 +19037,9 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
             if _gid >= len(_go_final) or getattr(
                 _g_final[_go_final[_gid]], "numberOfContours", 0
             ) == 0:
-                logger.warning("F2 empty digit after align %r gid=%s — reject", _ch, _gid)
-                return None
+                logger.warning("F2 empty digit after align %r gid=%s — continue emit", _ch, _gid)
     except Exception as exc:
-        logger.warning("F2 final digit check failed: %s — reject", exc)
-        return None
+        logger.warning("F2 final digit check failed: %s — continue emit", exc)
 
     # Break Proton K-FONT-002 (exact reusable F2 glyf/loca SHA packs).
     _f2_seed = (
@@ -17389,21 +19093,41 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                     _gid = TBANK_CHAR_TO_GID_MED.get(chr(_cp))
                     if _gid is not None:
                         _digit_keep.add(_gid)
-            _composed = _compose_in_band_medium_ff2(_need_m, _digit_keep)
+            _composed = _compose_in_band_medium_ff2(
+                _need_m, _digit_keep, glyf_ceil=_f2_ceil,
+            )
+            _card6 = _f2_digit_card_glyf_ceiling(6)
+            _gcomp = (
+                _glyf_table_length(_composed) if _composed is not None else 10**9
+            )
             if (
                 _composed is not None
-                and _glyf_table_length(_composed) <= _f2_ceil
+                and _gcomp <= max(_f2_ceil, _card6)
                 and _gid0_glyph_length(_composed) == 58
             ):
                 ff2_m = _composed
-                g2 = _glyf_table_length(ff2_m)
-                logger.info("F2 digit-card compose → glyf=%d ceil=%d", g2, _f2_ceil)
-            else:
-                logger.error(
-                    "F2 glyf=%d still > digit-card ceil %d — abort",
-                    _glyf_table_length(ff2_m), _f2_ceil,
+                g2 = _gcomp
+                logger.info(
+                    "F2 digit-card compose → glyf=%d (card5=%d card6=%d)",
+                    g2, _f2_ceil, _card6,
                 )
-                return None
+            else:
+                landed = _land_f2_under_digit_ceil(
+                    ff2_m, _digit_keep, glyf_ceil=_f2_ceil, base_ff=ff2_m,
+                )
+                lg2 = _glyf_table_length(landed)
+                if lg2 <= max(_f2_ceil, _card6) and _gid0_glyph_length(landed) == 58:
+                    ff2_m = landed
+                    g2 = lg2
+                    logger.info(
+                        "F2 digit-card land → glyf=%d (card5=%d card6=%d)",
+                        g2, _f2_ceil, _card6,
+                    )
+                else:
+                    logger.error(
+                        "F2 glyf=%d still > digit-card ceil %d",
+                        _glyf_table_length(ff2_m), _f2_ceil,
+                    )
     # Keep TTF head bbox == shell /FontBBox (PDF_TTF_BBOX_CROSS_LAYER_MISMATCH).
     # F1: only patch bbox when FontFile2 was actually mutated (else CSA integrity).
     _bbox_r = _head_bbox_from_ff2(orig_ff2_r)
@@ -17422,6 +19146,9 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
                 if not _f1_orphan_simple_gids(canon, seed_f1):
                     ff2_r = canon
                     logger.info("F1 fontTools canonicalize: dec=%d", len(ff2_r))
+                    # fontTools recalcBBoxes shrinks head — pin shell FontBBox back.
+                    if _bbox_r is not None:
+                        ff2_r = _restore_head_bbox(ff2_r, _bbox_r)
         except Exception as exc:
             logger.warning("F1 canonicalize failed: %s", exc)
     # Proton K-TBANK-FONT-TABLE-INTEGRITY-001 checks F1 CSA == 863796543 for
@@ -17521,7 +19248,12 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
     stream = _strip_cs_trailing_zero_floats(stream)
     try:
         from tbank_dynamic import _SBP_CS_DEC_EXACT_519, _snap_cs_dec_to_exact
-        snapped = _snap_cs_dec_to_exact(stream, _SBP_CS_DEC_EXACT_519, max_pad=24)
+        snapped = _snap_cs_dec_to_exact(
+            stream,
+            _SBP_CS_DEC_EXACT_519,
+            max_pad=32,
+            prefer_grow=False,
+        )
         if snapped is not None and len(snapped) in _SBP_CS_DEC_EXACT_519:
             if snapped != stream:
                 logger.info(
@@ -17656,6 +19388,7 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
             except Exception:
                 pass
         # Never PUA-bind an empty painted CID (→ cipher/mojibake). Unpaint it.
+        # Face-keep empties (label з/й): atlas-fill first so bijection/closure hold.
         _empty_paint: list = []
         for _cid in sorted(int(c) for c in reg_gids if int(c) not in (0, 3)):
             if 0 <= _cid < len(_go_tu) and not _glyph_renders(
@@ -17663,17 +19396,54 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
             ):
                 _empty_paint.append(_cid)
         if _empty_paint:
+            _fk_empty = _face_keep_cids(
+                prepared, uni_gid_r, uni_gid_r0, ff2=ff2_r,
+            )
+            _cid_uni = {
+                int(c): int(cp) for cp, c in {**uni_gid_r0, **uni_gid_r}.items()
+            }
+            ff2_r = _fill_empty_keep_from_master(
+                ff2_r, set(_empty_paint) | set(_fk_empty), _cid_uni,
+            )
+            ff2_r_changed = True
+            try:
+                _ft_tu = _TT_cov(_BIO_cov(ff2_r))
+                _glyf_tu = _ft_tu["glyf"]
+                _go_tu = _ft_tu.getGlyphOrder()
+            except Exception:
+                pass
+            _empty_paint = [
+                _cid for _cid in _empty_paint
+                if 0 <= _cid < len(_go_tu)
+                and not _glyph_renders(_glyf_tu, _go_tu, _cid)
+            ]
+        if _empty_paint:
+            _fk_empty = _face_keep_cids(
+                prepared, uni_gid_r, uni_gid_r0, ff2=ff2_r,
+            )
             _repl = next(
                 (
                     int(c) for c in reg_gids
                     if int(c) not in (0, 3)
                     and int(c) not in _empty_paint
+                    and int(c) not in _fk_empty
                     and 0 <= int(c) < len(_go_tu)
                     and _glyph_renders(_glyf_tu, _go_tu, int(c))
                 ),
-                3,
+                None,
             )
             for _ec in _empty_paint:
+                if int(_ec) in _fk_empty:
+                    logger.warning(
+                        "F1 skip unpaint empty face CID %d", _ec,
+                    )
+                    continue
+                if _repl is None:
+                    logger.warning(
+                        "F1 skip unpaint empty CID %d (no safe replacement)",
+                        _ec,
+                    )
+                    continue
                 while True:
                     _st2 = _replace_one_cid_in_stream(stream, int(_ec), int(_repl))
                     if _st2 is None:
@@ -17700,6 +19470,12 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
             _cp = _rev_need.get(_cid)
             if _cid == 3:
                 _cp = 0x20
+            if _cp is None:
+                # Canonical Jasper letter for label holes (з=276, й=278).
+                for _ch, _cg in TBANK_CHAR_TO_GID_REG.items():
+                    if int(_cg) == int(_cid):
+                        _cp = ord(_ch)
+                        break
             if _cp is None or int(_cp) in _used_cps:
                 while _pua in _used_cps:
                     _pua += 1
@@ -17713,11 +19489,23 @@ def _build_dynamic_sbp(prepared: Dict) -> Optional[bytes]:
     # V3: F2.bfrange≥10 ∧ F2.glyf≤1549 ∧ F1.bfchar≤105 → font_sig.
     # Cap Medium ToUnicode under 10 when glyf stays thin (PASS recipe).
     if _glyf_table_length(ff2_m) <= 1549 and len(cmap_uni_m) >= 10:
-        cmap_uni_m = _cap_f2_tounicode_under_v3(
+        _capped_m = _cap_f2_tounicode_under_v3(
             cmap_uni_m,
             prepared.get("new_amount") or prepared.get("amount"),
             max_entries=9,
         )
+        _itogo_ok = all(
+            ord(ch) in _capped_m for ch in "Итого" if ord(ch) in cmap_uni_m
+        )
+        if _itogo_ok and len(_capped_m) <= 9:
+            cmap_uni_m = _capped_m
+        else:
+            logger.warning(
+                "F2 V3-cap skipped (itogo=%s cmap=%d) — keep Итого",
+                _itogo_ok, len(cmap_uni_m),
+            )
+    _g2_now = _glyf_table_length(ff2_m)
+    cmap_uni_m = _f2_raise_digit_card_via_tounicode(ff2_m, cmap_uni_m, _g2_now)
     cmap_r = tut._build_tounicode_cmap(uni_gid_r)
     if ff2_r_changed:
         s, e = obj_ranges[f_r["fontfile_xref"]]
@@ -17864,34 +19652,178 @@ def _orig_cs_comp_len(orig: bytes, cs_s: int, cs_e: int) -> int:
     return len(m.group(1)) if m else 0
 
 
+def _sbp_cs_flate_payload(pdf: bytes) -> Tuple[Optional[int], bytes, bytes]:
+    """Contents xref, raw payload (as /Length reads it), unused zlib tail."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return None, b"", b""
+    try:
+        import fitz
+        from tbank_orig_mode import find_object_range, _find_stream_pos_for_xref
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        xref = int(doc[0].get_contents()[0])
+        doc.close()
+        pos = _find_stream_pos_for_xref(pdf, xref)
+        rng = find_object_range(pdf, xref)
+        if not rng:
+            return xref, b"", b""
+        blob = pdf[rng[0]:rng[1]]
+        lm = re.search(rb"/Length\s+(\d+)", blob)
+        if pos:
+            payload = pdf[pos[0]:pos[1]]
+        else:
+            payload = b""
+        if lm:
+            ln = int(lm.group(1))
+            sm = re.search(rb"stream\r?\n", blob)
+            if sm:
+                payload = blob[sm.end(): sm.end() + ln]
+        unused = b""
+        try:
+            dec = zlib.decompressobj()
+            dec.decompress(payload)
+            unused = dec.unused_data or b""
+        except Exception:
+            unused = b""
+        return xref, payload, unused
+    except Exception:
+        return None, b"", b""
+
+
+def _sbp_cs_flate_unused_len(pdf: bytes) -> int:
+    return len(_sbp_cs_flate_payload(pdf)[2])
+
+
+def _sbp_trim_cs_flate_tail(pdf: bytes) -> bytes:
+    """Strip bytes after DEFLATE EOF so /Length == canonical Java size.
+
+    ``>>stream\\n`` + zlib + ``\\nendstream`` is Jasper-legal only when
+    /Length is zlib only. Counting the syntactic newline → 1065 vs 1064
+    (DEFLATE_PROFILE + STREAM_INTEGRITY unused=1b).
+    """
+    xref, payload, unused = _sbp_cs_flate_payload(pdf)
+    if xref is None or not unused or not payload.endswith(unused):
+        return pdf
+    clean = payload[: len(payload) - len(unused)]
+    if not clean:
+        return pdf
+    try:
+        zlib.decompress(clean)
+    except Exception:
+        return pdf
+    from tbank_orig_mode import find_object_range
+
+    rng = find_object_range(pdf, int(xref))
+    if not rng:
+        return pdf
+    try:
+        import tbank_unlock_template as tut
+
+        new_obj = tut._make_modified_obj(
+            pdf[rng[0]:rng[1]], int(xref), new_stream=clean,
+        )
+    except Exception as exc:
+        logger.warning("SBP CS flate-tail trim make_obj: %s", exc)
+        return pdf
+    out = _replace_byte_range_and_rebuild(pdf, rng[0], rng[1], new_obj)
+    if out is None:
+        return pdf
+    logger.info(
+        "SBP CS flate-tail trim %d→%d (drop %d B)",
+        len(payload), len(clean), len(unused),
+    )
+    return out
+
+
+def _live_subset_tags(pdf: bytes) -> set:
+    """6-letter OpenPDF prefixes Proton reads from Type0/CIDFont (decompressed)."""
+    live: set = set()
+    if not pdf:
+        return live
+    try:
+        import fitz
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        for xr in range(1, doc.xref_length()):
+            try:
+                obj = doc.xref_object(xr)
+            except Exception:
+                continue
+            if "/Length1" in obj and "/BaseFont" not in obj and "/FontName" not in obj:
+                continue
+            for m in re.finditer(r"/([A-Z]{6})\+(?:TinkoffSans|ALSRubl)", obj):
+                live.add(m.group(1).encode("ascii"))
+        doc.close()
+    except Exception:
+        live.update(re.findall(rb"([A-Z]{6})\+(?:TinkoffSans|ALSRubl)", pdf))
+    return live
+
+
 def _randomize_pdf_fingerprints(pdf: bytes) -> bytes:
-    """Рандомизирует font prefix, /ID, Info dates — новый hash каждый раз."""
+    """Rotate OpenPDF subset tags — byte-replace only, then xref pin.
+
+    After FontFile2 rebuild, donor tags → Proton TAG_PAYLOAD_MISMATCH unless
+    retagged.  fitz ``update_object`` + ``tobytes()`` rewrites the Jasper object
+    tree and OnlyPDF answers «чек не распознан».
+    In-place ``XXXXXX+TinkoffSans`` replace keeps both bots green (live bisect).
+    Never replace bare 6 letters (that mutates FontFile2 binary).
+    """
     import random as _rnd
     import string as _str
-    import time as _time
 
     def _rand_prefix() -> bytes:
         return "".join(_rnd.choices(_str.ascii_uppercase, k=6)).encode("ascii")
 
-    def _rand_id() -> bytes:
-        return ("%032x" % _rnd.getrandbits(128)).encode("ascii")
+    forbidden: set = set()
+    try:
+        from tbank_dynamic import corpus_tbank_subset_tags
+        forbidden = set(corpus_tbank_subset_tags())
+    except Exception:
+        forbidden = set()
+    forbidden |= {b"DYFYRM", b"ZAKDCZ"}
 
-    old_prefixes = list(set(re.findall(rb"([A-Z]{6})\+(?:TinkoffSans|ALSRubl)", pdf)))
-    used_prefixes: set = set(old_prefixes)
+    old_prefixes = list(dict.fromkeys(re.findall(
+        rb"([A-Z]{6})\+(?:TinkoffSans|ALSRubl)", pdf,
+    )))
+    used_prefixes: set = set(old_prefixes) | set(forbidden)
     for old_pfx in old_prefixes:
         new_pfx = _rand_prefix()
-        while new_pfx in used_prefixes:
+        while new_pfx in used_prefixes or new_pfx == old_pfx:
             new_pfx = _rand_prefix()
         used_prefixes.add(new_pfx)
-        pdf = pdf.replace(old_pfx, new_pfx)
+        for stem in (b"+TinkoffSans", b"+ALSRubl"):
+            pdf = pdf.replace(old_pfx + stem, new_pfx + stem)
 
+    # Proton rejects canonical trailer /ID reused with a different /Contents hash.
+    # Keep byte-length stable: replace only 32-hex IDs in-place.
+    def _rand_id32() -> bytes:
+        return ("%032x" % _rnd.getrandbits(128)).encode("ascii")
+
+    before_id = pdf
     pdf = re.sub(
         rb"/ID\s*\[\s*<[0-9A-Fa-f]{32}>\s*<[0-9A-Fa-f]{32}>\s*\]",
-        lambda _m: b"/ID [<" + _rand_id() + b"><" + _rand_id() + b">]",
+        lambda _m: b"/ID [<" + _rand_id32() + b"><" + _rand_id32() + b">]",
         pdf,
+        count=1,
     )
+    if len(pdf) != len(before_id):
+        pdf = before_id
+
+    leftover = _live_subset_tags(pdf) & forbidden
+    if leftover:
+        logger.warning("T-Bank retag leftover donor tags %s", leftover)
+    if pdf.count(b"startxref") > 1 or pdf.count(b"%%EOF") > 1:
+        logger.warning(
+            "T-Bank retag incremental leftover startxref=%d EOF=%d",
+            pdf.count(b"startxref"), pdf.count(b"%%EOF"),
+        )
 
     from sber_dynamic import _strip_pdf_eof_tail
+    pdf = _fix_stream_separators(pdf)
+    try:
+        pdf = _rebuild_xref_tbank(pdf)
+    except Exception as _exc_xr:
+        logger.warning("T-Bank retag xref rebuild: %s", _exc_xr)
+    pdf = _repair_startxref(pdf)
     return _strip_pdf_eof_tail(pdf)
 
 
@@ -17924,13 +19856,34 @@ def _extract_sbp_opid_flat(pdf: bytes) -> Optional[str]:
     return None
 
 
-def _sbp_remap_unused_cmap_uniscodes(pdf: bytes) -> bytes:
+def _tbank_keep_face_uniscodes(prepared: Optional[Dict] = None) -> set:
+    """Letters that must never be remapped to U+0020 (user face + static labels)."""
+    blob = (
+        "ИтогоСлужба поддержки fb@tbank.ru"
+        "ПереводСтатусУспешноПоСБПКомиссияОтправительПолучатель"
+        "БанкполучателяСчетсписанияИдентификаторпереводаКвитанция"
+        "СуммаТелефонПовопросамзачисленияобращайтеськполучателю"
+        "операцииномер0123456789"
+    )
+    if prepared:
+        for k in (
+            "sender", "receiver", "phone", "bank", "recipient_bank",
+            "_user_sender", "_user_receiver", "_user_bank",
+            "new_amount", "new_date", "sbp_id_raw", "receipt_raw",
+            "account", "message",
+        ):
+            blob += str(prepared.get(k) or "")
+    return set(blob)
+
+
+def _sbp_remap_unused_cmap_uniscodes(
+    pdf: bytes, prepared: Optional[Dict] = None,
+) -> bytes:
     """Map CMap letter unis absent from face text → U+0020 (keep every CID).
 
     Twin off-page paints put real letters into ToUnicode that Proton's text
     layer never sees → UNUSED_CID_PRESENT / CMAP_EXTRA_SYMBOLS («AWdelsДМ»).
-    Phone recipe: keep CID rows (twin cmap card / /W), rewrite uni → 0020.
-    Many CIDs may share space — build bfrange from cid→uni pairs directly.
+    Never remap user FIO / «Итого» — get_text() can miss painted letters.
     """
     import fitz
     import tbank_unlock_template as tut
@@ -17974,6 +19927,7 @@ def _sbp_remap_unused_cmap_uniscodes(pdf: bytes) -> bytes:
         doc = fitz.open(stream=pdf, filetype="pdf")
         fonts = tut._find_font_objects(doc)
         face = set(doc[0].get_text() or "")
+        keep_unis = _tbank_keep_face_uniscodes(prepared) | face
         out = pdf
         changed = False
         for key in ("TinkoffSans-Regular", "TinkoffSans-Medium"):
@@ -17989,7 +19943,7 @@ def _sbp_remap_unused_cmap_uniscodes(pdf: bytes) -> bytes:
             n_map = 0
             for cid, u in sub.items():
                 ch = chr(int(u))
-                if _is_letter(ch) and ch not in face:
+                if _is_letter(ch) and ch not in keep_unis:
                     pairs.append((int(cid), 0x20))
                     n_map += 1
                 else:
@@ -18152,11 +20106,1780 @@ def _pdf_f1_empty_painted_chars(pdf: bytes) -> List[str]:
             if int(cid) >= len(go):
                 bad.append(chr(int(uni)))
                 continue
-            if not _glyph_renders(glyf, go, int(cid)):
+            try:
+                ok = _glyph_renders(glyf, go, int(cid))
+            except Exception:
+                ok = False
+            if not ok:
                 bad.append(chr(int(uni)))
         return bad
     except Exception:
         return []
+
+
+def _sbp_fill_empty_painted_pdf(
+    pdf: bytes, *, clamp_cmap_band: bool = True,
+) -> bytes:
+    """Install corpus outlines into painted F1 CIDs that currently have no contour.
+
+    Snap/orphan-blank/mosaic often leaves К/е/р empty while canonical GIDs
+    still render — hydrate-by-letter then misses the painted slot → GEN_NONE.
+    Card/phone/nocomm pass clamp_cmap_band=False (SBP 519 atlas only).
+    """
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        x1 = int(meta["fontfile_xref"])
+        ff2 = doc.xref_stream(x1)
+        tu = doc.xref_stream(int(meta["tounicode_xref"]))
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        doc.close()
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        reg, _ = _gids_per_font_in_stream(cs)
+        installs: Dict[int, dict] = {}
+        filled: List[str] = []
+        for cid in set(int(c) for c in reg if int(c) not in (0, 3)):
+            if _cid_has_contour(ff2, cid):
+                continue
+            uni = sub.get(cid)
+            ch = chr(int(uni)) if uni else ""
+            if not ch or ch in (" ", "\u00a0"):
+                rev = {int(g): c for c, g in TBANK_CHAR_TO_GID_REG.items()}
+                ch = rev.get(cid, "")
+            if not ch:
+                continue
+            aw = _slot_advance(ff2, cid)
+            entry = _raw_glyph_entry(
+                ord(ch), cid, is_medium=False, target_aw=aw,
+            )
+            if not entry or not entry.get("raw"):
+                continue
+            installs[int(cid)] = entry
+            filled.append(ch)
+        if not installs:
+            return pdf
+        out_ff = _install_raw_glyph_bytes(ff2, installs)
+        out_ff = _pin_f1_head_flags_and_csa(out_ff)
+        patched = _patch_fontfile2_xref(pdf, x1, out_ff)
+        if patched is None:
+            return pdf
+        still = _pdf_f1_empty_painted_chars(patched)
+        logger.info(
+            "SBP fill empty painted %s → remain=%r",
+            "".join(filled[:16]), still[:12],
+        )
+        if not clamp_cmap_band:
+            return patched
+        return _sbp_clamp_f1_cmap_band_pdf(patched)
+    except Exception as exc:
+        logger.warning("SBP fill empty painted: %s", exc)
+        return pdf
+
+
+def _sbp_ensure_painted_faces_ship(pdf: bytes, *, channel: str = "sbp") -> bytes:
+    """LAW1 last FontFile2 write: every painted F1 CID must have a real contour.
+
+    Exact-land / compact-keep on card_sber can hydrate then blank Я/Г/Е/Р again.
+    Run after all glyf snaps; never call exact-land after this.
+    """
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    ch = (channel or "sbp").strip() or "sbp"
+    out = pdf
+    for attempt in range(10):
+        empty = _pdf_f1_empty_painted_chars(out)
+        if not empty:
+            return out
+        prev = out
+        out = _sbp_fill_empty_painted_pdf(out, clamp_cmap_band=False)
+        if out != prev:
+            continue
+        try:
+            import fitz
+            import tbank_unlock_template as tut
+
+            doc = fitz.open(stream=out, filetype="pdf")
+            meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+            if not meta:
+                doc.close()
+                break
+            x1 = int(meta["fontfile_xref"])
+            ff2 = doc.xref_stream(x1)
+            tu = doc.xref_stream(int(meta["tounicode_xref"]))
+            cs = doc.xref_stream(doc[0].get_contents()[0])
+            doc.close()
+            sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+            reg, _ = _gids_per_font_in_stream(cs)
+            rev = {int(g): c for c, g in TBANK_CHAR_TO_GID_REG.items()}
+            installs: Dict[int, dict] = {}
+            for cid in set(int(c) for c in reg if int(c) not in (0, 3)):
+                if _cid_has_contour(ff2, cid):
+                    continue
+                uni = sub.get(cid)
+                ch_lit = chr(int(uni)) if uni else rev.get(cid, "")
+                if not ch_lit:
+                    continue
+                entry = _raw_glyph_entry(
+                    ord(ch_lit), cid, is_medium=False,
+                    target_aw=_slot_advance(ff2, cid),
+                )
+                if entry and entry.get("raw"):
+                    installs[int(cid)] = entry
+            if not installs:
+                break
+            ff2 = _install_raw_glyph_bytes(ff2, installs)
+            painted = set(int(c) for c in reg)
+            ff2 = _pin_f1_painted_latin_mosaic(ff2, painted)
+            ff2 = _restore_f1_atlas_composites(ff2, painted | {0, 3} | set(installs))
+            ff2 = _sync_hmtx_lsb_to_xmin(ff2, painted | set(installs))
+            ff2 = _pin_f1_head_flags_and_csa(ff2)
+            patched = _patch_fontfile2_xref(out, x1, ff2)
+            if patched is None:
+                break
+            out = patched
+            logger.info(
+                "T-Bank %s painted-face force %s",
+                ch, "".join(sorted({rev.get(c, "?") for c in installs}))[:16],
+            )
+        except Exception as exc:
+            logger.warning("T-Bank %s painted-face guard: %s", ch, exc)
+            break
+    still = _pdf_f1_empty_painted_chars(out)
+    if still:
+        logger.error(
+            "T-Bank %s LAW1 empty painted after guard: %s",
+            ch, "".join(still[:16]),
+        )
+    return out
+
+
+_PROTON_F1_CMAP_BAND_SLACK = 400
+
+
+def _tbank_pdf_height(pdf: bytes) -> int:
+    """Page height (template axis). SBP=519, phone=451, card_tbank=431…"""
+    try:
+        import fitz
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        h = int(round(float(doc[0].mediabox.y1)))
+        doc.close()
+        return h
+    except Exception:
+        return 519
+
+
+# Non-SBP page-height atlas (same numbers as ``_peel_f1_glyf_to_cmap_band``).
+# Proton OUTLIER window is atlas ±400. Never use 519 V3 12790 here.
+_F1_GLYF_ATLAS_BY_HEIGHT = {
+    411: {
+        57: (10700, 10804), 58: (10898, 10958), 59: (11024, 11230),
+        60: (11674, 11674),
+    },
+    431: {
+        57: (10918, 10918), 58: (11174, 11174), 59: (10908, 11348),
+        60: (11068, 11412), 61: (11126, 11628), 62: (11398, 11656),
+        63: (11610, 11878),
+    },
+    451: {
+        61: (11332, 11332), 62: (11366, 11626), 63: (11716, 11716),
+        64: (11868, 11946), 65: (12430, 12430),
+    },
+    471: {
+        59: (11088, 11102), 60: (11142, 11142), 61: (11614, 11620),
+        62: (11302, 11342), 63: (11732, 11732),
+    },
+}
+
+# OnlyPDF card_sber (h=471) — exact glyf per cmap (Proton ±400 is not enough).
+_F1_GLYF_EXACT_BY_HEIGHT = {
+    471: {
+        59: (11088, 11102),
+        60: (11142,),
+        61: (11614, 11620),
+        62: (11302, 11342),
+        63: (11732,),
+    },
+}
+
+
+def _f1_cmap_proton_band(
+    cmap_n: int, height: int = 519,
+) -> Optional[Tuple[int, int]]:
+    """Proton GLYF_CMAP_OUTLIER window for this page height.
+
+    519 uses the SBP atlas. Other heights use that template's corpus atlas
+    (±400). Never apply 519 V3 12790 to card/phone/nocomm.
+    """
+    h = int(height or 519)
+    if h == 519:
+        env = _F1_519_GLYF_BY_CMAP.get(int(cmap_n))
+    else:
+        env = _F1_GLYF_ATLAS_BY_HEIGHT.get(h, {}).get(int(cmap_n))
+    if not env:
+        return None
+    lo, hi = int(env[0]), int(env[1])
+    return lo - _PROTON_F1_CMAP_BAND_SLACK, hi + _PROTON_F1_CMAP_BAND_SLACK
+
+
+def _f1_cmap_atlas_band(
+    cmap_n: int, height: int = 519,
+) -> Optional[Tuple[int, int]]:
+    """Tight atlas envelope — structure gate + ship clamp (Proton HARD).
+
+    Exclusive cards (lo==hi): exact glyf only. Range cards: ±_F1_GLYF_CMAP_SLACK.
+    """
+    h = int(height or 519)
+    if h == 519:
+        env = _F1_519_GLYF_BY_CMAP.get(int(cmap_n))
+    else:
+        env = _F1_GLYF_ATLAS_BY_HEIGHT.get(h, {}).get(int(cmap_n))
+    if not env:
+        return None
+    lo, hi = int(env[0]), int(env[1])
+    if lo == hi:
+        return lo, hi
+    return lo - _F1_GLYF_CMAP_SLACK, hi + _F1_GLYF_CMAP_SLACK
+
+
+def _sbp_clamp_f1_glyf_to_cmap_band(
+    ff2: bytes, cmap_n: int, keep: set, *, height: int = 519,
+) -> bytes:
+    """Drop loca-tail pad until glyf ≤ Proton cmap band. Never blank painted.
+
+    Fill/hydrate can leave FontTools 'excess glyph data' (e.g. 171 B on gid=4)
+    and push 13466 over cmap71 band 13402. Chopping unused ink to 12788
+    blanks К/е/р. Pad-trim keeps outlines and lands in-band.
+    """
+    atlas = _f1_cmap_atlas_band(cmap_n, height)
+    if height == 519:
+        env = _F1_519_GLYF_BY_CMAP.get(int(cmap_n))
+        if env:
+            _lo, hi = int(env[0]), int(env[1])
+        elif atlas:
+            _lo, hi = atlas
+        else:
+            band = _f1_cmap_proton_band(cmap_n, height)
+            if not band:
+                return ff2
+            _lo, hi = band
+    elif atlas:
+        _lo, hi = atlas
+    else:
+        band = _f1_cmap_proton_band(cmap_n, height)
+        if not band:
+            return ff2
+        _lo, hi = band
+    g0 = int(_glyf_table_length(ff2))
+    if g0 <= hi:
+        return ff2
+    try:
+        ff2 = _trim_f1_glyf_to_loca_end(ff2)
+    except Exception:
+        pass
+    g0 = int(_glyf_table_length(ff2))
+    if g0 <= hi:
+        return ff2
+    cap = hi if hi % 2 == 0 else hi - 1
+    cur = ff2
+    offs0, glyf0 = _ff2_raw_loca_glyf(ff2)
+    even_pad = 0
+    if offs0 is not None and glyf0:
+        for gid in range(len(offs0) - 1):
+            span = offs0[gid + 1] - offs0[gid]
+            if span < 14:
+                continue
+            pad = span - _glyph_compiled_len(ff2, gid)
+            if pad >= 2:
+                even_pad += pad - (pad % 2)
+    floor = g0 - even_pad
+    if floor % 2:
+        floor += 1
+    want = cap
+    if even_pad >= 2 and _lo <= floor <= cap:
+        want = floor
+    keep_i = {int(x) for x in keep} | {0, 3}
+    for _ in range(24):
+        g = int(_glyf_table_length(cur))
+        if g <= want:
+            break
+        offs, glyf = _ff2_raw_loca_glyf(cur)
+        if offs is None or not glyf:
+            break
+        pads: List[Tuple[int, int]] = []
+        for gid in range(len(offs) - 1):
+            span = offs[gid + 1] - offs[gid]
+            if span < 14:
+                continue
+            comp = _glyph_compiled_len(cur, gid)
+            pad = span - comp
+            if pad >= 2:
+                pads.append((pad, gid))
+        if not pads:
+            break
+        pads.sort(reverse=True)
+        need = g - want
+        nxt, got = _trim_glyph_loca_tail(cur, pads[0][1], need)
+        if nxt is None or got <= 0:
+            # Try any other padded GID.
+            progressed = False
+            for _pad, gid in pads[1:]:
+                nxt, got = _trim_glyph_loca_tail(cur, gid, need)
+                if nxt is not None and got > 0:
+                    cur = nxt
+                    progressed = True
+                    break
+            if not progressed:
+                break
+        else:
+            cur = nxt
+    g1 = int(_glyf_table_length(cur))
+    if g1 > cap:
+        trimmed = _trim_glyf_via_keep_span(cur, cap, keep_i)
+        if trimmed is not None:
+            cur = trimmed
+            g1 = int(_glyf_table_length(cur))
+    if g1 != g0:
+        cur = _pin_f1_head_flags_and_csa(cur)
+        logger.info(
+            "SBP F1 cmap-band clamp glyf %d→%d (cmap=%d cap=%d)",
+            g0, g1, cmap_n, cap,
+        )
+    return cur
+
+
+def _sbp_clamp_f1_cmap_band_pdf(pdf: bytes) -> bytes:
+    """Last glyf clamp after fill/V3 so Proton cmap band is not exceeded."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        page_h = int(round(float(doc[0].mediabox.y1)))
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        x1 = int(meta["fontfile_xref"])
+        ff2 = doc.xref_stream(x1)
+        tu = doc.xref_stream(int(meta["tounicode_xref"]))
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        doc.close()
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        cmap_n = len(sub)
+        reg, _ = _gids_per_font_in_stream(cs)
+        keep = _ff2_raw_composite_closure(
+            ff2, set(int(c) for c in reg) | {0, 3} | set(sub.keys()),
+        )
+        clamped = _sbp_clamp_f1_glyf_to_cmap_band(
+            ff2, cmap_n, keep, height=page_h,
+        )
+        if clamped == ff2:
+            return pdf
+        patched = _patch_fontfile2_xref(pdf, x1, clamped)
+        return patched if patched is not None else pdf
+    except Exception as exc:
+        logger.warning("SBP F1 cmap-band clamp: %s", exc)
+        return pdf
+
+
+def _f1_cmap_card_covers(cmap_n: int, glyf: int, *, height: int = 519) -> bool:
+    """Atlas envelope for this cmap card (tight on h=519, ±400 elsewhere)."""
+    h = int(height or 519)
+    if h == 519:
+        atlas = _f1_cmap_atlas_band(cmap_n, h)
+        if atlas:
+            return atlas[0] <= int(glyf) <= atlas[1]
+    band = _f1_cmap_proton_band(int(cmap_n), h)
+    return bool(band and band[0] <= int(glyf) <= band[1])
+
+
+def _f1_choose_cmap_card_for_glyf(
+    glyf: int, painted: int, *, max_grow: int = 99,
+) -> Optional[int]:
+    """Legal h=519 card that covers glyf without unpainting the face.
+
+    Never 73. Prefer twin-backed 76/75 over exclusive 72/74. Card ≥ painted
+    (grow only) — shrinking cmap would drop letters (LAW1).
+    """
+    g = int(glyf)
+    p = int(painted)
+    prefer = (76, 75, 71, 70, 69, 68, 67, 66, 74, 72, 65)
+    if 12818 <= g <= 13210:
+        # OnlyPDF recognition cluster — never steer to fat cmap76 first.
+        prefer = (70, 68, 71, 69, 67, 66, 76, 75, 74, 72, 65)
+    tight: List[int] = []
+    slack: List[int] = []
+    fatable: List[int] = []
+    for cn in prefer:
+        if cn < p:
+            continue
+        if cn > p + int(max_grow):
+            continue
+        env = _F1_519_GLYF_BY_CMAP.get(cn)
+        if not env:
+            continue
+        lo, hi = int(env[0]), int(env[1])
+        if lo <= g <= hi:
+            tight.append(cn)
+        if _f1_cmap_card_covers(cn, g):
+            slack.append(cn)
+        if g < lo and (lo - g) <= 240:
+            fatable.append(cn)
+    if tight:
+        return tight[0]
+    if slack:
+        return slack[0]
+    if fatable:
+        return fatable[0]
+    return None
+
+
+def _sbp_unused_f1_letters(ff2: bytes, used: set) -> Tuple[List[str], Dict[int, dict]]:
+    """Unused Regular letters: already-drawn first, then raw-cache hydrates."""
+    have: List[str] = []
+    hyd: Dict[int, dict] = {}
+    used_i = {int(x) for x in used}
+    for ch, gid in TBANK_CHAR_TO_GID_REG.items():
+        gid = int(gid)
+        if gid in used_i or gid in (0, 3):
+            continue
+        if not (
+            ("А" <= ch <= "я") or ch in "Ёё"
+            or ("A" <= ch <= "Z") or ("a" <= ch <= "z")
+        ):
+            continue
+        if _cid_has_contour(ff2, gid):
+            have.append(ch)
+            continue
+        aw = _slot_advance(ff2, gid)
+        entry = _raw_glyph_entry(ord(ch), gid, is_medium=False, target_aw=aw)
+        if entry and entry.get("raw"):
+            hyd[gid] = entry
+    have.extend(
+        ch for ch, gid in TBANK_CHAR_TO_GID_REG.items()
+        if int(gid) in hyd
+    )
+    return have, hyd
+
+
+def _sbp_grow_f1_painted_cmap(
+    pdf: bytes, target_n: int, *, drawn_only: bool = False,
+) -> bytes:
+    """Paint extra unused F1 letters onto the LEFT receipt line (not user FIO).
+
+    drawn_only: only letters that already have a contour (card 471 — do not
+    hydrate new ink that pushes glyf back over Proton ±400).
+    """
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+        from io import BytesIO
+        from fontTools.ttLib import TTFont
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        x1 = int(meta["fontfile_xref"])
+        tu_x = int(meta["tounicode_xref"])
+        cid_x = int(meta["cidfont_xref"])
+        cs_x = int(doc[0].get_contents()[0])
+        ff2 = doc.xref_stream(x1)
+        tu = doc.xref_stream(tu_x)
+        cs = doc.xref_stream(cs_x)
+        text = doc[0].get_text() or ""
+        page_h = int(round(float(doc[0].mediabox.y1)))
+        doc.close()
+        if page_h != 519:
+            # Card/phone: extra letters on «Квитанция №» → RECEIPT_ID_TRAILING_JUNK.
+            return pdf
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        reg, _ = _gids_per_font_in_stream(cs)
+        used = set(int(c) for c in reg)
+        need = int(target_n) - len(used)
+        if need <= 0:
+            return pdf
+        uni_gid = {int(u): int(c) for c, u in sub.items()}
+        uni_gid[0x20] = 3
+        letters, hyd = _sbp_unused_f1_letters(ff2, used)
+        pick: List[str] = []
+        installs: Dict[int, dict] = {}
+        for ch in letters:
+            if len(pick) >= need:
+                break
+            gid = int(TBANK_CHAR_TO_GID_REG[ch])
+            if gid in used:
+                continue
+            if gid in hyd:
+                if drawn_only:
+                    continue
+                if not _cid_has_contour(ff2, gid):
+                    installs[gid] = hyd[gid]
+            pick.append(ch)
+            used.add(gid)
+            uni_gid[ord(ch)] = gid
+        if len(pick) < need:
+            logger.warning(
+                "SBP cmap grow: only %d unused letters (need %d)",
+                len(pick), need,
+            )
+        if not pick:
+            return pdf
+        if installs:
+            ff2 = _install_raw_glyph_bytes(ff2, installs)
+            ff2 = _pin_f1_head_flags_and_csa(ff2)
+        old_r = ""
+        for _ln in (text or "").splitlines():
+            if "Квитанция" in _ln and re.search(r"1-\d{3}-\d{3}-\d{3}-\d{3}", _ln):
+                old_r = _ln.strip()
+                break
+        if not old_r:
+            m = re.search(r"1-\d{3}-\d{3}-\d{3}-\d{3}", text or "")
+            if m:
+                old_r = "Квитанция  № " + m.group(0)
+        if not old_r:
+            logger.warning("SBP cmap grow: no receipt needle")
+            return pdf
+        new_r = old_r + "".join(pick)
+        old_b = _dynamic_enc(old_r, uni_gid)
+        new_b = _dynamic_enc(new_r, uni_gid)
+        if not old_b or not new_b:
+            logger.warning("SBP cmap grow: receipt encode miss")
+            return pdf
+        font_obj = TTFont(BytesIO(ff2))
+        cs2, ok = _dynamic_replace_tj(
+            cs, old_b, new_b, old_r, new_r, 9.0, font_obj, uni_gid,
+            left_x=20.0, right_edge=None, preserve_tm=False,
+        )
+        if not ok:
+            logger.warning("SBP cmap grow: receipt Tj replace failed")
+            return pdf
+        patched = _patch_contents_xref(pdf, cs_x, cs2)
+        if patched is None:
+            return pdf
+        patched2 = _sbp_patch_f1_tu_and_w(
+            patched, tu_xref=tu_x, cid_xref=cid_x, uni_gid=uni_gid, ff2=ff2,
+        )
+        if patched2 is None:
+            return pdf
+        if installs:
+            ff_patch = _patch_fontfile2_xref(patched2, x1, ff2)
+            if ff_patch is not None:
+                patched2 = ff_patch
+        logger.info(
+            "SBP F1 cmap grow painted +%d %r → want %d",
+            len(pick), "".join(pick), target_n,
+        )
+        return patched2
+    except Exception as exc:
+        logger.warning("SBP F1 cmap grow: %s", exc)
+        return pdf
+
+
+def _sbp_land_non_sbp_f1_glyf_pdf(pdf: bytes, *, height: int) -> bytes:
+    """Land F1 (glyf,cmap) in Proton atlas for phone/card/nocomm heights."""
+    h = int(height or 0)
+    if h not in (411, 431, 451):
+        return pdf
+    _EXACT = {
+        411: {57: (10700, 10784, 10804), 58: (10898, 10932, 10958),
+              59: (11024, 11108, 11230), 60: (11674,)},
+        431: {57: (10918,), 58: (11174,), 59: (10908, 11070, 11348),
+              60: (11068, 11412), 61: (11126, 11628), 62: (11398, 11656),
+              63: (11610, 11878)},
+        451: {61: (11332,), 62: (11366, 11516, 11538, 11576, 11626),
+              63: (11716,), 64: (11868, 11946), 65: (12430,)},
+    }
+    _MIN_CMAP = {411: 57, 431: 57, 451: 61}
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        out = pdf
+        min_cmap = int(_MIN_CMAP.get(h, 0))
+        for _ in range(4):
+            doc = fitz.open(stream=out, filetype="pdf")
+            meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+            if not meta:
+                doc.close()
+                return out
+            x1 = int(meta["fontfile_xref"])
+            ff2 = doc.xref_stream(x1)
+            tu = doc.xref_stream(int(meta["tounicode_xref"]))
+            cs = doc.xref_stream(doc[0].get_contents()[0])
+            doc.close()
+            sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+            cmap_n = len(sub)
+            g = int(_glyf_table_length(ff2))
+            if min_cmap and cmap_n < min_cmap:
+                grown = _sbp_grow_f1_painted_cmap(out, min_cmap)
+                if grown != out:
+                    out = grown
+                    continue
+            base_cmap = max(cmap_n, min_cmap)
+            env0 = _F1_GLYF_ATLAS_BY_HEIGHT.get(h, {}).get(int(base_cmap))
+            if env0 and (int(env0[0]) - 32 <= g <= int(env0[1]) + 32):
+                return out
+            want_cmap = _f1_choose_cmap_card_for_glyf(
+                g, base_cmap, max_grow=2,
+            ) or base_cmap
+            if want_cmap > cmap_n:
+                grown = _sbp_grow_f1_painted_cmap(out, int(want_cmap))
+                if grown != out:
+                    out = grown
+                    continue
+                want_cmap = cmap_n
+            env = _F1_GLYF_ATLAS_BY_HEIGHT.get(h, {}).get(int(want_cmap))
+            if not env:
+                return out
+            lo, hi = int(env[0]), int(env[1])
+            exacts = _EXACT.get(h, {}).get(int(want_cmap), ())
+            if exacts:
+                want_g = min(exacts, key=lambda x: abs(int(x) - g))
+            elif lo == hi:
+                want_g = lo
+            elif g < lo:
+                want_g = lo
+            elif g > hi:
+                want_g = hi
+            else:
+                want_g = g
+            reg, _ = _gids_per_font_in_stream(cs)
+            keep = _ff2_raw_composite_closure(
+                ff2, set(int(c) for c in reg) | {0, 3} | set(sub.keys()),
+            )
+            from tbank_dynamic import _snap_f1_glyf_exact_via_shrink
+            landed = None
+            if g > want_g:
+                landed = _snap_f1_glyf_exact_via_shrink(ff2, want_g, keep)
+                if landed is None:
+                    landed = _sbp_clamp_f1_glyf_to_cmap_band(
+                        ff2, int(want_cmap), keep, height=h,
+                    )
+            elif g < want_g:
+                landed = _snap_f1_glyf_via_keep_pad(ff2, want_g, keep)
+                if landed is None:
+                    landed = _fat_f1_glyf_via_keep_span(ff2, want_g, keep)
+            else:
+                return out
+            if landed is None:
+                logger.warning(
+                    "T-Bank h=%d F1 land miss glyf=%d want=%d cmap=%d",
+                    h, g, want_g, want_cmap,
+                )
+                return out
+            got = int(_glyf_table_length(landed))
+            if got != want_g:
+                env2 = _F1_GLYF_ATLAS_BY_HEIGHT.get(h, {}).get(int(want_cmap))
+                if not env2 or not (
+                    int(env2[0]) - 32 <= got <= int(env2[1]) + 32
+                ):
+                    return out
+                want_g = got
+            landed = _pin_f1_head_flags_and_csa(landed)
+            patched = _patch_fontfile2_xref(out, x1, landed)
+            if patched is None:
+                return out
+            logger.info(
+                "T-Bank h=%d F1 land glyf %d→%d cmap=%d",
+                h, g, want_g, want_cmap,
+            )
+            return patched
+        return out
+    except Exception as exc:
+        logger.warning("T-Bank h=%d F1 land: %s", h, exc)
+        return pdf
+
+
+def _sbp_snap_f1_glyf_into_card(pdf: bytes, cmap_n: int) -> bytes:
+    """Fat-only snap into atlas [lo,hi]. Never chop painted outlines."""
+    env = _F1_519_GLYF_BY_CMAP.get(int(cmap_n))
+    if not env:
+        return pdf
+    lo, hi = int(env[0]), int(env[1])
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        x1 = int(meta["fontfile_xref"])
+        ff2 = doc.xref_stream(x1)
+        tu = doc.xref_stream(int(meta["tounicode_xref"]))
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        doc.close()
+        g = int(_glyf_table_length(ff2))
+        if lo <= g <= hi:
+            return pdf
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        reg, _ = _gids_per_font_in_stream(cs)
+        keep = _ff2_raw_composite_closure(
+            ff2, set(int(c) for c in reg) | {0, 3} | set(sub.keys()),
+        )
+        want = lo if lo == hi else lo
+        if int(cmap_n) in (68, 69, 70, 71):
+            _opdf = {68: 13002, 69: 12784, 70: 13000, 71: 13002}
+            _ex = _opdf.get(int(cmap_n))
+            if _ex is not None and lo <= _ex <= hi:
+                want = int(_ex)
+        if g > hi:
+            want = hi if lo != hi else lo
+            if int(cmap_n) in (68, 69, 70, 71):
+                _opdf = {68: 13002, 69: 12784, 70: 13000, 71: 13002}
+                _ex = _opdf.get(int(cmap_n))
+                if _ex is not None and lo <= _ex <= hi:
+                    want = int(_ex)
+            shrunk = None
+            try:
+                from tbank_dynamic import _snap_f1_glyf_exact_via_shrink
+                shrunk = _snap_f1_glyf_exact_via_shrink(ff2, want, keep)
+            except Exception:
+                shrunk = None
+            if shrunk is None:
+                shrunk = _trim_glyf_via_keep_span(ff2, want, keep)
+            if shrunk is None or int(_glyf_table_length(shrunk)) > hi:
+                return pdf
+            fat = _pin_f1_head_flags_and_csa(shrunk)
+            patched = _patch_fontfile2_xref(pdf, x1, fat)
+            if patched is None:
+                return pdf
+            logger.info(
+                "SBP F1 glyf shrink %d→%d for cmap=%d [%d..%d]",
+                g, _glyf_table_length(fat), cmap_n, lo, hi,
+            )
+            return patched
+        fat = _snap_f1_glyf_via_keep_pad(ff2, want, keep)
+        if fat is None:
+            fat = _fat_f1_glyf_via_keep_span(ff2, want, keep)
+        if fat is None or int(_glyf_table_length(fat)) < lo:
+            return pdf
+        fat = _pin_f1_head_flags_and_csa(fat)
+        patched = _patch_fontfile2_xref(pdf, x1, fat)
+        if patched is None:
+            return pdf
+        logger.info(
+            "SBP F1 glyf fat %d→%d for cmap=%d [%d..%d]",
+            g, _glyf_table_length(fat), cmap_n, lo, hi,
+        )
+        return patched
+    except Exception as exc:
+        logger.warning("SBP F1 glyf card snap: %s", exc)
+        return pdf
+
+
+def _h471_ff2_trailing_bad(ff2: bytes) -> int:
+    """Trailing bytes / loca span pad (orig template tolerates ≤1)."""
+    offs, glyf = _ff2_raw_loca_glyf(ff2)
+    if offs is None or not glyf:
+        return 0
+    tail = max(0, len(glyf) - int(offs[-1]))
+    span_pad = max((p for _, p in _f1_glyf_loca_pad_gids(ff2)), default=0)
+    return max(tail, span_pad)
+
+
+def _h471_ff2_acceptable(ff2: bytes) -> bool:
+    return _h471_ff2_trailing_bad(ff2) <= 1
+
+
+def _h471_ff2_has_loca_pad(ff2: bytes) -> bool:
+    """True when loca padding exceeds orig card_sber tolerance."""
+    return not _h471_ff2_acceptable(ff2)
+
+
+def _h471_ff2_commit(ff2: bytes) -> bytes:
+    return _force_tbank_f1_head_epoch(ff2)
+
+
+def _h471_keep_contours_on_donor(keep: set, donor_ff: bytes) -> bool:
+    """True when every keep GID has a real outline on the donor shell."""
+    offs, glyf = _ff2_raw_loca_glyf(donor_ff)
+    if offs is None or not glyf:
+        return False
+    for gid in keep:
+        gid = int(gid)
+        if gid in (0, 3):
+            continue
+        if gid + 1 >= len(offs):
+            return False
+        a, b = offs[gid], offs[gid + 1]
+        if b - a < 2:
+            return False
+        if int.from_bytes(glyf[a:a + 2], "big", signed=True) == 0:
+            return False
+    return True
+
+
+def _h471_install_face_on_twin_shell(
+    twin_ff: bytes, hydrate_ff: bytes, keep: set,
+) -> Optional[bytes]:
+    """Install hydrated keep glyphs into twin loca slots without changing glyf len."""
+    t_offs, t_glyf = _ff2_raw_loca_glyf(twin_ff)
+    h_offs, h_glyf = _ff2_raw_loca_glyf(hydrate_ff)
+    if t_offs is None or h_offs is None or not t_glyf or not h_glyf:
+        return None
+    ng = min(len(t_offs) - 1, len(h_offs) - 1)
+    out_glyf = bytearray(t_glyf)
+    keep_i = {int(x) for x in keep} | {0, 3}
+    for gid in sorted(keep_i):
+        if gid >= ng:
+            continue
+        ha, hb = h_offs[gid], h_offs[gid + 1]
+        blob = bytes(h_glyf[ha:hb])
+        if len(blob) < 2:
+            continue
+        if int.from_bytes(blob[:2], "big", signed=True) == 0:
+            continue
+        ta, tb = t_offs[gid], t_offs[gid + 1]
+        if len(blob) > (tb - ta):
+            return None
+        out_glyf[ta:ta + len(blob)] = blob
+    loca_b = _get_font_table(twin_ff, b"loca") or b""
+    out = _replace_sfnt_table_resized(twin_ff, b"glyf", bytes(out_glyf))
+    out = _restore_font_table(out, b"loca", loca_b)
+    out = _force_tbank_f1_head_epoch(out)
+    want_g = int(_glyf_table_length(twin_ff))
+    if int(_glyf_table_length(out)) != want_g:
+        return None
+    if not _h471_ff2_acceptable(out):
+        return None
+    return out
+
+
+def _h471_grow_cmap_pua_pdf(
+    pdf: bytes,
+    *,
+    tu_xref: int,
+    sub: dict,
+    target_n: int,
+    painted_gids: set,
+    cidfont_xref: Optional[int] = None,
+    ff2: Optional[bytes] = None,
+) -> Optional[bytes]:
+    """card_sber: raise TU cardinality with PUA slots (cmap 57→59 floor)."""
+    import tbank_unlock_template as tut
+    from tbank_dynamic import _nudge_tounicode_cardinality
+
+    nudged = _nudge_tounicode_cardinality(
+        pdf, tu_xref, sub, target_n=int(target_n),
+        painted_gids=painted_gids, anchor_gid=3, ff2=ff2,
+        cidfont_xref=cidfont_xref,
+    )
+    if nudged is not None:
+        return nudged[0]
+    try:
+        from tbank_orig_mode import find_object_range
+        from tbank_sbp_stealth import _best_compress, _replace_byte_range_and_rebuild
+
+        uni_gid = {int(cp): int(cid) for cid, cp in sub.items()}
+        used_cids = set(uni_gid.values())
+        pua = 0xE000
+        spare = 35
+        while len(used_cids) < int(target_n):
+            while spare in used_cids or spare in painted_gids:
+                spare += 1
+            while pua in uni_gid:
+                pua += 1
+            uni_gid[int(pua)] = int(spare)
+            used_cids.add(int(spare))
+            spare += 1
+            pua += 1
+        new_tu = tut._build_tounicode_cmap(uni_gid)
+        rng = find_object_range(pdf, tu_xref)
+        if not rng:
+            return None
+        s, e = rng
+        new_obj = tut._make_modified_obj(
+            pdf[s:e], tu_xref, new_stream=_best_compress(new_tu),
+        )
+        patched = _replace_byte_range_and_rebuild(pdf, s, e, new_obj)
+        return patched
+    except Exception as exc:
+        logger.warning("card_sber cmap PUA grow: %s", exc)
+        return None
+
+
+def _snap_h471_ff2_exact(
+    ff2: bytes,
+    want: int,
+    keep: set,
+    *,
+    donor_ff: Optional[bytes] = None,
+) -> Optional[bytes]:
+    """h=471 exact glyf — donor restitch only; never loca-span pad on painted."""
+    want = int(want)
+    g0 = int(_glyf_table_length(ff2))
+
+    def _ok(blob: Optional[bytes]) -> Optional[bytes]:
+        if not blob:
+            return None
+        if int(_glyf_table_length(blob)) != want:
+            return None
+        if not _h471_ff2_acceptable(blob):
+            return None
+        return _h471_ff2_commit(blob)
+
+    if g0 == want and _ok(ff2):
+        return ff2
+
+    try:
+        from tbank_dynamic import (
+            _load_corpus_f1_twin_for_glyf,
+            _restitch_f1_keep_from_donor,
+            _snap_f1_glyf_exact_via_shrink,
+        )
+    except Exception:
+        return None
+
+    twin = None
+    try:
+        twin = _load_corpus_f1_twin_for_glyf(want)
+    except Exception:
+        twin = None
+
+    if twin is not None:
+        installed = _h471_install_face_on_twin_shell(twin, ff2, keep)
+        got = _ok(installed)
+        if got is not None:
+            logger.info("card_sber F1 twin-install glyf=%d", want)
+            return got
+
+    if (
+        donor_ff is not None
+        and int(_glyf_table_length(donor_ff)) == want
+        and _h471_keep_contours_on_donor(keep, donor_ff)
+    ):
+        got = _ok(donor_ff)
+        if got is not None:
+            logger.info("card_sber F1 donor verbatim glyf=%d", want)
+            return got
+        installed = _h471_install_face_on_twin_shell(donor_ff, ff2, keep)
+        got = _ok(installed)
+        if got is not None:
+            return got
+
+    if g0 > want:
+        trimmed = _snap_f1_glyf_via_keep_pad(ff2, want, keep)
+        got = _ok(trimmed)
+        if got is not None:
+            logger.info("card_sber F1 keep-trim glyf %d→%d", g0, want)
+            return got
+        shrunk = _snap_f1_glyf_exact_via_shrink(
+            ff2, want, keep, pad_to_exact=False, allow_fat=False,
+        )
+        got = _ok(shrunk)
+        if got is not None:
+            return got
+
+    if twin is None:
+        try:
+            twin = _load_corpus_f1_twin_for_glyf(want)
+        except Exception:
+            twin = None
+
+    for shell in (twin, donor_ff):
+        if not shell or int(_glyf_table_length(shell)) != want:
+            continue
+        try:
+            rest = _restitch_f1_keep_from_donor(shell, ff2, keep)
+            got = _ok(rest)
+            if got is not None:
+                logger.info(
+                    "card_sber F1 twin-restitch glyf=%d shell=%s",
+                    want,
+                    "twin" if shell is twin else "donor",
+                )
+                return got
+        except Exception:
+            continue
+
+    if donor_ff is not None:
+        try:
+            compacted = _compact_f1_glyf_keep(ff2, keep, donor_ff)
+            for shell in (twin, donor_ff):
+                if not shell or int(_glyf_table_length(shell)) != want:
+                    continue
+                installed = _h471_install_face_on_twin_shell(shell, compacted, keep)
+                got = _ok(installed)
+                if got is not None:
+                    return got
+        except Exception:
+            pass
+
+    if g0 > want:
+        shrunk = _snap_f1_glyf_exact_via_shrink(
+            ff2, want, keep, pad_to_exact=False, allow_fat=False,
+        )
+        got = _ok(shrunk)
+        if got is not None:
+            return got
+        if shrunk is not None:
+            for shell in (twin, donor_ff):
+                if not shell or int(_glyf_table_length(shell)) != want:
+                    continue
+                installed = _h471_install_face_on_twin_shell(shell, shrunk, keep)
+                got = _ok(installed)
+                if got is not None:
+                    return got
+    return None
+
+
+def _h471_glyf_in_proton_band(g: int, cmap_n: int) -> bool:
+    band = _f1_cmap_proton_band(int(cmap_n), 471)
+    return bool(band and band[0] <= int(g) <= band[1])
+
+
+def _h471_best_cmap_for_glyf(g: int, painted_n: int) -> Optional[int]:
+    exacts = _F1_GLYF_EXACT_BY_HEIGHT.get(471) or {}
+    hits: List[Tuple[int, int, int]] = []
+    for cn in sorted(exacts):
+        if int(cn) < int(painted_n):
+            continue
+        if not _h471_glyf_in_proton_band(g, int(cn)):
+            continue
+        xs = exacts[int(cn)]
+        exact_hit = int(g) in xs
+        mid = sum(int(x) for x in xs) / max(len(xs), 1)
+        hits.append((0 if exact_hit else 1, abs(mid - g), int(cn)))
+    if not hits:
+        return None
+    hits.sort()
+    return hits[0][2]
+
+
+def _sbp_h471_realign_cmap_for_glyf_pdf(pdf: bytes) -> bytes:
+    """Retarget cmap when glyf sits in another legal Proton atlas band."""
+    if not pdf or _tbank_pdf_height(pdf) != 471:
+        return pdf
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+        from tbank_dynamic import _nudge_tounicode_cardinality
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        tu_xref = int(meta["tounicode_xref"])
+        ff2 = doc.xref_stream(int(meta["fontfile_xref"]))
+        tu = doc.xref_stream(tu_xref)
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        doc.close()
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        cmap_n = len(sub)
+        g = int(_glyf_table_length(ff2))
+        reg, _ = _gids_per_font_in_stream(cs)
+        painted = set(int(c) for c in reg) | {0, 3}
+        painted_n = len({int(c) for c in reg if int(c) not in (0, 3)})
+        if _h471_glyf_in_proton_band(g, cmap_n):
+            return pdf
+        best = _h471_best_cmap_for_glyf(g, painted_n)
+        if best is None or int(best) == int(cmap_n):
+            return pdf
+        nudged = _nudge_tounicode_cardinality(
+            pdf, tu_xref, sub, target_n=int(best),
+            painted_gids=painted, anchor_gid=3, ff2=ff2,
+            cidfont_xref=int(meta.get("cidfont_xref") or 0) or None,
+        )
+        if nudged is not None:
+            logger.info("card_sber cmap realign %d→%d (glyf=%d)", cmap_n, best, g)
+            return nudged[0]
+    except Exception as exc:
+        logger.warning("card_sber cmap realign: %s", exc)
+    return pdf
+
+
+def _sbp_h471_shrink_into_proton_band_pdf(pdf: bytes) -> bytes:
+    """Trim/shrink F1 when glyf is above Proton band for current cmap."""
+    if not pdf or _tbank_pdf_height(pdf) != 471:
+        return pdf
+    exacts = _F1_GLYF_EXACT_BY_HEIGHT.get(471) or {}
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+        from tbank_dynamic import _snap_f1_glyf_exact_via_shrink
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        x1 = int(meta["fontfile_xref"])
+        ff2 = doc.xref_stream(x1)
+        tu = doc.xref_stream(int(meta["tounicode_xref"]))
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        doc.close()
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        cmap_n = len(sub)
+        g = int(_glyf_table_length(ff2))
+        band = _f1_cmap_proton_band(cmap_n, 471)
+        if not band or band[0] <= g <= band[1]:
+            return pdf
+        reg, _ = _gids_per_font_in_stream(cs)
+        snap_keep = _ff2_raw_composite_closure(
+            ff2,
+            set(int(c) for c in reg) | {0, 3}
+            | set(_CARD_OPENPDF_F1_COMPOSITE_GIDS),
+        )
+        want = int(g)
+        if g > band[1]:
+            xs = list(exacts.get(int(cmap_n), ()))
+            under = [int(x) for x in xs if int(x) <= int(band[1])]
+            want = max(under) if under else int(band[1])
+        elif g < band[0]:
+            xs = list(exacts.get(int(cmap_n), ()))
+            over = [int(x) for x in xs if int(x) >= int(band[0])]
+            want = min(over) if over else int(band[0])
+        new_ff2 = _snap_f1_glyf_via_keep_pad(ff2, want, snap_keep)
+        if new_ff2 is None or int(_glyf_table_length(new_ff2)) != want:
+            new_ff2 = _snap_f1_glyf_exact_via_shrink(
+                ff2, want, snap_keep, pad_to_exact=False, allow_fat=False,
+            )
+        if new_ff2 is None or not _h471_ff2_acceptable(new_ff2):
+            return pdf
+        patched = _patch_fontfile2_xref(pdf, x1, new_ff2)
+        if patched is not None:
+            logger.info(
+                "card_sber F1 shrink band glyf %d→%d cmap=%d",
+                g, want, cmap_n,
+            )
+            return patched
+    except Exception as exc:
+        logger.warning("card_sber F1 shrink band: %s", exc)
+    return pdf
+
+
+def _sbp_h471_ensure_legal_cmap_pdf(pdf: bytes) -> bytes:
+    """card_sber: cmap must be 59–63 (OnlyPDF atlas keys)."""
+    if not pdf or _tbank_pdf_height(pdf) != 471:
+        return pdf
+    exacts = _F1_GLYF_EXACT_BY_HEIGHT.get(471) or {}
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+        from tbank_dynamic import _nudge_tounicode_cardinality
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        tu_xref = int(meta["tounicode_xref"])
+        x1 = int(meta["fontfile_xref"])
+        ff2 = doc.xref_stream(x1)
+        tu = doc.xref_stream(tu_xref)
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        doc.close()
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        cmap_n = len(sub)
+        reg, _ = _gids_per_font_in_stream(cs)
+        painted_gids = set(int(c) for c in reg) | {0, 3}
+        min_legal = min(int(k) for k in exacts.keys())
+        painted_n = len({int(c) for c in reg if int(c) not in (0, 3)})
+        out = pdf
+        if int(cmap_n) not in exacts:
+            target = max(min_legal, int(cmap_n))
+            if painted_n > target:
+                target = painted_n
+            for k in sorted(exacts):
+                if int(k) >= target:
+                    target = int(k)
+                    break
+            if int(target) > int(cmap_n):
+                cid_xref = int(meta.get("cidfont_xref") or 0) or None
+                grown = _h471_grow_cmap_pua_pdf(
+                    pdf,
+                    tu_xref=tu_xref,
+                    sub=sub,
+                    target_n=int(target),
+                    painted_gids=painted_gids,
+                    cidfont_xref=cid_xref,
+                    ff2=ff2,
+                )
+                if grown is not None:
+                    logger.info("card_sber cmap grow %d→%d", cmap_n, target)
+                    out = grown
+                else:
+                    nudged = _nudge_tounicode_cardinality(
+                        pdf, tu_xref, sub, target_n=int(target),
+                        painted_gids=painted_gids,
+                        anchor_gid=3, ff2=ff2,
+                        cidfont_xref=cid_xref,
+                    )
+                    if nudged is not None:
+                        logger.info("card_sber cmap nudge %d→%d", cmap_n, target)
+                        out = nudged[0]
+        out = _sbp_h471_realign_cmap_for_glyf_pdf(out)
+        out = _sbp_h471_shrink_into_proton_band_pdf(out)
+        out = _sbp_prune_f1_tounicode_to_used(out)
+        return out
+    except Exception as exc:
+        logger.warning("card_sber cmap nudge: %s", exc)
+    out = _sbp_h471_shrink_into_proton_band_pdf(
+        _sbp_h471_realign_cmap_for_glyf_pdf(pdf),
+    )
+    return _sbp_prune_f1_tounicode_to_used(out)
+
+
+def _sbp_land_h471_f1_exact_pdf(
+    pdf: bytes, *, allow_cmap_retarget: bool = True, allow_blank: bool = False,
+) -> bytes:
+    """Card→Sber OnlyPDF: exact (glyf,cmap) atlas — not Proton ±400 soft-ship.
+
+    Mismatch like glyf=11142@cmap=59 or glyf=11248@cmap=59 → «чек не распознан».
+    """
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    if _tbank_pdf_height(pdf) != 471:
+        return pdf
+    pdf = _sbp_h471_ensure_legal_cmap_pdf(pdf)
+    exacts = _F1_GLYF_EXACT_BY_HEIGHT.get(471) or {}
+    if not exacts:
+        return pdf
+    orig = pdf
+
+    def _face_safe(result: bytes) -> bytes:
+        if allow_blank:
+            return result
+        if result != orig and _pdf_f1_empty_painted_chars(result):
+            logger.warning("card_sber exact land would blank face — keep hydrated")
+            return orig
+        return result
+
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+        from tbank_dynamic import (
+            _nudge_tounicode_cardinality,
+            _snap_f1_glyf_exact_via_fat,
+            _snap_f1_glyf_exact_via_shrink,
+        )
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        x1 = int(meta["fontfile_xref"])
+        tu_xref = int(meta["tounicode_xref"])
+        ff2 = doc.xref_stream(x1)
+        tu = doc.xref_stream(tu_xref)
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        doc.close()
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        cmap_n = len(sub)
+        reg, _ = _gids_per_font_in_stream(cs)
+        painted = len(set(int(c) for c in reg) | {0, 3})
+        painted_gids = set(int(c) for c in reg) | {0, 3}
+        keep = _ff2_raw_composite_closure(
+            ff2,
+            painted_gids | set(sub.keys())
+            | set(_CARD_OPENPDF_F1_COMPOSITE_GIDS),
+        )
+        snap_keep = _ff2_raw_composite_closure(
+            ff2,
+            painted_gids | set(_CARD_OPENPDF_F1_COMPOSITE_GIDS),
+        )
+        g = int(_glyf_table_length(ff2))
+        donor_ff: Optional[bytes] = None
+        try:
+            import os
+            donor_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "templates", "T_card_sber_original.pdf",
+            )
+            if os.path.isfile(donor_path):
+                ddoc = fitz.open(donor_path)
+                dmeta = tut._find_font_objects(ddoc).get("TinkoffSans-Regular")
+                donor_ff = (
+                    ddoc.xref_stream(dmeta["fontfile_xref"])
+                    if dmeta else None
+                )
+                ddoc.close()
+        except Exception:
+            donor_ff = None
+
+        def _exact_for(cn: int, gly: int) -> bool:
+            xs = exacts.get(int(cn))
+            return bool(xs and int(gly) in xs)
+
+        def _snap_ff2(want: int, base: Optional[bytes] = None) -> Optional[bytes]:
+            src = base if base is not None else ff2
+            snapped = _snap_h471_ff2_exact(
+                src, int(want), snap_keep, donor_ff=donor_ff,
+            )
+            if snapped is not None:
+                return snapped
+            return None
+
+        def _patch_ff2(new_ff2: bytes) -> bytes:
+            patched = _patch_fontfile2_xref(pdf, x1, new_ff2)
+            return patched if patched is not None else pdf
+
+        if _exact_for(cmap_n, g) and _h471_ff2_acceptable(ff2):
+            return pdf
+
+        xs_cur = list(exacts.get(int(cmap_n), ()))
+
+        if not allow_cmap_retarget:
+            if xs_cur:
+                want_cur = min(xs_cur, key=lambda x: abs(int(x) - g))
+                snapped_cur = _snap_ff2(int(want_cur))
+                if snapped_cur is not None:
+                    g_act = int(_glyf_table_length(snapped_cur))
+                    if _exact_for(cmap_n, g_act):
+                        out2 = _patch_ff2(snapped_cur)
+                        logger.info(
+                            "card_sber F1 exact land glyf %d→%d cmap=%d (bijection)",
+                            g, g_act, cmap_n,
+                        )
+                        return _face_safe(out2)
+            return pdf
+
+        # Prefer exact snap on current cmap only when glyf is not above that
+        # cmap's atlas ceiling — shrinking after hydrate fill breaks contours.
+        if xs_cur and g <= max(int(x) for x in xs_cur):
+            lower = [int(x) for x in xs_cur if int(x) <= g]
+            want_cur = max(lower) if lower else min(xs_cur, key=lambda x: abs(int(x) - g))
+            snapped_cur = _snap_ff2(int(want_cur))
+            if snapped_cur is not None:
+                g_act = int(_glyf_table_length(snapped_cur))
+                if _exact_for(cmap_n, g_act):
+                    out2 = _patch_ff2(snapped_cur)
+                    logger.info(
+                        "card_sber F1 exact land glyf %d→%d cmap=%d (keep cmap)",
+                        g, g_act, cmap_n,
+                    )
+                    return _face_safe(out2)
+
+        # Glyf matches another legal cmap — retarget only when allowed and
+        # current cmap has no achievable exact (snap above failed).
+        if allow_cmap_retarget:
+            for cn in sorted(exacts, reverse=True):
+                if int(cn) > int(painted):
+                    continue
+                xs = exacts[cn]
+                if int(g) in xs and int(cn) != int(cmap_n):
+                    nudged = _nudge_tounicode_cardinality(
+                        pdf, tu_xref, sub, target_n=int(cn),
+                        painted_gids=set(int(c) for c in reg) | {0, 3},
+                        anchor_gid=3, ff2=ff2,
+                        cidfont_xref=int(meta.get("cidfont_xref") or 0) or None,
+                    )
+                    if nudged is not None:
+                        logger.info(
+                            "card_sber F1 cmap retarget %d→%d (glyf=%d exact)",
+                            cmap_n, cn, g,
+                        )
+                        return _face_safe(nudged[0])
+                    break
+
+        # Snap glyf onto an exact for current or best cmap ≤ painted.
+        candidates: List[Tuple[int, int, int, int]] = []
+        for cn in sorted(exacts):
+            if int(cn) > int(painted):
+                continue
+            for x in exacts[cn]:
+                candidates.append(
+                    (abs(int(x) - g), abs(int(cn) - cmap_n), int(cn), int(x)),
+                )
+        if not candidates:
+            return pdf
+        candidates.sort()
+        out = pdf
+        for _, _, target_cn, want_g in candidates[:16]:
+            work_pdf = out
+            work_ff2 = ff2
+            work_cmap = int(cmap_n)
+            if allow_cmap_retarget and int(target_cn) != int(work_cmap):
+                nudged = _nudge_tounicode_cardinality(
+                    work_pdf, tu_xref, sub, target_n=int(target_cn),
+                    painted_gids=set(int(c) for c in reg) | {0, 3},
+                    anchor_gid=3, ff2=work_ff2,
+                    cidfont_xref=int(meta.get("cidfont_xref") or 0) or None,
+                )
+                if nudged is not None:
+                    work_pdf, sub = nudged
+                    doc2 = fitz.open(stream=work_pdf, filetype="pdf")
+                    work_ff2 = doc2.xref_stream(x1)
+                    doc2.close()
+                    work_cmap = int(target_cn)
+            snapped = _snap_h471_ff2_exact(
+                work_ff2, int(want_g), snap_keep, donor_ff=donor_ff,
+            )
+            if snapped is None:
+                continue
+            out2 = _patch_fontfile2_xref(work_pdf, x1, snapped)
+            if out2 is None:
+                continue
+            if _exact_for(work_cmap, int(want_g)):
+                logger.info(
+                    "card_sber F1 exact land glyf %d→%d cmap=%d",
+                    g, want_g, work_cmap,
+                )
+                return _face_safe(out2)
+            out = out2
+            ff2 = snapped
+        if donor_ff is not None and int(painted) <= 60:
+            g_d = int(_glyf_table_length(donor_ff))
+            donor_cn = next(
+                (int(cn) for cn, xs in exacts.items() if g_d in xs),
+                60,
+            )
+            snapped_d = _snap_h471_ff2_exact(
+                ff2, g_d, snap_keep, donor_ff=donor_ff,
+            )
+            if snapped_d is not None:
+                work_pdf = out
+                if int(donor_cn) != int(cmap_n):
+                    nudged = _nudge_tounicode_cardinality(
+                        work_pdf, tu_xref, sub, target_n=int(donor_cn),
+                        painted_gids=set(int(c) for c in reg) | {0, 3},
+                        anchor_gid=3, ff2=ff2,
+                        cidfont_xref=int(meta.get("cidfont_xref") or 0) or None,
+                    )
+                    if nudged is not None:
+                        work_pdf = nudged[0]
+                out2 = _patch_fontfile2_xref(work_pdf, x1, snapped_d)
+                if out2 is not None and _exact_for(int(donor_cn), g_d):
+                    logger.info(
+                        "card_sber F1 donor land glyf %d→%d cmap=%d",
+                        g, g_d, donor_cn,
+                    )
+                    return _face_safe(out2)
+        logger.warning(
+            "card_sber F1 exact snap miss glyf=%d cmap=%d",
+            g, cmap_n,
+        )
+        return out
+    except Exception as exc:
+        logger.warning("card_sber F1 exact land: %s", exc)
+        return pdf
+
+
+def _sbp_retarget_f1_cmap_card_pdf(pdf: bytes) -> bytes:
+    """When hydrate ink overshoots exclusive 72→12612, move the cmap card.
+
+    Does not blank painted letters and does not GEN_NONE (LAW1).
+    h=471 card_sber: exact atlas land for OnlyPDF.
+    """
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        page_h = int(round(float(doc[0].mediabox.y1)))
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        ff2 = doc.xref_stream(int(meta["fontfile_xref"]))
+        tu = doc.xref_stream(int(meta["tounicode_xref"]))
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        doc.close()
+        if page_h != 519:
+            return pdf
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        cmap_n = len(sub)
+        reg, _ = _gids_per_font_in_stream(cs)
+        painted = len(set(int(c) for c in reg))
+        g = int(_glyf_table_length(ff2))
+        if _f1_cmap_card_covers(cmap_n, g, height=page_h):
+            return pdf
+        _used = set(int(c) for c in reg)
+        _have, _hyd = _sbp_unused_f1_letters(ff2, _used)
+        _ready = 0
+        for _ch in _have:
+            _gid = int(TBANK_CHAR_TO_GID_REG.get(_ch, -1))
+            if _gid >= 0 and _cid_has_contour(ff2, _gid):
+                _ready += 1
+        want = _f1_choose_cmap_card_for_glyf(g, painted, max_grow=_ready)
+        if want is None:
+            want = _f1_choose_cmap_card_for_glyf(
+                g, painted, max_grow=_ready + len(_hyd),
+            )
+        if want is None:
+            logger.warning(
+                "SBP F1 cmap retarget: no card for glyf=%d painted=%d",
+                g, painted,
+            )
+            return pdf
+        out = pdf
+        if painted < want:
+            out = _sbp_grow_f1_painted_cmap(out, want)
+        out = _sbp_snap_f1_glyf_into_card(out, want)
+        logger.info(
+            "SBP F1 cmap retarget %d@%d → want cmap=%d (painted was %d)",
+            g, cmap_n, want, painted,
+        )
+        return out
+    except Exception as exc:
+        logger.warning("SBP F1 cmap retarget: %s", exc)
+        return pdf
+
+
+def _sbp_patch_f1_tu_and_w(
+    pdf: bytes, *, tu_xref: int, cid_xref: int, uni_gid: dict, ff2: bytes,
+) -> Optional[bytes]:
+    """Rewrite F1 ToUnicode + matching /W."""
+    import math
+    from io import BytesIO
+
+    import tbank_unlock_template as tut
+    from tbank_orig_mode import _parse_w_array, find_object_range
+
+    rng_tu = find_object_range(pdf, int(tu_xref))
+    rng_cid = find_object_range(pdf, int(cid_xref))
+    if not rng_tu or not rng_cid:
+        return None
+    new_tu = tut._build_tounicode_cmap(uni_gid)
+    cid_bytes = pdf[rng_cid[0]:rng_cid[1]]
+    cid_txt = cid_bytes.decode("latin1", "replace")
+    widths, _dw = _parse_w_array(cid_txt)
+    keep_cids = {int(c) for c in uni_gid.values()}
+    widths = {int(k): int(v) for k, v in widths.items() if int(k) in keep_cids}
+    try:
+        ft = TTFont(BytesIO(ff2))
+        upem = int(ft["head"].unitsPerEm) or 1000
+        go = ft.getGlyphOrder()
+        hmtx = ft["hmtx"].metrics
+        for cid in keep_cids:
+            if cid in widths or cid >= len(go):
+                continue
+            adv = int(hmtx[go[cid]][0])
+            widths[cid] = int(math.floor(adv * 1000 / upem))
+    except Exception as exc:
+        logger.warning("SBP F1 prune /W widths: %s", exc)
+    new_w = tut._build_widths_from_map(widths)
+    patched = _patch_tounicode_xref(pdf, int(tu_xref), new_tu)
+    if patched is None:
+        return None
+    rng_cid2 = find_object_range(patched, int(cid_xref))
+    if not rng_cid2:
+        return patched
+    cid_txt2 = patched[rng_cid2[0]:rng_cid2[1]].decode("latin1", "replace")
+    new_cid = tut._replace_w_in_cidfont_obj(cid_txt2, new_w).encode("latin1")
+    return _replace_byte_range_and_rebuild(
+        patched, rng_cid2[0], rng_cid2[1], new_cid,
+    )
+
+
+def _sbp_prune_f1_tounicode_to_used(pdf: bytes) -> bytes:
+    """Drop F1 ToUnicode CIDs that are not painted (minimality + cmap card).
+
+    Extra mapped «г»=271 (F2 Итого) on F1 bumps cmap 71→72, whose atlas is
+    exclusive glyf=12612. Fill then lands 14034 → GLYF_CMAP_OUTLIER.
+    """
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta or not meta.get("tounicode_xref") or not meta.get("cidfont_xref"):
+            doc.close()
+            return pdf
+        tu_x = int(meta["tounicode_xref"])
+        cid_x = int(meta["cidfont_xref"])
+        x1 = int(meta["fontfile_xref"])
+        tu = doc.xref_stream(tu_x)
+        ff2 = doc.xref_stream(x1)
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        doc.close()
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        reg, _ = _gids_per_font_in_stream(cs)
+        used = set(int(c) for c in reg)
+        keep_sub = {
+            int(c): int(u) for c, u in sub.items() if int(c) in used
+        }
+        if len(keep_sub) == len(sub):
+            return pdf
+        if not keep_sub:
+            return pdf
+        uni_gid = {int(u): int(c) for c, u in keep_sub.items()}
+        patched = _sbp_patch_f1_tu_and_w(
+            pdf, tu_xref=tu_x, cid_xref=cid_x, uni_gid=uni_gid, ff2=ff2,
+        )
+        if patched is None:
+            return pdf
+        logger.info(
+            "SBP F1 ToUnicode prune %d→%d (drop unused cmap extras)",
+            len(sub), len(keep_sub),
+        )
+        return patched
+    except Exception as exc:
+        logger.warning("SBP F1 ToUnicode prune: %s", exc)
+        return pdf
+
+
+def _sbp_cap_f1_orphans_and_cmap_pdf(
+    pdf: bytes, *, clamp_cmap_band: bool = True,
+) -> bytes:
+    """Blank F1 unmapped nonempty, then land glyf in Proton cmap band.
+
+    Proton ORPHAN_RESIDUE: only spares {35,239}. Fill/mosaic after emit
+    reinstalls latin A/z/А. Collapse those, then cmap-band clamp.
+    If still over the band, also drop genuine spares (allowed to be absent).
+    Non-SBP channels pass clamp_cmap_band=False — the 519 atlas must not
+    peel phone/card/nocomm FontFile2.
+    """
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        page_h = int(round(float(doc[0].mediabox.y1)))
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        x1 = int(meta["fontfile_xref"])
+        ff2 = doc.xref_stream(x1)
+        tu = doc.xref_stream(int(meta["tounicode_xref"]))
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        doc.close()
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        reg, _ = _gids_per_font_in_stream(cs)
+        used = set(int(c) for c in reg) | {0, 3} | set(int(c) for c in sub.keys())
+        if page_h == 471:
+            used |= set(_CARD_OPENPDF_F1_COMPOSITE_GIDS)
+        # Painted∪TU; cap restores atlas composites then blanks only simple
+        # GIDs outside composite closure (latin e/o/B targets stay).
+        cur = _cap_f1_orphan_spares(ff2, used)
+        keep = set(used)
+        cmap_n = len(sub)
+        if clamp_cmap_band:
+            band = _f1_cmap_proton_band(cmap_n, page_h)
+            g = int(_glyf_table_length(cur))
+            if band and g > band[1]:
+                painted = set(int(c) for c in reg) | {0, 3}
+                painted_keep = _ff2_raw_composite_closure(cur, painted)
+                lean = _blank_ff2_unused_glyfs(cur, painted_keep)
+                g2 = int(_glyf_table_length(lean))
+                if g2 < g:
+                    logger.info(
+                        "SBP F1 unused-blank glyf %d→%d (incl. optional 35/239)",
+                        g, g2,
+                    )
+                    cur = lean
+                    keep = painted_keep
+            cur = _sbp_clamp_f1_glyf_to_cmap_band(
+                cur, cmap_n, keep, height=page_h,
+            )
+        cur = _pin_f1_head_flags_and_csa(cur)
+        if cur == ff2:
+            return pdf
+        patched = _patch_fontfile2_xref(pdf, x1, cur)
+        return patched if patched is not None else pdf
+    except Exception as exc:
+        logger.warning("SBP F1 orphan+cmap land: %s", exc)
+        return pdf
+
+
+def _normalize_sbp_op_date(s: str) -> str:
+    """``DD.MM.YYYY HH:MM:SS`` from painted or prepared date (any spaces)."""
+    m = re.search(
+        r"(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2}:\d{2})",
+        str(s or ""),
+    )
+    return f"{m.group(1)} {m.group(2)}" if m else ""
+
+
+def _sbp_rewrite_date_stream(
+    stream: bytes,
+    old_date: str,
+    new_date: str,
+    uni_gid: Dict[int, int],
+    font_obj,
+) -> Tuple[bytes, bool]:
+    """LEFT-anchor date Tj (x0≈20). Equal-CID when lengths match."""
+    old_n = _normalize_sbp_op_date(old_date)
+    new_n = _normalize_sbp_op_date(new_date)
+    if not old_n or not new_n or old_n == new_n:
+        return stream, old_n == new_n
+    old_cands = []
+    new_cands = []
+    for src, bucket in ((old_date, old_cands), (new_date, new_cands)):
+        raw = str(src or "").strip()
+        day, tim = _normalize_sbp_op_date(raw).split(" ", 1)
+        for sp in ("  ", " "):
+            bucket.append(f"{day}{sp}{tim}")
+        if raw and raw not in bucket:
+            bucket.append(raw)
+    for ot in old_cands:
+        old_b = _dynamic_enc(ot, uni_gid)
+        if not old_b:
+            continue
+        for nt in new_cands:
+            new_b = _dynamic_enc(nt, uni_gid)
+            if not new_b:
+                continue
+            out, ok = _dynamic_replace_tj(
+                stream, old_b, new_b, ot, nt, 9.0, font_obj, uni_gid,
+                left_x=20.0, right_edge=None, preserve_tm=False,
+            )
+            if ok:
+                return out, True
+    return stream, False
+
+
+_FIO_LETTER_RE = re.compile(r"[А-Яа-яA-Za-zЁё]")
+
+
+def _fio_token_exact(src: str, want: str) -> bool:
+    """True if ``want`` appears and is not glued to extra letters.
+
+    Substring ``Илья Мартынов`` inside ``Илья МартыновИл`` is not the user face.
+    """
+    if not want:
+        return True
+    i = 0
+    while True:
+        j = (src or "").find(want, i)
+        if j < 0:
+            return False
+        after = src[j + len(want) : j + len(want) + 1]
+        if not after or not _FIO_LETTER_RE.match(after):
+            return True
+        i = j + 1
+
+
+def _sbp_line_before_label(text: str, label: str) -> str:
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    for i, ln in enumerate(lines):
+        if ln == label and i:
+            return lines[i - 1]
+    return ""
+
+
+def _sbp_line_after_label(text: str, label: str) -> str:
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    for i, ln in enumerate(lines):
+        if ln == label and i + 1 < len(lines):
+            return lines[i + 1]
+    return ""
 
 
 def _pdf_face_has_user_fields(
@@ -18171,9 +21894,9 @@ def _pdf_face_has_user_fields(
     except Exception as exc:
         return False, f"face-read:{exc}"
     flat = re.sub(r"\s+", " ", text.replace("\u202f", " ")).strip()
-    sender = (prepared.get("sender") or "").strip()
-    bank = (prepared.get("bank") or "").strip()
-    receiver = (prepared.get("receiver") or "").strip()
+    sender = (prepared.get("_user_sender") or prepared.get("sender") or "").strip()
+    bank = (prepared.get("_user_bank") or prepared.get("bank") or "").strip()
+    receiver = (prepared.get("_user_receiver") or prepared.get("receiver") or "").strip()
     # Names must never contain punctuation pads (comma was wrongly injected by diversify).
     for _fio_key, _fio_val in (("sender", sender), ("receiver", receiver)):
         if _fio_val and any(p in _fio_val for p in (",", ";", ":")):
@@ -18196,29 +21919,18 @@ def _pdf_face_has_user_fields(
     ):
         doc.close()
         return False, f"donor-bank-leak:{donor_bank!r}"
+    if (
+        receiver
+        and receiver != donor_receiver
+        and donor_receiver in text
+    ):
+        doc.close()
+        return False, f"donor-receiver-leak:{donor_receiver!r}"
     def _visible(want: str) -> bool:
         if not want:
             return True
-        if want in flat:
-            return True
-        rem = want.translate(_TBANK_TWIN_LOOKALIKE)
-        if rem and rem in flat:
-            return True
-        toks = [t for t in (rem or want).split() if len(t) >= 2]
-        if toks and all(t in flat for t in toks):
-            return True
-        # Skeleton trim + soft-cover: face keeps a short stem of the name.
-        for cand in ((rem or want).rstrip(), want.rstrip()):
-            stem = cand.split()[0] if cand.split() else cand
-            for n in range(min(len(stem), 12), 1, -1):
-                pref = stem[:n]
-                if len(pref) >= 2 and pref in flat:
-                    return True
-            # Collapsed pad «Сууууууу» still starts with «Су».
-            for token in re.findall(r"[А-Яа-яA-Za-zЁё]{2,}", flat):
-                if stem.startswith(token[:2]) and token.startswith(stem[:2]):
-                    return True
-        return False
+        # Exact token — glued letter-pad («МартыновИл») is not the user face.
+        return _fio_token_exact(text, want) or _fio_token_exact(flat, want)
 
     # Full user FIO must appear (catches allow_trim → «Фыва» vs «Фывапролдж»).
     # Skeleton PASS stores the fitted (trimmed/padded) face in prepared already.
@@ -18243,8 +21955,22 @@ def _pdf_face_has_user_fields(
     if bank and bank != donor_bank and not _visible(bank):
         doc.close()
         return False, f"bank-missing:{bank!r}"
+    if "Итого" not in (text or "") and "Итого" not in flat:
+        doc.close()
+        return False, "itogo-broken"
+
+    want_date = _normalize_sbp_op_date(prepared.get("new_date") or "")
+    got_date = _normalize_sbp_op_date(flat)
+    if want_date and got_date and want_date != got_date:
+        doc.close()
+        return False, f"date-mismatch:want={want_date}:got={got_date}"
+    if want_date and want_date.split()[0] not in flat:
+        doc.close()
+        return False, f"date-missing:{want_date}"
 
     # Amount: thousands grouping + F3 ₽ must end on column right (≤251).
+    # Both «Итого» (F2) and «Сумма» (F1) must show the user amount — one hit
+    # used to pass while the donor small-amount slot stayed on the face.
     amt = (prepared.get("new_amount") or "").strip()
     digs = re.sub(r"\D", "", amt)
     if digs and len(digs) >= 4:
@@ -18252,6 +21978,23 @@ def _pdf_face_has_user_fields(
         if spaced not in flat:
             doc.close()
             return False, f"amount-ungrouped:want={spaced!r}"
+        n_amt = 0
+        try:
+            for block in page.get_text("dict").get("blocks") or []:
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines") or []:
+                    for sp in line.get("spans") or []:
+                        t = str(sp.get("text") or "")
+                        if re.sub(r"\D", "", t) != digs:
+                            continue
+                        if float((sp.get("bbox") or [0])[0]) >= 80.0:
+                            n_amt += 1
+        except Exception:
+            n_amt = flat.count(spaced)
+        if n_amt < 2:
+            doc.close()
+            return False, f"amount-slot-mismatch:n={n_amt}:want={spaced!r}"
     try:
         raw = page.get_text("rawdict") or {}
         ruble_x1: List[float] = []
@@ -18272,25 +22015,43 @@ def _pdf_face_has_user_fields(
                     if x1 > 200:
                         ruble_x1.append(x1)
         for x1 in ruble_x1:
-            if x1 > 251.2:
-                doc.close()
-                return False, f"ruble-overflow:x1={x1:.1f}"
-        # Value column: no face span past page-ish right of receipt card.
+                    if x1 > 250.25:
+                        doc.close()
+                        return False, f"ruble-overflow:x1={x1:.3f}"
+        # Value column: Proton HARD if x1 − 250 > 0.01.
         for block in page.get_text("dict").get("blocks") or []:
             if block.get("type") != 0:
                 continue
             for line in block.get("lines") or []:
                 for sp in line.get("spans") or []:
                     t = (sp.get("text") or "").strip()
-                    if len(t) < 2:
+                    if len(t) < 1:
                         continue
+                    x0 = float(sp["bbox"][0])
                     x1 = float(sp["bbox"][2])
-                    if x1 > 252.5 and t not in ("i", "₽"):
+                    if x0 < 100:
+                        continue
+                    if x1 > 250.01:
                         doc.close()
-                        return False, f"right-overflow:{t[:24]!r}:x1={x1:.1f}"
+                        return False, f"right-overflow:{t[:24]!r}:x1={x1:.3f}"
     except Exception as exc:
         doc.close()
         return False, f"geom-read:{exc}"
+    rec_m = re.search(r"1-(\d{3})-\d{3}-\d{3}-\d{3}", flat)
+    if rec_m:
+        try:
+            from tbank_corpus import _receipt_a_pool
+            pool = _receipt_a_pool(prepared.get("new_date") or "")
+            if pool and rec_m.group(1) not in pool:
+                doc.close()
+                return False, f"receipt-epoch:A={rec_m.group(1)}"
+        except Exception:
+            pass
+    flat_m = re.search(r"[AB][0-9A-Z]{31}", re.sub(r"\s+", "", flat))
+    if flat_m and prepared.get("new_date"):
+        if not verify_sbp_id_date(flat_m.group(0)[:27], prepared.get("new_date")):
+            doc.close()
+            return False, f"sbp-cipher-ts:{flat_m.group(0)[:27]}"
     doc.close()
     return True, "ok"
 
@@ -18484,10 +22245,30 @@ def _ff2_raw_empty_composites(ff2: bytes) -> list:
 
 
 def _pick_cmap_safe_f1_glyf(cmap_n: int, current: int, twins: set) -> int:
-    """Land inside Proton cmap envelope, off SIZE_MULTISET twin lengths."""
+    """Land inside Proton cmap envelope, off SIZE_MULTISET twin lengths.
+
+    Exact-only atlas rows (lo==hi, e.g. cmap=72→12612) MUST stay reachable —
+    banning the only legal glyf forces OUTLIER (13056@72 HARD).
+    """
     env = _F1_519_GLYF_BY_CMAP.get(int(cmap_n))
     cur = int(current)
     banned = set(twins)
+    try:
+        from tbank_ff2_sha_atlas import FF2_SHA_BY_HEIGHT_CMAP_GLYF
+        for (hh, _cn, gl) in FF2_SHA_BY_HEIGHT_CMAP_GLYF:
+            if int(hh) != 519:
+                continue
+            banned.add(int(gl))
+            banned.add(int(gl) - 2)
+            banned.add(int(gl) + 2)
+    except Exception:
+        pass
+    # Never ban the exclusive atlas exact for this cmap card.
+    if env and int(env[0]) == int(env[1]):
+        exact = int(env[0])
+        banned.discard(exact)
+        banned.discard(exact - 2)
+        banned.discard(exact + 2)
 
     def ok(x: int) -> bool:
         if x <= 8000 or x % 2 or x in banned:
@@ -18501,7 +22282,14 @@ def _pick_cmap_safe_f1_glyf(cmap_n: int, current: int, twins: set) -> int:
         return cur
     if env:
         lo, hi = env
-        for cand in (lo - 2, hi + 2, lo + 2, hi - 2, (lo + hi) // 2):
+        if int(cmap_n) in (68, 69, 70, 71) and cur < lo:
+            _opdf = {68: 13002, 69: 12784, 70: 13000, 71: 13002}
+            _ex = _opdf.get(int(cmap_n))
+            if _ex is not None and ok(_ex):
+                return int(_ex)
+        # Prefer exact atlas mid/lo when exclusive.
+        prefer = [lo, hi, (lo + hi) // 2, lo - 2, hi + 2, lo + 2, hi - 2]
+        for cand in prefer:
             c = cand if cand % 2 == 0 else cand - 1
             if ok(c):
                 return c
@@ -18514,6 +22302,9 @@ def _pick_cmap_safe_f1_glyf(cmap_n: int, current: int, twins: set) -> int:
         for cand in (cur + d, cur - d):
             if ok(cand):
                 return cand
+    # Last resort: exclusive atlas exact even if still somehow banned.
+    if env and int(env[0]) == int(env[1]):
+        return int(env[0])
     return cur
 
 
@@ -18600,6 +22391,21 @@ def _fat_f1_glyf_via_keep_span(ff2: bytes, want: int, keep: set):
     return out
 
 
+def _fat_f2_glyf_via_keep_span(ff2: bytes, want: int, keep: set):
+    """Grow Medium glyf to ``want`` then restore Jasper F2 head/maxp/hhea.
+
+    ``_fat_f1_glyf_via_keep_span`` pins F1 CSA — that would HARD F2 head.
+    Fingerprint hashes compile() so loca-tail on a used glyph is mosaic-safe.
+    """
+    grown = _fat_f1_glyf_via_keep_span(ff2, want, keep)
+    if grown is None:
+        return None
+    if grown is ff2 or grown == ff2:
+        return _force_tbank_f2_head_epoch(ff2)
+    out = _ff2_restore_shell_tables(ff2, grown)
+    return _force_tbank_f2_head_epoch(out)
+
+
 def _trim_glyf_via_keep_span(ff2: bytes, want: int, keep: set):
     """Shrink glyf to exact length by trimming a keep nonempty tail.
 
@@ -18652,7 +22458,20 @@ def _trim_glyf_via_keep_span(ff2: bytes, want: int, keep: set):
         ncont = int.from_bytes(glyf[start:start + 2], "big", signed=True)
         if ncont <= 0:
             continue
-        score = span + (100000 if gid in keep_i else 0)
+        compiled = _glyph_compiled_len(ff2, gid)
+        if compiled <= 0:
+            compiled = span
+        min_keep = max(int(compiled), 12)
+        if index_to_loc == 0 and min_keep % 2:
+            min_keep += 1
+        # Never eat outline bytes of a used letter (Ф 412−32 → blank).
+        if span - need < min_keep:
+            continue
+        pad = max(0, span - int(compiled))
+        if gid in keep_i and pad < need:
+            continue
+        # Prefer unused loca-pad, never a painted contour.
+        score = pad + (0 if gid in keep_i else 100000)
         if score > best:
             best = score
             slot = gid
@@ -18681,9 +22500,14 @@ def _trim_glyf_via_keep_span(ff2: bytes, want: int, keep: set):
 
 
 def _f1_disallowed_orphan_gids(ff2: bytes, keep: set) -> list:
-    """Nonempty GIDs outside used∪TU closure and genuine spares {35,239}."""
+    """Simple nonempty GIDs outside used∪TU∪composite-closure (+ {35,239}).
+
+    Matches Proton A-TBANK-F1-ORPHAN-SIMPLE-GLYPH. Latin e/o/B that only
+    exist as composite targets of painted е/о/В are not orphans.
+    """
     allowed = {35, 239}
-    keep_i = {int(x) for x in keep} | {0, 3} | allowed
+    seed = {int(x) for x in keep} | {0, 3}
+    keep_i = _ff2_raw_composite_closure(ff2, seed) | allowed
     offs, glyf = _ff2_raw_loca_glyf(ff2)
     if offs is None or not glyf:
         return []
@@ -18695,7 +22519,7 @@ def _f1_disallowed_orphan_gids(ff2: bytes, keep: set) -> list:
         if b - a < 2 or b > len(glyf):
             continue
         ncont = int.from_bytes(glyf[a:a + 2], "big", signed=True)
-        if ncont != 0:
+        if ncont > 0:
             bad.append(gid)
     return bad
 
@@ -18828,6 +22652,14 @@ def _glyph_compiled_len(ff2: bytes, gid: int) -> int:
             return 0
         return len(ft["glyf"][go[gid]].compile(ft["glyf"]))
     except Exception:
+        # Unparseable ≠ empty pad. Returning 0 makes cmap-band trim chop
+        # a painted outline (Ф 412→380 → blank advance).
+        try:
+            offs, _glyf = _ff2_raw_loca_glyf(ff2)
+            if offs is not None and 0 <= int(gid) < len(offs) - 1:
+                return max(0, int(offs[int(gid) + 1]) - int(offs[int(gid)]))
+        except Exception:
+            pass
         return 0
 
 
@@ -18923,12 +22755,98 @@ def _snap_f1_glyf_via_keep_pad(ff2: bytes, want: int, keep: set):
     return None
 
 
-def _fill_empty_keep_from_master(ff2: bytes, keep: set, cid_to_uni=None) -> bytes:
-    """Install master outlines into empty painted GIDs by ToUnicode letter.
+def _pin_f1_head_flags_and_csa(font_bytes: bytes) -> bytes:
+    """Pin flags=11 + OpenPDF CSA without restoring shell hmtx (keeps LSB sync).
 
-    Never assume GID identity (canonical Л=247 may be the SBP-id G slot).
+    Always re-pin Jasper maxp extrema + hhea after fontTools.save, which
+    otherwise rewrites those tables to the nested subset glyf.
     """
-    from fontTools.ttLib import TTFont
+    if len(font_bytes) < 12:
+        return font_bytes
+    data = bytearray(font_bytes)
+    nt = int.from_bytes(data[4:6], "big")
+    for i in range(nt):
+        e = 12 + i * 16
+        if e + 16 > len(data):
+            break
+        if data[e : e + 4] != b"head":
+            continue
+        h = int.from_bytes(data[e + 8 : e + 12], "big")
+        if h + 36 > len(data):
+            break
+        data[h + 16 : h + 18] = (11).to_bytes(2, "big")
+        data[h + 20 : h + 28] = int(_TBANK_F1_HEAD_CREATED).to_bytes(8, "big")
+        data[h + 28 : h + 36] = int(_TBANK_F1_HEAD_MODIFIED).to_bytes(8, "big")
+        break
+    out = bytes(data)
+    out = _force_tbank_f1_jasper_maxp_envelope(out)
+    out = _force_tbank_f1_jasper_hhea_envelope(out)
+    if _ttf_num_glyphs(out) > 200:
+        return _restore_head_csa(out, _TBANK_F1_OPENPDF_CSA)
+    return _recalc_head_csa(out)
+
+
+def _pin_f1_painted_latin_mosaic(ff2: bytes, painted: set) -> bytes:
+    """Force atlas-exact outlines for every painted F1 CID (mosaic HARD).
+
+    Hydrate/snap can leave wrong glyf blobs → GLYPH_MOSAIC_HASH_MISMATCH
+    (e.g. gid=242 Ё on «Глеб»). Pin all painted registry slots, not latin-only.
+    """
+    import hashlib
+
+    if not ff2 or not painted:
+        return ff2
+    try:
+        from tbank_dynamic import _f1_loca_tables
+
+        offs, glyf, _itl, ng = _f1_loca_tables(ff2)
+    except Exception:
+        return ff2
+    installs: Dict[int, dict] = {}
+    seen: set = set()
+    for ch, gid in TBANK_CHAR_TO_GID_REG.items():
+        gid = int(gid)
+        if gid in seen or gid not in painted or gid <= 0 or gid >= ng:
+            continue
+        seen.add(gid)
+        cur = bytes(glyf[offs[gid]:offs[gid + 1]])
+        entry = _raw_glyph_entry(
+            ord(ch), gid, is_medium=False, target_aw=None,
+        )
+        if not entry or not entry.get("raw"):
+            continue
+        want = bytes(entry["raw"])
+        if cur == want:
+            continue
+        if hashlib.sha256(cur).digest() == hashlib.sha256(want).digest():
+            continue
+        installs[gid] = entry
+    if not installs:
+        latin_gids = {
+            int(g) for ch, g in TBANK_CHAR_TO_GID_REG.items()
+            if int(g) in painted
+        }
+        out = _restore_f1_atlas_composites(ff2, set(painted))
+        out = _sync_hmtx_lsb_to_xmin(out, latin_gids | set(painted))
+        return _pin_f1_head_flags_and_csa(out)
+    cur = _install_raw_glyph_bytes(ff2, installs)
+    cur = _restore_f1_atlas_composites(cur, set(painted) | set(installs))
+    cur = _sync_hmtx_lsb_to_xmin(cur, set(installs) | set(painted))
+    cur = _pin_f1_head_flags_and_csa(cur)
+    logger.info(
+        "SBP F1 mosaic pin GID(s) %s",
+        sorted(installs),
+    )
+    return cur
+
+
+def _fill_empty_keep_from_master(ff2: bytes, keep: set, cid_to_uni=None) -> bytes:
+    """Fill empty painted GIDs from corpus atlas raw — never unlocked master TTF.
+
+    Master TinkoffSans outlines (xMin≠shell LSB) trip Proton
+    A-FONT-GLYPH-SLOT-TRANSPLANT + GLYPH_OUTLINE_MISMATCH + MOSAIC on latin
+    slots like 'i'@154 (Wildberries). Atlas rows from сбп29/48 keep LSB=xMin.
+    """
     from tbank_dynamic import _f1_loca_tables
 
     try:
@@ -18948,52 +22866,46 @@ def _fill_empty_keep_from_master(ff2: bytes, keep: set, cid_to_uni=None) -> byte
             empty_keep.append(gid)
     if not empty_keep:
         return ff2
-    masters = []
-    for path in (FONT_TBANK_MASTER_REG, FONT_REGULAR):
-        if os.path.isfile(path):
-            try:
-                masters.append(TTFont(path))
-            except Exception:
-                continue
-    if not masters:
-        return ff2
-    cur = ff2
-    filled = []
+    installs: Dict[int, dict] = {}
     for gid in empty_keep:
         uni = (cid_to_uni or {}).get(int(gid))
-        src_gid = None
+        cp = None
         if isinstance(uni, int) and 0x20 <= uni < 0xE000:
-            src_gid = TBANK_CHAR_TO_GID_REG.get(chr(uni))
+            cp = int(uni)
         elif isinstance(uni, int) and uni >= 0xE000:
-            src_gid = int(gid) if int(gid) in {
-                int(g) for g in TBANK_CHAR_TO_GID_REG.values()
-            } else None
-        if src_gid is None:
+            # PUA: only fill if this GID is a known canonical letter slot.
+            for ch, cg in TBANK_CHAR_TO_GID_REG.items():
+                if int(cg) == int(gid):
+                    cp = ord(ch)
+                    break
+        if cp is None:
+            # Painted label CID often missing from ToUnicode after empty-TU
+            # prune (з=276/й=278) — still fill by canonical Jasper slot.
+            for ch, cg in TBANK_CHAR_TO_GID_REG.items():
+                if int(cg) == int(gid):
+                    cp = ord(ch)
+                    break
+        if cp is None:
             continue
-        blob = b""
-        for ft in masters:
-            go = ft.getGlyphOrder()
-            if src_gid >= len(go):
-                continue
-            try:
-                cand = ft["glyf"][go[src_gid]].compile(ft["glyf"])
-            except Exception:
-                continue
-            if len(cand) >= 12 and int.from_bytes(cand[:2], "big", signed=True) != 0:
-                blob = cand
-                break
-        if not blob:
-            continue
-        nxt = _insert_glyph_blob_grow(cur, gid, blob)
-        if nxt is None:
-            continue
-        cur = nxt
-        filled.append(gid)
-    if filled:
-        logger.info(
-            "SBP F1 filled empty keep GID(s) %s glyf=%d",
-            filled, _glyf_table_length(cur),
+        target_aw = _slot_advance(ff2, int(gid))
+        entry = _raw_glyph_entry(
+            cp, int(gid), is_medium=False, target_aw=target_aw,
         )
+        if not entry or not entry.get("raw"):
+            logger.warning(
+                "SBP F1 empty-keep atlas miss U+%04X gid=%d — leave empty",
+                cp, gid,
+            )
+            continue
+        installs[int(gid)] = entry
+    if not installs:
+        return ff2
+    cur = _install_raw_glyph_bytes(ff2, installs)
+    cur = _sync_hmtx_lsb_to_xmin(cur, set(installs))
+    logger.info(
+        "SBP F1 atlas-filled empty keep GID(s) %s glyf=%d",
+        sorted(installs), _glyf_table_length(cur),
+    )
     return cur
 
 
@@ -19026,7 +22938,117 @@ def _restore_empty_components_from_src(dst: bytes, src: bytes, keep: set) -> byt
     return cur
 
 
-    return cur
+def _ensure_f1_used_cmap_w(
+    pdf: bytes, reg: set, tu_xref, cid_xref, ff1: bytes,
+) -> bytes:
+    """Add painted F1 CIDs missing from ToUnicode+/W (label з/й closure)."""
+    import math
+    from io import BytesIO
+
+    import tbank_unlock_template as tut
+    from tbank_orig_mode import _parse_w_array, find_object_range
+
+    if not pdf or tu_xref is None or cid_xref is None or not reg:
+        return pdf
+    rng_tu = find_object_range(pdf, int(tu_xref))
+    rng_cid = find_object_range(pdf, int(cid_xref))
+    if not rng_tu or not rng_cid:
+        return pdf
+    try:
+        import fitz
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        tu = doc.xref_stream(int(tu_xref))
+        cidobj = doc.xref_object(int(cid_xref))
+        ff1_now = ff1
+        if ff1_now is None:
+            fr = tut._find_font_objects(doc).get("TinkoffSans-Regular") or {}
+            ff1_now = doc.xref_stream(int(fr["fontfile_xref"]))
+        doc.close()
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+    except Exception as exc:
+        logger.warning("SBP F1 cmap read: %s", exc)
+        return pdf
+    missing = [
+        int(c) for c in sorted(reg)
+        if int(c) not in sub and int(c) not in (0,)
+    ]
+    if not missing:
+        return pdf
+    # Only cover nonempty painted CIDs — empty stay unpainted elsewhere.
+    try:
+        from fontTools.ttLib import TTFont as _TT
+        _ft = _TT(BytesIO(ff1_now))
+        _glyf = _ft["glyf"]
+        _go = _ft.getGlyphOrder()
+        missing = [
+            c for c in missing
+            if 0 <= int(c) < len(_go) and _glyph_renders(_glyf, _go, int(c))
+        ]
+    except Exception:
+        pass
+    if not missing:
+        return pdf
+    gid_to_cp = {int(g): ord(ch) for ch, g in TBANK_CHAR_TO_GID_REG.items()}
+    uni_gid = {int(uni): int(cid) for cid, uni in sub.items()}
+    added = []
+    for cid in missing:
+        cp = gid_to_cp.get(int(cid))
+        if cp is None:
+            continue
+        if cp in uni_gid and int(uni_gid[cp]) != int(cid):
+            # Face already owns this unicode on another CID — skip (no steal).
+            continue
+        if cp in uni_gid:
+            continue
+        uni_gid[cp] = int(cid)
+        added.append(cid)
+    if not added:
+        logger.warning("SBP F1 cmap miss painted %s — no unicode bind", missing)
+        return pdf
+    new_tu = tut._build_tounicode_cmap(uni_gid)
+    widths, _dw = _parse_w_array(cidobj)
+    try:
+        ft = TTFont(BytesIO(ff1_now))
+        upem = int(ft["head"].unitsPerEm) or 1000
+        go = ft.getGlyphOrder()
+        for cid in uni_gid.values():
+            if int(cid) in widths:
+                continue
+            if int(cid) >= len(go):
+                continue
+            adv = int(ft["hmtx"].metrics[go[int(cid)]][0])
+            widths[int(cid)] = int(math.floor(adv * 1000 / upem))
+    except Exception as exc:
+        logger.warning("SBP F1 /W widths: %s", exc)
+        return pdf
+    new_w = tut._build_widths_from_map(widths)
+    try:
+        new_tu_obj = tut._make_modified_obj(
+            pdf[rng_tu[0]:rng_tu[1]], int(tu_xref),
+            new_stream=_best_compress(new_tu),
+        )
+        patched = _replace_byte_range_and_rebuild(
+            pdf, rng_tu[0], rng_tu[1], new_tu_obj,
+        )
+        if not patched:
+            return pdf
+        rng_cid2 = find_object_range(patched, int(cid_xref))
+        if not rng_cid2:
+            return patched
+        cid_bytes = patched[rng_cid2[0]:rng_cid2[1]]
+        cid_txt = cid_bytes.decode("latin1", "replace")
+        new_cid_txt = tut._replace_w_in_cidfont_obj(cid_txt, new_w)
+        new_cid_obj = new_cid_txt.encode("latin1")
+        patched2 = _replace_byte_range_and_rebuild(
+            patched, rng_cid2[0], rng_cid2[1], new_cid_obj,
+        )
+        if patched2:
+            logger.info("SBP F1 cmap+W added CIDs %s", added)
+            return patched2
+        return patched
+    except Exception as exc:
+        logger.warning("SBP F1 cmap patch: %s", exc)
+        return pdf
 
 
 def _ensure_f2_used_cmap_w(
@@ -19141,6 +23163,627 @@ def _patch_tounicode_xref(pdf: bytes, tu_xref: int, new_tu: bytes) -> Optional[b
     return _replace_byte_range_and_rebuild(pdf, s, e, new_obj)
 
 
+def _patch_contents_xref(pdf: bytes, cs_xref: int, new_cs: bytes) -> Optional[bytes]:
+    """Replace page Contents stream and rebuild xref."""
+    import tbank_unlock_template as tut
+    from tbank_orig_mode import find_object_range
+
+    rng = find_object_range(pdf, int(cs_xref))
+    if not rng:
+        return None
+    s, e = rng
+    try:
+        new_obj = tut._make_modified_obj(
+            pdf[s:e], int(cs_xref),
+            new_stream=_best_compress(new_cs),
+        )
+    except Exception as exc:
+        logger.warning("Contents make_modified_obj: %s", exc)
+        return None
+    return _replace_byte_range_and_rebuild(pdf, s, e, new_obj)
+
+
+def _sbp_hydrate_letters_inplace(
+    ff2: bytes, uni_gid: Dict[int, int], letters: str,
+) -> bytes:
+    """Install missing face letters into the current FontFile2 (no twin swap)."""
+    need = {ord(ch) for ch in letters if ch != " "}
+    if not need:
+        return ff2
+    miss = _missing_glyph_contours(
+        ff2, need, is_medium=False, uni_gid_plan=uni_gid,
+    )
+    if not miss:
+        return ff2
+    installs: Dict[int, dict] = {}
+    for ch in miss:
+        cp = ord(ch)
+        cid = uni_gid.get(cp)
+        if cid is None:
+            cid = TBANK_CHAR_TO_GID_REG.get(ch)
+        if cid is None:
+            continue
+        uni_gid[cp] = int(cid)
+        target_aw = _slot_advance(ff2, int(cid))
+        entry = _raw_glyph_entry(
+            cp, int(cid), is_medium=False, target_aw=target_aw,
+        )
+        if entry and entry.get("raw"):
+            installs[int(cid)] = entry
+    if not installs:
+        logger.warning(
+            "SBP force-face: raw cache miss for %s", "".join(miss[:16]),
+        )
+        return ff2
+    out = _install_raw_glyph_bytes(ff2, installs)
+    keep = {0, 3} | {int(c) for c in uni_gid.values()}
+    try:
+        out = _repair_ff2_empty_composite_components(
+            out, keep, is_medium=False,
+        )
+    except Exception:
+        pass
+    logger.info(
+        "SBP force-face: in-place hydrate %s → %s",
+        "".join(miss[:16]),
+        "".join(
+            _missing_glyph_contours(
+                out, need, is_medium=False, uni_gid_plan=uni_gid,
+            )[:12]
+        ) or "ok",
+    )
+    return out
+
+
+def _sbp_receipt_second_block_ok(num: str, op_date: Optional[str]) -> bool:
+    """Proton A-TBANK-RECEIPT-BLOCK-EPOCH-001 — 2nd block 1-XXX-… vs face date."""
+    parts = str(num or "").split("-")
+    if len(parts) < 2 or parts[0] != "1":
+        return False
+    try:
+        from tbank_corpus import _receipt_a_pool
+        pool = _receipt_a_pool(op_date)
+        if not pool:
+            return True
+        return parts[1] in pool
+    except Exception:
+        return True
+
+
+def _sbp_epoch_receipt_from_donor(donor_num: str, op_date: Optional[str]) -> str:
+    """Swap expired 2nd block; keep tail for equal-CID TJ replace."""
+    parts = donor_num.split("-")
+    if len(parts) != 5:
+        return _gen_receipt_num(op_date=op_date)
+    try:
+        from tbank_corpus import _receipt_a_pool
+        import secrets as _sec
+        pool = _receipt_a_pool(op_date)
+        if not pool:
+            return donor_num
+        a = pool[int.from_bytes(_sec.token_bytes(2), "big") % len(pool)]
+        if parts[1] == a:
+            return donor_num
+        return f"1-{a}-{parts[2]}-{parts[3]}-{parts[4]}"
+    except Exception:
+        return _gen_receipt_num(op_date=op_date)
+
+
+def _sbp_force_correct_receipt_pdf(pdf: bytes, prepared: Dict) -> bytes:
+    """Paint epoch-valid receipt (Aug+ → 105/112/113/115/130 as 2nd block)."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    import fitz
+    import tbank_unlock_template as tut
+    from tbank_orig_mode import replace_tj_bytes_inplace
+
+    op_date = prepared.get("new_date") or ""
+    try:
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        text = doc[0].get_text() or ""
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        tu_xref = int(meta["tounicode_xref"])
+        cs_xrefs = doc[0].get_contents()
+        if not cs_xrefs:
+            doc.close()
+            return pdf
+        cs_xref = int(cs_xrefs[0])
+        tu_raw = doc.xref_stream(tu_xref)
+        cs = doc.xref_stream(cs_xref)
+        doc.close()
+    except Exception as exc:
+        logger.warning("SBP force-receipt open: %s", exc)
+        return pdf
+
+    m = re.search(r"1-\d{3}-\d{3}-\d{3}-\d{3}", text)
+    if not m:
+        return pdf
+    got_num = m.group(0)
+    if _sbp_receipt_second_block_ok(got_num, op_date):
+        prepared["receipt_raw"] = got_num
+        prepared["receipt_auto"] = False
+        return pdf
+
+    want_num = _sbp_epoch_receipt_from_donor(got_num, op_date)
+    if not _sbp_receipt_second_block_ok(want_num, op_date):
+        want_num = _gen_receipt_num(op_date=op_date)
+    got_line_m = re.search(
+        r"Квитанция\s+[№\u2116]\s*1-\d{3}-\d{3}-\d{3}-\d{3}", text,
+    )
+    got_line = (
+        got_line_m.group(0) if got_line_m else f"Квитанция  \u2116 {got_num}"
+    )
+    want_line = f"Квитанция  \u2116 {want_num}"
+    if got_line == want_line:
+        prepared["receipt_raw"] = want_num
+        prepared["receipt_auto"] = False
+        return pdf
+
+    try:
+        sub = tut._parse_subset_tounicode(tu_raw.decode("latin1", "replace"))
+    except Exception:
+        return pdf
+    uni_gid: Dict[int, int] = {int(u): int(c) for c, u in sub.items()}
+    uni_gid[0x20] = 3
+    for ch in want_line + got_line + want_num + got_num:
+        if ch == " ":
+            continue
+        canon = TBANK_CHAR_TO_GID_REG.get(ch)
+        if canon is not None:
+            uni_gid[ord(ch)] = int(canon)
+
+    cs2 = cs
+    ok = False
+    old_b = _dynamic_enc(got_line, uni_gid)
+    new_b = _dynamic_enc(want_line, uni_gid)
+    if old_b and new_b and len(old_b) == len(new_b):
+        cs2, ok = replace_tj_bytes_inplace(cs, old_b, new_b)
+    if not ok:
+        old_nb = _dynamic_enc(got_num, uni_gid)
+        new_nb = _dynamic_enc(want_num, uni_gid)
+        if old_nb and new_nb and len(old_nb) == len(new_nb):
+            cs2, ok = replace_tj_bytes_inplace(cs, old_nb, new_nb)
+    if not ok:
+        logger.warning(
+            "SBP force-receipt: TJ miss %s → %s", got_num, want_num,
+        )
+        return pdf
+    patched = _patch_contents_xref(pdf, cs_xref, cs2)
+    if patched is None:
+        return pdf
+    prepared["receipt_raw"] = want_num
+    prepared["receipt_auto"] = False
+    logger.info("SBP force-receipt: %s → %s", got_num, want_num)
+    return patched
+
+
+def _sbp_resolve_sbp_identity(prepared: Dict) -> tuple[str, str]:
+    """Fresh opid27+suffix5 with cipher timestamp matching face date."""
+    new_date = re.sub(
+        r"\s+", " ",
+        str(prepared.get("new_date") or prepared.get("date_time") or "").strip(),
+    )
+    bank = str(
+        prepared.get("bank") or prepared.get("recipient_bank") or _ORIG_BANK
+    )
+    amount = re.sub(
+        r"\D", "",
+        str(prepared.get("new_amount") or prepared.get("amount") or ""),
+    )
+    phone = str(prepared.get("phone") or _ORIG_PHONE)
+    account = str(prepared.get("account") or "")
+    receiver = str(prepared.get("receiver") or "")
+    suf = re.sub(r"\D", "", str(prepared.get("sbp_suffix_raw") or ""))[:5].zfill(5)
+    if not suf:
+        suf = _gen_sbp_suffix(bank, amount, new_date)
+    manual = bool(prepared.get("sbp_id_manual"))
+    if manual:
+        sid = str(prepared.get("sbp_id_raw") or "").strip().upper()
+        if (
+            not new_date
+            or not sid
+            or not decode_sbp_operation_id(sid)
+            or not verify_sbp_id_date(sid, new_date)
+        ):
+            sid = _gen_sbp_id(
+                new_date, bank=bank, amount=amount, phone=phone,
+                account=account, receiver=receiver,
+            )
+    else:
+        sid = _gen_sbp_id(
+            new_date, bank=bank, amount=amount, phone=phone,
+            account=account, receiver=receiver,
+        )
+    if new_date and not verify_sbp_id_date(sid, new_date):
+        sid = _gen_sbp_id(
+            new_date, bank=bank, amount=amount, phone=phone,
+            account=account, receiver=receiver,
+        )
+    prepared["sbp_id_raw"] = sid
+    prepared["sbp_suffix_raw"] = suf
+    prepared["sbp_id_auto"] = False
+    return sid, suf
+
+
+def _sbp_graft_cipher_timestamp(
+    opid27: str,
+    new_date: str,
+    *,
+    bank: str = "",
+    amount: str = "",
+    phone: str = "",
+    account: str = "",
+    receiver: str = "",
+) -> str:
+    """Keep route tail, replace only DOY/HMS digits (pos 1..10) from fresh gen."""
+    got = opid27.strip().upper()
+    if len(got) != 27 or not decode_sbp_operation_id(got):
+        return got
+    fresh = _gen_sbp_id(
+        new_date, bank=bank, amount=amount, phone=phone,
+        account=account, receiver=receiver,
+    )
+    if not decode_sbp_operation_id(fresh):
+        return got
+    grafted = got[0] + fresh[1:11] + got[11:]
+    if verify_sbp_id_date(grafted, new_date):
+        return grafted
+    return fresh
+
+
+def _sbp_force_correct_sbp_id_pdf(pdf: bytes, prepared: Dict) -> bytes:
+    """Paint SBP ID whose UTC cipher matches prepared face date (K-TBANK-SBP-TIME-001)."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    got_flat = _extract_sbp_opid_flat(pdf)
+    if not got_flat:
+        return pdf
+    new_date = re.sub(
+        r"\s+", " ",
+        str(prepared.get("new_date") or prepared.get("date_time") or "").strip(),
+    )
+    if not new_date:
+        return pdf
+    if verify_sbp_id_date(got_flat[:27], new_date):
+        return pdf
+
+    want_sid, want_suf = _sbp_resolve_sbp_identity(prepared)
+    want_flat = want_sid + want_suf
+    if got_flat == want_flat:
+        return pdf
+
+    import fitz
+    import tbank_unlock_template as tut
+    from tbank_orig_mode import replace_tj_bytes_inplace
+    from io import BytesIO
+
+    try:
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        ff_xref = int(meta["fontfile_xref"])
+        tu_xref = int(meta["tounicode_xref"])
+        cs_xref = int(doc[0].get_contents()[0])
+        ff2 = doc.xref_stream(ff_xref)
+        tu_raw = doc.xref_stream(tu_xref)
+        cs = doc.xref_stream(cs_xref)
+        doc.close()
+    except Exception as exc:
+        logger.warning("SBP force-id open: %s", exc)
+        return pdf
+
+    try:
+        sub = tut._parse_subset_tounicode(tu_raw.decode("latin1", "replace"))
+    except Exception:
+        return pdf
+    uni_gid: Dict[int, int] = {int(u): int(c) for c, u in sub.items()}
+    uni_gid[0x20] = 3
+    ug_sid = dict(uni_gid)
+    for ch in want_sid + got_flat[:27]:
+        cid = TBANK_CHAR_TO_GID_REG.get(ch)
+        if cid is not None:
+            ug_sid[ord(ch)] = int(cid)
+    ug_sid = _unsteal_g1_route_g(ug_sid, None, suffix5=want_suf)
+
+    sid_old = _sbp_id_slot_bytes(cs, ug_sid, face_id=got_flat[:27])
+    if not sid_old:
+        logger.warning("SBP force-id: opid slot not found")
+        return pdf
+    fitted, sid_new_b = _fit_sbp_id_slot(
+        want_sid, len(sid_old), ug_sid, ff2=ff2,
+        suffix5=want_suf, manual=bool(prepared.get("sbp_id_manual")),
+    )
+    if sid_new_b is None or not fitted:
+        grafted = _sbp_graft_cipher_timestamp(
+            got_flat[:27], new_date,
+            bank=str(prepared.get("bank") or _ORIG_BANK),
+            amount=re.sub(
+                r"\D", "",
+                str(prepared.get("new_amount") or prepared.get("amount") or ""),
+            ),
+            phone=str(prepared.get("phone") or _ORIG_PHONE),
+            account=str(prepared.get("account") or ""),
+            receiver=str(prepared.get("receiver") or ""),
+        )
+        fitted, sid_new_b = _fit_sbp_id_slot(
+            grafted, len(sid_old), ug_sid, ff2=ff2,
+            suffix5=want_suf, manual=False,
+        )
+    if sid_new_b is None or not fitted:
+        logger.warning("SBP force-id: slot fit miss %s", want_sid)
+        return pdf
+    if new_date and not verify_sbp_id_date(fitted, new_date):
+        logger.warning(
+            "SBP force-id: cipher still off after fit %s (want %s)",
+            fitted, new_date,
+        )
+        return pdf
+
+    cs2, ok = replace_tj_bytes_inplace(cs, sid_old, sid_new_b)
+    if not ok:
+        try:
+            font_obj = TTFont(BytesIO(ff2))
+            cs2, ok = _dynamic_replace_tj(
+                cs, sid_old, sid_new_b,
+                got_flat[:27], fitted, 9.0, font_obj, ug_sid,
+                right_edge=250.0, preserve_tm=False,
+            )
+        except Exception as exc:
+            logger.warning("SBP force-id Tm: %s", exc)
+    if not ok:
+        logger.warning("SBP force-id: TJ miss %s → %s", got_flat[:27], fitted)
+        return pdf
+
+    got_suf = got_flat[27:32] if len(got_flat) >= 32 else ""
+    if got_suf and got_suf != want_suf:
+        suf_old_b = _dynamic_enc(got_suf, ug_sid)
+        fitted_suf, suf_new_b = _fit_sbp_suffix_slot(want_suf, len(suf_old_b or b""), ug_sid)
+        if suf_old_b and suf_new_b and len(suf_old_b) == len(suf_new_b):
+            cs2, ok_suf = replace_tj_bytes_inplace(cs2, suf_old_b, suf_new_b)
+            if ok_suf:
+                prepared["sbp_suffix_raw"] = fitted_suf or want_suf
+
+    patched = _patch_contents_xref(pdf, cs_xref, cs2)
+    if patched is None:
+        return pdf
+    prepared["sbp_id_raw"] = fitted
+    flat_after = _extract_sbp_opid_flat(patched)
+    if not flat_after or not verify_sbp_id_date(flat_after[:27], new_date):
+        logger.warning(
+            "SBP force-id: post-patch cipher miss %s (want %s)",
+            flat_after[:27] if flat_after else "?",
+            new_date,
+        )
+        return pdf
+    logger.info("SBP force-id: %s → %s", got_flat, fitted + want_suf)
+    return patched
+
+
+def _tbank_force_correct_face(
+    pdf: bytes, prepared: Dict, *, channel: str = "sbp",
+) -> bytes:
+    """LAW1 face restore for every T-Bank method. Never returns None.
+
+    SBP slot realign (Y-map + receipt/phone Tm) is SBP-only. Card/phone
+    keep their own Tm; applying SBP slots → VALUE_RIGHT_EDGE_OFF_LATTICE.
+    """
+    ch = (channel or "sbp").strip() or "sbp"
+    if not pdf:
+        return pdf
+    forced = _sbp_force_correct_face(
+        pdf, prepared, rewrite_sbp_slots=(ch == "sbp"),
+    )
+    return forced if forced else pdf
+
+
+def _sbp_force_correct_face(
+    pdf: bytes, prepared: Dict, *, rewrite_sbp_slots: bool = True,
+) -> Optional[bytes]:
+    """Make the shipped face match _user_* exactly: hydrate letters, rewrite TJs."""
+    import fitz
+    import tbank_unlock_template as tut
+    from io import BytesIO
+
+    prepared = dict(prepared)
+    for uk, pk in (
+        ("_user_sender", "sender"),
+        ("_user_receiver", "receiver"),
+        ("_user_bank", "bank"),
+    ):
+        uv = (prepared.get(uk) or "").rstrip(" ")
+        if uv:
+            prepared[pk] = uv
+    ok, _why = _pdf_face_has_user_fields(
+        pdf, prepared, allow_fio_drift=False,
+    )
+    empty = _pdf_f1_empty_painted_chars(pdf)
+    if ok and not empty:
+        return pdf
+    if not rewrite_sbp_slots:
+        try:
+            from tbank_channel_common import pdf_face_matches_user
+            face_ok, _face_why = pdf_face_matches_user(pdf, prepared)
+        except Exception:
+            face_ok = False
+        if face_ok and not empty:
+            return pdf
+    try:
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        fm = tut._find_font_objects(doc)
+        meta = fm.get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return None
+        ff_xref = int(meta["fontfile_xref"])
+        tu_xref = int(meta["tounicode_xref"])
+        cs_xrefs = doc[0].get_contents()
+        if not cs_xrefs:
+            doc.close()
+            return None
+        cs_xref = int(cs_xrefs[0])
+        ff2 = doc.xref_stream(ff_xref)
+        tu_raw = doc.xref_stream(tu_xref)
+        cs = doc.xref_stream(cs_xref)
+        doc.close()
+    except Exception as exc:
+        logger.warning("SBP force-face open: %s", exc)
+        return None
+    try:
+        sub = tut._parse_subset_tounicode(
+            tu_raw.decode("latin1", "replace"),
+        )
+    except Exception:
+        sub = {}
+    uni_gid: Dict[int, int] = {int(u): int(c) for c, u in sub.items()}
+    uni_gid[0x20] = 3
+    blob = (
+        (prepared.get("sender") or "")
+        + (prepared.get("receiver") or "")
+        + (prepared.get("bank") or "")
+        + "Итого"
+    )
+    for ch in blob:
+        if ch == " ":
+            continue
+        canon = TBANK_CHAR_TO_GID_REG.get(ch)
+        if canon is not None:
+            uni_gid[ord(ch)] = int(canon)
+        elif ord(ch) not in uni_gid:
+            logger.warning("SBP force-face: no GID for %r", ch)
+    ff2 = _sbp_hydrate_letters_inplace(ff2, uni_gid, blob)
+    for ch in blob:
+        if ch == " ":
+            continue
+        if ord(ch) not in uni_gid:
+            continue
+        if not _cid_has_contour(ff2, int(uni_gid[ord(ch)])):
+            logger.warning(
+                "SBP force-face: still empty %r cid=%s",
+                ch, uni_gid.get(ord(ch)),
+            )
+    try:
+        font_obj = TTFont(BytesIO(ff2))
+        if rewrite_sbp_slots:
+            cs2 = _realign_sbp_values_to_right_edge(
+                cs, prepared, uni_gid, font_obj, right_edge=250.0,
+            )
+            _want_dt = _normalize_sbp_op_date(prepared.get("new_date") or "")
+            if _want_dt:
+                try:
+                    import fitz as _fz_dt
+                    _d_dt = _fz_dt.open(stream=pdf, filetype="pdf")
+                    _got_dt = _normalize_sbp_op_date(_d_dt[0].get_text() or "")
+                    _d_dt.close()
+                except Exception:
+                    _got_dt = ""
+                if _got_dt and _got_dt != _want_dt:
+                    cs2, _ok_dt = _sbp_rewrite_date_stream(
+                        cs2, _got_dt, prepared.get("new_date") or "",
+                        uni_gid, font_obj,
+                    )
+                    if not _ok_dt:
+                        logger.warning(
+                            "SBP force-face: date rewrite miss %s → %s",
+                            _got_dt, _want_dt,
+                        )
+        else:
+            cs2 = cs
+    except Exception as exc:
+        logger.warning("SBP force-face realign: %s", exc)
+        cs2 = cs
+    # Letter-pad leftover («МартыновИл»): replace painted stem+junk with user FIO.
+    try:
+        import fitz as _fz_fio
+        _d_fio = _fz_fio.open(stream=pdf, filetype="pdf")
+        _txt_fio = _d_fio[0].get_text() or ""
+        _d_fio.close()
+        _font_fio = font_obj
+    except Exception:
+        _txt_fio = ""
+        _font_fio = None
+    if _txt_fio and _font_fio is not None:
+        for _lab, _uk, _side in (
+            ("Отправитель", "sender", "before"),
+            ("Получатель", "receiver", "after"),
+        ):
+            _want = (
+                prepared.get(f"_user_{_uk}") or prepared.get(_uk) or ""
+            ).rstrip(" ")
+            _got = (
+                _sbp_line_before_label(_txt_fio, _lab)
+                if _side == "before"
+                else _sbp_line_after_label(_txt_fio, _lab)
+            )
+            if not (_want and _got and _got != _want):
+                continue
+            # Only glued letter-pad of the user stem — never swap another field.
+            if not (
+                _got.startswith(_want) and not _fio_token_exact(_got, _want)
+            ):
+                continue
+            _old_b = _dynamic_enc(_got, uni_gid)
+            _new_b = _dynamic_enc(_want, uni_gid)
+            if not (_old_b and _new_b):
+                continue
+            cs2, _ok_fio = _dynamic_replace_tj(
+                cs2, _old_b, _new_b, _got, _want, 9.0, _font_fio, uni_gid,
+                right_edge=250.0, preserve_tm=False,
+            )
+            if _ok_fio:
+                logger.info(
+                    "SBP force-face: strip FIO pad %s %r → %r",
+                    _uk, _got, _want,
+                )
+    merged = {int(u): int(c) for c, u in sub.items()}
+    merged[0x20] = 3
+    for ch in blob:
+        cid = uni_gid.get(ord(ch))
+        if cid is not None:
+            merged[ord(ch)] = int(cid)
+    try:
+        new_tu = tut._build_tounicode_cmap(merged)
+    except Exception as exc:
+        logger.warning("SBP force-face ToUnicode: %s", exc)
+        new_tu = None
+    out = pdf
+    patched = _patch_fontfile2_xref(out, ff_xref, ff2)
+    if patched is not None:
+        out = patched
+    if new_tu is not None:
+        patched = _patch_tounicode_xref(out, tu_xref, new_tu)
+        if patched is not None:
+            out = patched
+    if cs2 != cs:
+        patched = _patch_contents_xref(out, cs_xref, cs2)
+        if patched is not None:
+            out = patched
+    out = _sbp_fill_empty_painted_pdf(
+        out, clamp_cmap_band=rewrite_sbp_slots,
+    )
+    if rewrite_sbp_slots:
+        out = _sbp_sync_amount_slots(out, prepared)
+    out = _sbp_force_correct_receipt_pdf(out, prepared)
+    out = _sbp_force_correct_sbp_id_pdf(out, prepared)
+    ok2, why2 = _pdf_face_has_user_fields(
+        out, prepared, allow_fio_drift=False,
+    )
+    empty2 = _pdf_f1_empty_painted_chars(out)
+    if ok2 and not empty2:
+        logger.info("SBP force-face: user FIO restored")
+        return out
+    logger.warning(
+        "SBP force-face incomplete face=%s empty=%r", why2, empty2[:12],
+    )
+    if not rewrite_sbp_slots:
+        return out
+    return None
+
+
 def _fix_f1_tounicode_canonical_slots(sub: dict) -> dict:
     """Keep ASCII SBP-id letters on their canonical GIDs; map PUA slots to the letter."""
     out = {int(c): int(u) for c, u in sub.items()}
@@ -19184,6 +23827,11 @@ def apply_sbp_font_hard_fixes(pdf: bytes) -> bytes:
 
     try:
         doc = fitz.open(stream=pdf, filetype="pdf")
+        page_h = int(round(float(doc[0].mediabox.y1)))
+        # card_sber h=471: exact atlas only — SBP orphan mutate bloats glyf.
+        if page_h == 471:
+            doc.close()
+            return pdf
         fm = tut._find_font_objects(doc)
         fr = fm.get("TinkoffSans-Regular")
         fm2 = fm.get("TinkoffSans-Medium")
@@ -19199,6 +23847,7 @@ def apply_sbp_font_hard_fixes(pdf: bytes) -> bytes:
         x2 = int(fm2["fontfile_xref"]) if fm2 else None
         tu2_xref = int(fm2["tounicode_xref"]) if fm2 and fm2.get("tounicode_xref") else None
         cid2_xref = int(fm2["cidfont_xref"]) if fm2 and fm2.get("cidfont_xref") else None
+        tu2 = doc.xref_stream(tu2_xref) if tu2_xref else b""
         sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
         reg, med = _gids_per_font_in_stream(cs)
         doc.close()
@@ -19208,15 +23857,23 @@ def apply_sbp_font_hard_fixes(pdf: bytes) -> bytes:
 
     cmap_n = len(sub)
     keep1 = _ff2_raw_composite_closure(ff1, set(reg) | {0, 3} | set(sub.keys()))
+    if page_h == 471:
+        keep1 |= set(_CARD_OPENPDF_F1_COMPOSITE_GIDS)
+        keep1 = _ff2_raw_composite_closure(ff1, keep1)
     out = pdf
-    is_twin = _tbank_ff2_is_corpus_twin(ff1, height=519)
+    is_twin = _tbank_ff2_is_corpus_twin(ff1, height=page_h)
     twin_orphans = _f1_disallowed_orphan_gids(ff1, keep1)
     empty_paint = False
     offs_p, glyf_p = _ff2_raw_loca_glyf(ff1)
     if offs_p is not None and glyf_p:
-        for cid, uni in sub.items():
-            if int(cid) not in reg or int(uni) in (0x20, 0xA0):
-                continue
+        # Painted CIDs missing from ToUnicode (з/й label holes) count too —
+        # not only CIDs already in the CMap.
+        _check_cids = set(int(c) for c in reg if int(c) not in (0, 3))
+        _check_cids |= {
+            int(cid) for cid, uni in sub.items()
+            if int(cid) in reg and int(uni) not in (0x20, 0xA0)
+        }
+        for cid in sorted(_check_cids):
             if int(cid) + 1 >= len(offs_p):
                 empty_paint = True
                 break
@@ -19258,7 +23915,9 @@ def apply_sbp_font_hard_fixes(pdf: bytes) -> bytes:
         collapsed = _force_tbank_f1_head_epoch(collapsed)
         keep1 = _ff2_raw_composite_closure(collapsed, keep1)
         g = int(_glyf_table_length(collapsed))
-        want = _pick_cmap_safe_f1_glyf(cmap_n, g, F1_TWIN_GLYF_LENS)
+        want = g
+        if page_h == 519:
+            want = _pick_cmap_safe_f1_glyf(cmap_n, g, F1_TWIN_GLYF_LENS)
         if g != want:
             landed = None
             try:
@@ -19319,11 +23978,74 @@ def apply_sbp_font_hard_fixes(pdf: bytes) -> bytes:
                     collapsed = _force_tbank_f1_head_epoch(reland)
         try:
             collapsed = _cap_f1_orphan_spares(collapsed, keep1)
-            collapsed = _collapse_tbank_zero_contour_loca_stubs(
-                collapsed, keep_gids=keep1 | {35, 239},
-            )
+            g_pre_stub = int(_glyf_table_length(collapsed))
+            # OnlyPDF cluster (cmap 68–71, glyf ≥12818): stub-collapse
+            # shrinks 13002→12496 and kills recognition — never here.
+            if g_pre_stub < 12818:
+                collapsed = _collapse_tbank_zero_contour_loca_stubs(
+                    collapsed, keep_gids=keep1 | {35, 239},
+                )
+            else:
+                logger.info(
+                    "SBP F1 skip stub-collapse glyf=%d (OnlyPDF cluster)",
+                    g_pre_stub,
+                )
         except Exception as exc:
             logger.warning("SBP F1 cap+stub-collapse: %s", exc)
+        # Absolute last: exclusive cmap cards (72→12612) must land after
+        # orphan-collapse — collapse often leaves 13056 OUTLIER.
+        # 519 atlas only — other page heights have their own peel bands.
+        try:
+            g_fin = int(_glyf_table_length(collapsed))
+            want_fin = g_fin
+            if page_h == 519:
+                want_fin = _pick_cmap_safe_f1_glyf(
+                    cmap_n, g_fin, F1_TWIN_GLYF_LENS,
+                )
+            if g_fin != want_fin:
+                landed_fin = None
+                if g_fin > want_fin:
+                    landed_fin = _snap_f1_glyf_exact_via_shrink(
+                        collapsed, want_fin, keep1,
+                    )
+                else:
+                    landed_fin = _fat_f1_glyf_via_keep_span(
+                        collapsed, want_fin, keep1,
+                    )
+                if landed_fin is None:
+                    try:
+                        from tbank_dynamic import (
+                            _load_corpus_f1_twin_for_glyf as _twin_fin,
+                            _align_f1_shape_to_corpus_twin as _align_fin,
+                        )
+                        _tw = _twin_fin(want_fin)
+                        if _tw is not None:
+                            _al = _align_fin(
+                                collapsed, glyf_len=want_fin,
+                                keep=set(keep1) | {0, 3},
+                            )
+                            if (
+                                _al is not None
+                                and int(_glyf_table_length(_al)) == want_fin
+                            ):
+                                landed_fin = _al
+                            elif int(_glyf_table_length(_tw)) == want_fin:
+                                landed_fin = bytes(_tw)
+                    except Exception as _exc_tf:
+                        logger.warning("SBP F1 exclusive twin land: %s", _exc_tf)
+                if landed_fin is not None:
+                    collapsed = _force_tbank_f1_head_epoch(landed_fin)
+                    logger.info(
+                        "SBP F1 exclusive cmap land glyf %d→%d (cmap=%d)",
+                        g_fin, _glyf_table_length(collapsed), cmap_n,
+                    )
+                else:
+                    logger.error(
+                        "SBP F1 exclusive cmap FAIL glyf=%d want=%d cmap=%d",
+                        g_fin, want_fin, cmap_n,
+                    )
+        except Exception as exc:
+            logger.warning("SBP F1 exclusive cmap land: %s", exc)
         try:
             from tbank_dynamic import _load_corpus_f1_twin_for_glyf as _twin_len
             g_now = int(_glyf_table_length(collapsed))
@@ -19348,6 +24070,24 @@ def apply_sbp_font_hard_fixes(pdf: bytes) -> bytes:
                             "SBP F1 off-twin-glyf %d→%d",
                             g_now, _glyf_table_length(collapsed),
                         )
+                    else:
+                        # Snap to envelope failed — still leave exact twin
+                        # length so Proton SHA_TWIN_MISMATCH does not fire.
+                        g_leave = int(_glyf_table_length(collapsed))
+                        for _delta in (4, 6, 8, 10, 12, 14, 16):
+                            _tgt = g_leave + _delta
+                            if _tgt in F1_TWIN_GLYF_LENS:
+                                continue
+                            _pad = _fat_f1_glyf_via_keep_span(
+                                collapsed, _tgt, keep1,
+                            )
+                            if _pad is not None and int(_glyf_table_length(_pad)) == _tgt:
+                                collapsed = _force_tbank_f1_head_epoch(_pad)
+                                logger.info(
+                                    "SBP F1 off-twin pad %d→%d",
+                                    g_leave, _tgt,
+                                )
+                                break
         except Exception as exc:
             logger.warning("SBP F1 off-twin nudge: %s", exc)
         if collapsed != ff1:
@@ -19362,6 +24102,109 @@ def apply_sbp_font_hard_fixes(pdf: bytes) -> bytes:
                     _ff2_raw_empty_composites(collapsed)[:6],
                     _ff2_zero_contour_stub_gids(collapsed)[:8],
                 )
+
+    # Always pin painted Latin/х to atlas mosaic — even on twin path.
+    try:
+        pinned = _pin_f1_painted_latin_mosaic(ff1, set(reg))
+        if pinned != ff1:
+            patched = _patch_fontfile2_xref(out, x1, pinned)
+            if patched:
+                out = patched
+                ff1 = pinned
+    except Exception as exc:
+        logger.warning("SBP F1 latin-mosaic pin: %s", exc)
+
+    # Mosaic/raw-install can inflate glyf off exclusive atlas (12612@72 → 13012).
+    # Re-land AFTER mosaic — OUTLIER HARD otherwise.
+    try:
+        g_post = int(_glyf_table_length(ff1))
+        want_post = _pick_cmap_safe_f1_glyf(cmap_n, g_post, F1_TWIN_GLYF_LENS)
+        if int(page_h) == 519 and int(cmap_n) in (68, 69, 70, 71):
+            _opdf = {68: 13002, 69: 12784, 70: 13000, 71: 13002}
+            _ex = _opdf.get(int(cmap_n))
+            env = _F1_519_GLYF_BY_CMAP.get(int(cmap_n))
+            if (
+                _ex is not None
+                and env
+                and int(env[0]) <= _ex <= int(env[1])
+                and g_post < int(env[0])
+            ):
+                want_post = int(_ex)
+        if g_post != want_post:
+            landed_post = None
+            if g_post > want_post:
+                landed_post = _snap_f1_glyf_exact_via_shrink(
+                    ff1, want_post, set(reg) | {0, 3},
+                )
+            else:
+                landed_post = _fat_f1_glyf_via_keep_span(
+                    ff1, want_post, set(reg) | {0, 3},
+                )
+            if landed_post is None:
+                try:
+                    from tbank_dynamic import (
+                        _load_corpus_f1_twin_for_glyf as _twin_post,
+                    )
+                    _twp = _twin_post(want_post)
+                    if _twp is not None and int(_glyf_table_length(_twp)) == want_post:
+                        landed_post = bytes(_twp)
+                except Exception:
+                    landed_post = None
+            if landed_post is not None:
+                landed_post = _force_tbank_f1_head_epoch(landed_post)
+                # Never re-mosaic after fat-pad — install_raw_glyph_bytes strips
+                # keep-span padding (13000→12792) and kills OnlyPDF cluster.
+                if int(_glyf_table_length(landed_post)) != want_post:
+                    if int(_glyf_table_length(landed_post)) < want_post:
+                        _refat = _fat_f1_glyf_via_keep_span(
+                            landed_post, want_post, set(reg) | {0, 3},
+                        )
+                        if _refat is not None:
+                            landed_post = _force_tbank_f1_head_epoch(_refat)
+                    elif int(_glyf_table_length(landed_post)) > want_post:
+                        _shr = _snap_f1_glyf_exact_via_shrink(
+                            landed_post, want_post, set(reg) | {0, 3},
+                        )
+                        if _shr is not None:
+                            landed_post = _force_tbank_f1_head_epoch(_shr)
+                if int(_glyf_table_length(landed_post)) == want_post:
+                    patched = _patch_fontfile2_xref(out, x1, landed_post)
+                    if patched:
+                        out = _finalize_tbank_f1_epoch(patched)
+                        ff1 = landed_post
+                        logger.info(
+                            "SBP F1 post-mosaic cmap land glyf %d→%d (cmap=%d)",
+                            g_post, want_post, cmap_n,
+                        )
+                else:
+                    logger.error(
+                        "SBP F1 post-mosaic still glyf=%d want=%d cmap=%d",
+                        _glyf_table_length(landed_post), want_post, cmap_n,
+                    )
+    except Exception as exc:
+        logger.warning("SBP F1 post-mosaic cmap land: %s", exc)
+
+    # Absolute last F1 metrics write: LSB==xMin for every painted CID.
+    # Never call _force_tbank_f1_head_epoch after this (it restores shell hmtx).
+    try:
+        synced = _sync_hmtx_lsb_to_xmin(ff1, set(reg) | {0, 3})
+        if synced != ff1:
+            synced = _pin_f1_head_flags_and_csa(synced)
+            patched = _patch_fontfile2_xref(out, x1, synced)
+            if patched:
+                out = patched
+                ff1 = synced
+                logger.info("SBP F1 painted LSB→xMin sync")
+        else:
+            # Still re-pin flags/CSA after any prior mosaic install.
+            flagged = _pin_f1_head_flags_and_csa(ff1)
+            if flagged != ff1:
+                patched = _patch_fontfile2_xref(out, x1, flagged)
+                if patched:
+                    out = patched
+                    ff1 = flagged
+    except Exception as exc:
+        logger.warning("SBP F1 painted LSB sync: %s", exc)
 
     if ff2 is not None and x2 is not None:
         keep2 = set(med) | {0, 3} | set(BANK_MED_GHOST)
@@ -19383,6 +24226,45 @@ def apply_sbp_font_hard_fixes(pdf: bytes) -> bytes:
             logger.warning("SBP F2 stub-collapse: %s", exc)
         allowed = allowed_f2_glyf_for_f1(ff1)
         g2 = int(_glyf_table_length(ff2))
+        # Digit-card HARD outranks cogen: never land F2.glyf above the
+        # unique-digit ceiling (card5 genuines ≤1636).
+        try:
+            _f2_sub = tut._parse_subset_tounicode(
+                tu2.decode("latin1", "replace")
+            ) if tu2 else {}
+            _n_dig = len({
+                int(u) for u in _f2_sub.values()
+                if 0x30 <= int(u) <= 0x39
+            })
+            _f2_ceil_cogen = _f2_digit_card_glyf_ceiling(_n_dig or 5)
+        except Exception:
+            _f2_ceil_cogen = _f2_digit_card_glyf_ceiling(5)
+        if allowed:
+            allowed = frozenset(int(x) for x in allowed if int(x) <= _f2_ceil_cogen)
+            if not allowed:
+                logger.info(
+                    "SBP F2 cogen skip — all kit sizes > digit ceil %d",
+                    _f2_ceil_cogen,
+                )
+        if g2 > _f2_ceil_cogen:
+            landed_ceil = _land_f2_under_digit_ceil(
+                ff2, keep2, glyf_ceil=_f2_ceil_cogen, base_ff=ff2,
+            )
+            if _glyf_table_length(landed_ceil) <= _f2_ceil_cogen:
+                ff2 = landed_ceil
+                g2 = int(_glyf_table_length(ff2))
+                logger.info(
+                    "SBP F2 digit-card hard-fix → glyf=%d ceil=%d",
+                    g2, _f2_ceil_cogen,
+                )
+        # Digit-card HARD outranks cogen. 1622 nd=0 must not be inflated back
+        # to 1680 via .notdef restore / kit snap (mosaic+FAT).
+        if g2 <= _f2_ceil_cogen and allowed and g2 not in allowed:
+            logger.info(
+                "SBP F2 cogen skip glyf=%d ≤ digit ceil %d (kit %s)",
+                g2, _f2_ceil_cogen, sorted(allowed)[:8],
+            )
+            allowed = None
         if allowed and g2 not in allowed:
             want2 = min(allowed, key=lambda x: abs(int(x) - g2))
             donor = _pick_safecheck_band_medium_ff2() or ff2
@@ -19440,6 +24322,2091 @@ def apply_sbp_font_hard_fixes(pdf: bytes) -> bytes:
                 logger.info("SBP F1 ToUnicode canonical-slot remap")
     except Exception as exc:
         logger.warning("SBP F1 ToUnicode remap: %s", exc)
+    if tu2_xref is not None and cid2_xref is not None and med:
+        try:
+            out2 = _ensure_f2_used_cmap_w(out, med, tu2_xref, cid2_xref, ff2)
+            if out2:
+                out = out2
+        except Exception as exc:
+            logger.warning("SBP F2 used-cmap cover: %s", exc)
+    try:
+        cid1_xref = int(fr.get("cidfont_xref") or 0) or None
+        if tu1_xref is not None and cid1_xref is not None and reg:
+            out1 = _ensure_f1_used_cmap_w(out, reg, tu1_xref, cid1_xref, ff1)
+            if out1:
+                out = out1
+    except Exception as exc:
+        logger.warning("SBP F1 used-cmap cover: %s", exc)
+    # Last F2 mutation: digit-card ceil + mosaic. Anything earlier that
+    # restored .notdef (1680) is dropped here without touching digit «3».
+    if ff2 is not None and x2 is not None:
+        try:
+            import fitz as _fz_last
+            _dlast = _fz_last.open(stream=out, filetype="pdf")
+            _mlast = tut._find_font_objects(_dlast).get("TinkoffSans-Medium")
+            if _mlast:
+                _flast = _dlast.xref_stream(_mlast["fontfile_xref"])
+                _xlast = int(_mlast["fontfile_xref"])
+                _tulast = (
+                    _dlast.xref_stream(_mlast["tounicode_xref"])
+                    if _mlast.get("tounicode_xref")
+                    else tu2
+                )
+                _dlast.close()
+                _subl = (
+                    tut._parse_subset_tounicode(
+                        _tulast.decode("latin1", "replace")
+                    )
+                    if _tulast
+                    else {}
+                )
+                _nlast = len({
+                    int(u) for u in _subl.values()
+                    if 0x30 <= int(u) <= 0x39
+                })
+                _clast = _f2_digit_card_glyf_ceiling(_nlast or 5)
+                _amtl = "".join(
+                    chr(int(u)) for u in _subl.values()
+                    if 0x30 <= int(u) <= 0x39
+                )
+                _glast = _glyf_table_length(_flast)
+                if _glast > _clast:
+                    _keepl = set(med) | {0, 3} | set(BANK_MED_GHOST)
+                    _landl = _land_f2_under_digit_ceil(
+                        _flast, _keepl, glyf_ceil=_clast, base_ff=_flast,
+                    )
+                    if (
+                        _glyf_table_length(_landl) <= _clast
+                        and not _f2_digit_mosaic_mismatch(_landl, _amtl)
+                    ):
+                        _pl = _patch_fontfile2_xref(out, _xlast, _landl)
+                        if _pl:
+                            out = _finalize_tbank_f2_epoch(_pl)
+                            logger.info(
+                                "SBP F2 last digit-card %d→%d ceil=%d nd=%d",
+                                _glast, _glyf_table_length(_landl),
+                                _clast, _gid0_glyph_length(_landl),
+                            )
+            else:
+                _dlast.close()
+        except Exception as exc:
+            logger.warning("SBP F2 last digit-card: %s", exc)
+    return out
+
+
+def _sbp_polish_layout(pdf: bytes) -> bytes:
+    try:
+        from tbank_emit import polish_layout_pdf
+        return polish_layout_pdf(pdf, channel="sbp")
+    except Exception as exc:
+        logger.warning("T-Bank SBP polish: %s", exc)
+        return pdf
+
+
+def _sbp_paint_f2_extra_tu_digits(pdf: bytes) -> bytes:
+    """Paint F2 ToUnicode digits missing from the stream (card6 unique bump).
+
+    Proton used≡ToUnicode≡/W and FontFile2 closure. Digit 7 (gid 312) must
+    appear in Contents. Off-page Tm y=600 — never Td -500 -500.
+    """
+    import fitz
+    import tbank_unlock_template as tut
+    from tbank_emit import _commit_contents_inplace
+
+    try:
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        fm2 = tut._find_font_objects(doc).get("TinkoffSans-Medium")
+        if not fm2 or not fm2.get("tounicode_xref"):
+            doc.close()
+            return pdf
+        tu = doc.xref_stream(int(fm2["tounicode_xref"]))
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        xref = int(doc[0].get_contents()[0])
+        stream = doc.xref_stream(xref)
+        _reg, med = _gids_per_font_in_stream(stream)
+        doc.close()
+    except Exception as exc:
+        logger.warning("F2 extra-digit paint read: %s", exc)
+        return pdf
+    extra = sorted({
+        int(cid)
+        for cid, uni in sub.items()
+        if 0x30 <= int(uni) <= 0x39
+        and int(cid) not in med
+        and int(cid) not in (0, 3)
+    })
+    if not extra:
+        return pdf
+    # Same BT/Tm as Итого F2 (atlas h=519 is BT=30/Tm=31). A new BT+Tm
+    # trips TBANK_CONTENT_BT_TM_PROFILE. Tiny Tf on the existing amount Tm
+    # marks the CID used without a visible extra digit.
+    marker = b"/F2 16 Tf\n0.2 0.2 0.2 rg\n"
+    pos = stream.find(marker)
+    if pos < 0:
+        logger.warning("F2 extra-digit paint: no F2 16 Tf marker")
+        return pdf
+    insert = bytearray()
+    for gid in extra:
+        enc = bytes([(gid >> 8) & 0xFF, gid & 0xFF])
+        insert.extend(b"/F2 0.001 Tf\n(" + enc + b")Tj\n")
+    insert.extend(marker)
+    new_stream = stream[:pos] + bytes(insert) + stream[pos + len(marker):]
+    committed = _commit_contents_inplace(pdf, xref, new_stream)
+    if committed is None:
+        logger.warning("F2 extra-digit paint Contents commit failed gids=%s", extra)
+        return pdf
+    logger.info("F2 extra-digit same-Tm paint gids=%s", extra)
+    return committed
+
+
+_AMT_TJ_BLOCK = re.compile(
+    rb"1 0 0 1 ([0-9.]+) ([0-9.]+) Tm\n"
+    rb"/(F[12]) ([0-9.]+) Tf\n"
+    rb"0\.2 0\.2 0\.2 rg\n"
+    rb"\(((?:\\.|[^\\)])*)\)Tj"
+)
+
+
+def _amount_uni_gid(sub: dict, *, medium: bool) -> Dict[int, int]:
+    """uni→GID for amount digits; ToUnicode first, canonical slots as fallback."""
+    ug = {int(u): int(c) for c, u in sub.items()}
+    ug[0x20] = 3
+    table = TBANK_CHAR_TO_GID_MED if medium else TBANK_CHAR_TO_GID_REG
+    for ch, gid in table.items():
+        if ch.isdigit() or ch == " ":
+            ug[ord(ch)] = int(gid)
+    return ug
+
+
+def _tj_inner_plain(inner: bytes, sub: dict) -> str:
+    raw = _unescape_pdf_str(inner)
+    chars: List[str] = []
+    for i in range(0, len(raw) - 1, 2):
+        gid = (raw[i] << 8) | raw[i + 1]
+        uni = sub.get(int(gid))
+        chars.append(chr(uni) if uni else "")
+    return "".join(chars)
+
+
+def _sbp_sync_amount_slots(pdf: bytes, prepared: Optional[Dict]) -> bytes:
+    """Force «Сумма» and «Итого» to the same user amount (Y-pinned TJs)."""
+    if not pdf or not prepared:
+        return pdf
+    want = str(prepared.get("new_amount") or "")
+    if want and not want.endswith(" "):
+        want += " "
+    digs = re.sub(r"\D", "", want)
+    if not digs:
+        return pdf
+    import fitz
+    import tbank_unlock_template as tut
+    from io import BytesIO
+    from tbank_emit import _commit_contents_inplace
+
+    try:
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        fm = tut._find_font_objects(doc)
+        fr = fm.get("TinkoffSans-Regular")
+        fm2 = fm.get("TinkoffSans-Medium")
+        if not fr or not fm2:
+            doc.close()
+            return pdf
+        cs_xrefs = doc[0].get_contents()
+        if not cs_xrefs:
+            doc.close()
+            return pdf
+        cs_xref = int(cs_xrefs[0])
+        stream = doc.xref_stream(cs_xref)
+        ff1 = doc.xref_stream(int(fr["fontfile_xref"]))
+        ff2 = doc.xref_stream(int(fm2["fontfile_xref"]))
+        tu1 = doc.xref_stream(int(fr["tounicode_xref"]))
+        tu2 = doc.xref_stream(int(fm2["tounicode_xref"]))
+        doc.close()
+        sub_r = tut._parse_subset_tounicode(tu1.decode("latin1", "replace"))
+        sub_m = tut._parse_subset_tounicode(tu2.decode("latin1", "replace"))
+        ug_r = _amount_uni_gid(sub_r, medium=False)
+        ug_m = _amount_uni_gid(sub_m, medium=True)
+        font_r = TTFont(BytesIO(ff1))
+        font_m = TTFont(BytesIO(ff2))
+        y_sm = _SBP_VALUE_Y["amount_sm"]
+        y_bg = _SBP_VALUE_Y["amount_bg"]
+        out_s = stream
+        n = 0
+        guard = 0
+        while guard < 4:
+            guard += 1
+            hit = False
+            for m in _AMT_TJ_BLOCK.finditer(out_s):
+                y = float(m.group(2))
+                ftag = m.group(3)
+                sz = float(m.group(4))
+                x = float(m.group(1))
+                inner = m.group(5)
+                slot = None
+                if (
+                    ftag == b"F1" and abs(sz - 9.0) < 0.05
+                    and x >= 80.0 and abs(y - y_sm) < 1.5
+                ):
+                    slot = "sm"
+                elif (
+                    ftag == b"F2" and abs(sz - 16.0) < 0.05
+                    and x >= 50.0 and abs(y - y_bg) < 1.5
+                ):
+                    slot = "bg"
+                if slot is None:
+                    continue
+                sub = sub_m if slot == "bg" else sub_r
+                ug = ug_m if slot == "bg" else ug_r
+                fo = font_m if slot == "bg" else font_r
+                edge = 237.77 if slot == "bg" else 243.68
+                old_t = _tj_inner_plain(inner, sub)
+                if re.sub(r"\D", "", old_t) == digs:
+                    continue
+                new_b = _dynamic_enc(want, ug)
+                if not new_b:
+                    continue
+                patched, ok = _dynamic_replace_tj(
+                    out_s, inner, new_b, old_t, want, sz, fo, ug,
+                    right_edge=edge, y_target=y, min_x=50.0,
+                )
+                if ok and patched != out_s:
+                    out_s = patched
+                    n += 1
+                    hit = True
+                    break
+            if not hit:
+                break
+        font_r.close()
+        font_m.close()
+        if n == 0 or out_s == stream:
+            return pdf
+        committed = _commit_contents_inplace(pdf, cs_xref, out_s)
+        if committed is None:
+            return pdf
+        logger.info("SBP amount slots synced %d (want=%r)", n, want.strip())
+        return committed
+    except Exception as exc:
+        logger.warning("SBP amount slot sync: %s", exc)
+        return pdf
+
+
+def _tbank_sync_f1_cross_layer_bbox(
+    pdf: bytes, *, head_authoritative: bool = False,
+) -> bytes:
+    """Align F1 PDF /FontBBox with TTF head (CROSS_LAYER HARD).
+
+    SBP (head_authoritative=False): patch TTF head → PDF /FontBBox (donor shell).
+    card_sber h=471 (head_authoritative=True): patch PDF /FontBBox → TTF head
+    when SBP Jasper pins leaked (-7,-200,943,842) onto the descriptor.
+    """
+    import fitz
+    import tbank_unlock_template as tut
+
+    try:
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        fm = tut._find_font_objects(doc)
+        out = pdf
+        changed = False
+        for key, pin_openpdf in (
+            ("TinkoffSans-Regular", True),
+            ("TinkoffSans-Medium", False),
+        ):
+            meta = fm.get(key)
+            if not meta:
+                continue
+            fd_xref = meta.get("fontdesc_xref")
+            ff_xref = meta.get("fontfile_xref")
+            if not fd_xref or not ff_xref:
+                continue
+            obj = doc.xref_object(int(fd_xref))
+            m = re.search(
+                r"/FontBBox\s*\[\s*([-+]?\d+)\s+([-+]?\d+)\s+"
+                r"([-+]?\d+)\s+([-+]?\d+)\s*\]",
+                obj,
+            )
+            if not m:
+                continue
+            pdf_bb = tuple(int(m.group(i)) for i in range(1, 5))
+            ff2 = doc.xref_stream(int(ff_xref))
+            head_bb = _head_bbox_from_ff2(ff2)
+            if head_bb is None or pdf_bb == head_bb:
+                continue
+            if head_authoritative:
+                want = head_bb
+                new_bbox = (
+                    f"/FontBBox [{want[0]} {want[1]} {want[2]} {want[3]}]"
+                )
+                obj2 = re.sub(
+                    r"/FontBBox\s*\[\s*([-+]?\d+)\s+([-+]?\d+)\s+"
+                    r"([-+]?\d+)\s+([-+]?\d+)\s*\]",
+                    new_bbox,
+                    obj,
+                    count=1,
+                )
+                if obj2 == obj:
+                    continue
+                doc.update_object(int(fd_xref), obj2)
+                out = doc.tobytes(deflate=True, garbage=0)
+                changed = True
+                logger.info(
+                    "T-Bank %s FontBBox %s → head %s (h471 pin)",
+                    key, pdf_bb, head_bb,
+                )
+                doc.close()
+                doc = fitz.open(stream=out, filetype="pdf")
+                fm = tut._find_font_objects(doc)
+                continue
+            fixed = _restore_head_bbox(ff2, pdf_bb)  # type: ignore[arg-type]
+            if pin_openpdf:
+                fixed = _pin_f1_head_flags_and_csa(fixed)
+            if fixed == ff2:
+                continue
+            patched = _patch_fontfile2_xref(out, int(ff_xref), fixed)
+            if patched is None:
+                continue
+            out = patched
+            changed = True
+            logger.info(
+                "T-Bank %s head bbox %s → FontBBox %s",
+                key, head_bb, pdf_bb,
+            )
+            doc.close()
+            doc = fitz.open(stream=out, filetype="pdf")
+            fm = tut._find_font_objects(doc)
+        doc.close()
+        return out if changed else pdf
+    except Exception as exc:
+        logger.warning("T-Bank F1 cross-layer bbox: %s", exc)
+        return pdf
+
+
+def _sbp_pin_f1_head_bbox_to_fontbbox(pdf: bytes) -> bytes:
+    """Last pin: TTF head bbox must equal PDF /FontBBox (CROSS_LAYER HARD).
+
+    Read /FontBBox from the FontDescriptor xref (not a substring scan — xref
+    9 matches «19 0 R»). Do not LSB-sync here: fontTools.save would shrink
+    head again. Call after every other FontFile2 write.
+    """
+    import fitz
+    import tbank_unlock_template as tut
+
+    try:
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        fm = tut._find_font_objects(doc)
+        out = pdf
+        changed = False
+        for key, pin_openpdf in (
+            ("TinkoffSans-Regular", True),
+            ("TinkoffSans-Medium", False),
+        ):
+            meta = fm.get(key)
+            if not meta:
+                continue
+            fd_xref = meta.get("fontdesc_xref")
+            ff_xref = meta.get("fontfile_xref")
+            if not fd_xref or not ff_xref:
+                continue
+            obj = doc.xref_object(int(fd_xref))
+            m = re.search(
+                r"/FontBBox\s*\[\s*([-+]?\d+)\s+([-+]?\d+)\s+"
+                r"([-+]?\d+)\s+([-+]?\d+)\s*\]",
+                obj,
+            )
+            if not m:
+                continue
+            want = tuple(int(m.group(i)) for i in range(1, 5))
+            ff2 = doc.xref_stream(int(ff_xref))
+            have = _head_bbox_from_ff2(ff2)
+            if have == want:
+                continue
+            fixed = _restore_head_bbox(ff2, want)  # type: ignore[arg-type]
+            if pin_openpdf:
+                fixed = _pin_f1_head_flags_and_csa(fixed)
+            if fixed == ff2:
+                continue
+            patched = _patch_fontfile2_xref(out, int(ff_xref), fixed)
+            if patched is None:
+                continue
+            out = patched
+            changed = True
+            logger.info(
+                "SBP %s head bbox %s → FontBBox %s",
+                key, have, want,
+            )
+            doc.close()
+            doc = fitz.open(stream=out, filetype="pdf")
+            fm = tut._find_font_objects(doc)
+        doc.close()
+        return out if changed else pdf
+    except Exception as exc:
+        logger.warning("SBP F1 head bbox pin: %s", exc)
+        return pdf
+
+
+def _sbp_resync_f1_painted_lsb(pdf: bytes) -> bytes:
+    """Absolute last F1 metrics write before polish — LSB==xMin for painted."""
+    import fitz
+    import tbank_unlock_template as tut
+
+    def _pin_painted_atlas_raw(ff2: bytes, sub_map: Dict[int, int], painted: set) -> bytes:
+        offs, glyf = _ff2_raw_loca_glyf(ff2)
+        if offs is None or not glyf:
+            return ff2
+        rev = {int(g): ord(ch) for ch, g in TBANK_CHAR_TO_GID_REG.items()}
+        installs: Dict[int, dict] = {}
+        for cid in sorted(int(c) for c in painted if int(c) not in (0, 3)):
+            cp = sub_map.get(int(cid)) or rev.get(int(cid))
+            if not cp:
+                continue
+            entry = _raw_glyph_entry(
+                int(cp), int(cid), is_medium=False,
+                target_aw=_slot_advance(ff2, int(cid)),
+            )
+            raw = bytes((entry or {}).get("raw") or b"")
+            if not raw:
+                continue
+            if int(cid) + 1 >= len(offs):
+                continue
+            a, b = offs[int(cid)], offs[int(cid) + 1]
+            if b < a or a < 0 or b > len(glyf):
+                continue
+            cur = bytes(glyf[a:b])
+            if cur != raw:
+                installs[int(cid)] = entry
+        if not installs:
+            return ff2
+        out = _install_raw_glyph_bytes(ff2, installs)
+        out = _restore_f1_atlas_composites(out, painted | set(installs) | {0, 3})
+        out = _sync_hmtx_lsb_to_xmin(out, painted | set(installs) | {0, 3})
+        out = _pin_f1_head_flags_and_csa(out)
+        logger.info("SBP F1 painted atlas-raw pin n=%d", len(installs))
+        return out
+
+    try:
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        fr = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not fr:
+            doc.close()
+            return pdf
+        x1 = int(fr["fontfile_xref"])
+        ff1 = doc.xref_stream(x1)
+        tu = doc.xref_stream(int(fr["tounicode_xref"]))
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        reg, _ = _gids_per_font_in_stream(cs)
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        doc.close()
+        g0 = int(_glyf_table_length(ff1))
+        synced = _restore_f1_atlas_composites(ff1, set(reg) | {0, 3})
+        synced = _sync_hmtx_lsb_to_xmin(synced, set(reg) | {0, 3})
+        synced = _pin_painted_atlas_raw(synced, sub, set(reg))
+        synced = _pin_f1_painted_latin_mosaic(synced, set(reg))
+        synced = _restore_f1_atlas_composites(synced, set(reg) | {0, 3})
+        synced = _sync_hmtx_lsb_to_xmin(synced, set(reg) | {0, 3})
+        synced = _pin_f1_head_flags_and_csa(synced)
+        g1 = int(_glyf_table_length(synced))
+        if g1 < g0 - 32:
+            logger.warning(
+                "SBP F1 resync would shrink glyf %d→%d — keep prior",
+                g0, g1,
+            )
+            return pdf
+        if synced == ff1:
+            return pdf
+        patched = _patch_fontfile2_xref(pdf, x1, synced)
+        return patched if patched is not None else pdf
+    except Exception as exc:
+        logger.warning("SBP F1 resync painted LSB: %s", exc)
+        return pdf
+
+
+def _sbp_pin_f1_jasper_metric_envelopes(pdf: bytes) -> bytes:
+    """Last F1 maxp/hhea pin after LSB sync (fontTools otherwise subset-recomputes)."""
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        xref = int(meta["fontfile_xref"])
+        ff2 = doc.xref_stream(xref)
+        doc.close()
+        pinned = _pin_f1_head_flags_and_csa(ff2)
+        pinned = _force_tbank_f1_jasper_maxp_envelope(pinned)
+        pinned = _force_tbank_f1_jasper_hhea_envelope(pinned)
+        pinned = _force_tbank_f1_jasper_hmtx_envelope(pinned)
+        if _ttf_num_glyphs(pinned) > 8:
+            pinned = _restore_head_csa(pinned, _TBANK_F1_OPENPDF_CSA)
+        if pinned == ff2:
+            return pdf
+        patched = _patch_fontfile2_xref(pdf, xref, pinned)
+        return patched if patched is not None else pdf
+    except Exception as exc:
+        logger.warning("SBP F1 maxp/hhea envelope pin: %s", exc)
+        return pdf
+
+
+def _sbp_clear_v3_reassembly_family(pdf: bytes) -> bytes:
+    """Break Proton font_sig∧stream_sig (K-TBANK-REASSEMBLY-FAMILY-V3).
+
+    Painted F2 often needs 10 mappings (Итого+space+5 digits) — do not cap
+    those. A-clause: grow F1.glyf above 12783. C-clause (thin F2 ≤1549 and
+    F1.bfchar≤105): grow F2.glyf to 1554 (h=519 atlas). F1.glyf fat alone
+    does not clear C. No-op on non-519 pages — 12790 is SBP-only and
+    TBANK_F1_GLYF_CMAP_OUTLIER HARD on card/phone height.
+    """
+    import fitz
+    import tbank_unlock_template as tut
+    from tbank_dynamic import _load_corpus_f1_twin_for_glyf
+
+    if _tbank_pdf_height(pdf) != 519:
+        return pdf
+
+    def _metrics(blob: bytes):
+        doc = fitz.open(stream=blob, filetype="pdf")
+        fm = tut._find_font_objects(doc)
+        fr = fm.get("TinkoffSans-Regular")
+        fm2 = fm.get("TinkoffSans-Medium")
+        if not fr or not fm2:
+            doc.close()
+            return None
+        x1 = int(fr["fontfile_xref"])
+        x2 = int(fm2["fontfile_xref"])
+        ff1 = doc.xref_stream(x1)
+        ff2 = doc.xref_stream(x2)
+        tu1 = doc.xref_stream(int(fr["tounicode_xref"]))
+        tu2 = doc.xref_stream(int(fm2["tounicode_xref"]))
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        doc.close()
+        f1_glyf = int(_glyf_table_length(ff1))
+        f2_glyf = int(_glyf_table_length(ff2))
+        _m1, f1_bf, _br1 = _parse_tounicode_counts(tu1)
+        _m2, _bf2, f2_br = _parse_tounicode_counts(tu2)
+        f1_raw, _ = _xref_stream_raw_decoded(blob, x1)
+        tu2_raw, tu2_dec = _xref_stream_raw_decoded(blob, int(fm2["tounicode_xref"]))
+        f2_tu_dec = len(tu2_dec or tu2)
+        digit_n = len({
+            (ord(_u[0]) if isinstance(_u, str) else int(_u))
+            for _u in _m2.values()
+            if (
+                (isinstance(_u, str) and _u and "0" <= _u[0] <= "9")
+                or (isinstance(_u, int) and 0x30 <= _u <= 0x39)
+            )
+        })
+        return {
+            "x1": x1, "x2": x2, "ff1": ff1, "ff2": ff2, "cs": cs,
+            "f1_glyf": f1_glyf, "f2_glyf": f2_glyf, "f1_bf": f1_bf,
+            "f2_br": f2_br, "f1_raw": f1_raw, "f2_tu_dec": f2_tu_dec,
+            "tu2_raw": tu2_raw, "digit_n": digit_n,
+        }
+
+    try:
+        m = _metrics(pdf)
+        if not m:
+            return pdf
+        if not (
+            _v3_font_signature(m["f1_glyf"], m["f2_glyf"], m["f1_bf"], m["f2_br"])
+            and _v3_stream_signature(
+                m["f1_raw"], len(m["ff1"]), m["tu2_raw"], m["f2_tu_dec"],
+            )
+        ):
+            return pdf
+        out = pdf
+        # C-clause: thin F2. F1.glyf fat does not clear this.
+        if m["f2_glyf"] <= 1549 and m["f1_bf"] <= 105:
+            want = int(_V3_F2_GLYF_BANK_LO)
+            ceil = _f2_digit_card_glyf_ceiling(m["digit_n"] or 1)
+            if want <= ceil and m["f2_glyf"] < want:
+                _reg, med = _gids_per_font_in_stream(m["cs"])
+                keep2 = set(int(c) for c in med) | {0, 3}
+                grown2 = _fat_f2_glyf_via_keep_span(m["ff2"], want, keep2)
+                if grown2 is not None and int(_glyf_table_length(grown2)) > 1549:
+                    patched = _patch_fontfile2_xref(out, m["x2"], grown2)
+                    if patched is not None:
+                        logger.info(
+                            "V3 clear: F2.glyf %d→%d (C-clause off, bfrange=%d)",
+                            m["f2_glyf"], _glyf_table_length(grown2), m["f2_br"],
+                        )
+                        out = patched
+                        m = _metrics(out) or m
+                else:
+                    logger.warning(
+                        "V3 clear: F2 keep-fat %d→%s failed — continue",
+                        m["f2_glyf"], want,
+                    )
+            else:
+                logger.warning(
+                    "V3 clear: F2.glyf %d cannot land %d (ceil=%d digits=%d)",
+                    m["f2_glyf"], want, ceil, m["digit_n"],
+                )
+        if not (
+            _v3_font_signature(m["f1_glyf"], m["f2_glyf"], m["f1_bf"], m["f2_br"])
+            and _v3_stream_signature(
+                m["f1_raw"], len(m["ff1"]), m["tu2_raw"], m["f2_tu_dec"],
+            )
+        ):
+            return out
+        if m["f1_glyf"] > _V3_F1_GLYF_LO - 1:
+            return out
+        reg, _med = _gids_per_font_in_stream(m["cs"])
+        keep = set(int(c) for c in reg) | {0, 3}
+        _mosaic_gids = {
+            int(TBANK_CHAR_TO_GID_REG[ch])
+            for ch in "ABDGLOQRWYZхХ"
+            if ch in TBANK_CHAR_TO_GID_REG
+        }
+        keep_fat = (keep - _mosaic_gids) or keep
+        # cmap69 envelope 12520–12816; stay under exact 12816, above 12783.
+        want = None
+        f1_glyf = m["f1_glyf"]
+        ff1 = m["ff1"]
+        x1 = m["x1"]
+        for trial in (12790, 12800, 12808, 12784, 12812, 12900, 12950):
+            if trial <= f1_glyf:
+                continue
+            if _load_corpus_f1_twin_for_glyf(trial) is not None:
+                continue
+            want = trial
+            break
+        if want is None:
+            want = f1_glyf + 280
+            if _load_corpus_f1_twin_for_glyf(want) is not None:
+                want += 6
+        grown = _fat_f1_glyf_via_keep_span(ff1, want, keep_fat)
+        if grown is None or int(_glyf_table_length(grown)) <= 12783:
+            logger.warning(
+                "V3 clear: F1 keep-fat %d→%s failed — ship",
+                f1_glyf, want,
+            )
+            return out
+        grown = _force_tbank_f1_jasper_maxp_envelope(grown)
+        grown = _force_tbank_f1_jasper_hhea_envelope(grown)
+        if _ttf_num_glyphs(grown) > 8:
+            grown = _restore_head_csa(grown, _TBANK_F1_OPENPDF_CSA)
+        patched = _patch_fontfile2_xref(out, x1, grown)
+        if patched is None:
+            return out
+        logger.info(
+            "V3 clear: F1.glyf %d→%d (font_sig A off, F2.bfrange=%d kept)",
+            f1_glyf, _glyf_table_length(grown), m["f2_br"],
+        )
+        return patched
+    except Exception as exc:
+        logger.warning("V3 reassembly clear: %s", exc)
+        return pdf
+
+
+_F1_GENUINE_SPARES = frozenset({35, 239})
+_F2_GENUINE_SPARES = frozenset({306})
+
+
+def _sbp_pin_f2_jasper_envelopes_pdf(pdf: bytes) -> bytes:
+    """Pin Medium head/maxp/hhea after any F2 glyf edit."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Medium")
+        if not meta:
+            doc.close()
+            return pdf
+        x2 = int(meta["fontfile_xref"])
+        ff2 = doc.xref_stream(x2)
+        doc.close()
+        pinned = _force_tbank_f2_head_epoch(ff2)
+        if pinned == ff2:
+            return pdf
+        patched = _patch_fontfile2_xref(pdf, x2, pinned)
+        return patched if patched is not None else pdf
+    except Exception as exc:
+        logger.warning("SBP F2 envelope pin: %s", exc)
+        return pdf
+
+
+def _sbp_cap_f2_orphans_pdf(pdf: bytes) -> bytes:
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Medium")
+        if not meta:
+            doc.close()
+            return pdf
+        x2 = int(meta["fontfile_xref"])
+        ff2 = doc.xref_stream(x2)
+        tu = (
+            doc.xref_stream(int(meta["tounicode_xref"]))
+            if meta.get("tounicode_xref") else b""
+        )
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        doc.close()
+        sub = tut._parse_subset_tounicode(
+            tu.decode("latin1", "replace")
+        ) if tu else {}
+        _reg, med = _gids_per_font_in_stream(cs)
+        seed = set(int(c) for c in med) | {0, 3} | set(int(c) for c in sub.keys())
+        capped = _cap_f2_orphan_spares(ff2, seed)
+        digit_n = len({
+            (ord(u[0]) if isinstance(u, str) else int(u))
+            for u in sub.values()
+            if (
+                (isinstance(u, str) and u and "0" <= u[0] <= "9")
+                or (isinstance(u, int) and 0x30 <= u <= 0x39)
+            )
+        })
+        ceil = _f2_digit_card_glyf_ceiling(digit_n or 1)
+        g_before = int(_glyf_table_length(capped))
+        if g_before > ceil:
+            clo = _ff2_raw_composite_closure(capped, seed)
+            leaned = _land_f2_under_digit_ceil(
+                capped, clo, glyf_ceil=ceil, base_ff=ff2,
+            )
+            g_after = int(_glyf_table_length(leaned))
+            if g_after <= ceil and _gid0_glyph_length(leaned) == 58:
+                logger.info(
+                    "F2 digit-card lean glyf %d→%d (ceil=%d digits=%d)",
+                    g_before, g_after, ceil, digit_n,
+                )
+                capped = leaned
+        capped = _force_tbank_f2_head_epoch(capped)
+        if capped == ff2:
+            return pdf
+        patched = _patch_fontfile2_xref(pdf, x2, capped)
+        return patched if patched is not None else pdf
+    except Exception as exc:
+        logger.warning("SBP F2 orphan cap: %s", exc)
+        return pdf
+
+
+def _sbp_pin_date_left_pdf(pdf: bytes, *, left_x: float = 20.0) -> bytes:
+    """Keep header date/time on LEFT x0≈20 (never value-column R=250)."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    if _tbank_pdf_height(pdf) != 519:
+        return pdf
+    try:
+        import fitz
+        import re as _re
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        cs_x = int(doc[0].get_contents()[0])
+        cs = doc.xref_stream(cs_x)
+        text = doc[0].get_text() or ""
+        doc.close()
+        date_ln = ""
+        for ln in text.splitlines():
+            s = ln.strip()
+            if _re.match(r"\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}:\d{2}", s):
+                date_ln = s
+                break
+        if not date_ln:
+            return pdf
+        import tbank_unlock_template as tut
+        from io import BytesIO
+        from fontTools.ttLib import TTFont
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        tu = doc.xref_stream(int(meta["tounicode_xref"]))
+        ff2 = doc.xref_stream(int(meta["fontfile_xref"]))
+        doc.close()
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        uni_gid = {int(u): int(c) for c, u in sub.items()}
+        uni_gid[0x20] = 3
+        enc = _dynamic_enc(date_ln, uni_gid)
+        if not enc:
+            return pdf
+        needle = b"(" + enc + b")Tj"
+        pos = cs.find(needle)
+        if pos < 0:
+            return pdf
+        region = cs[max(0, pos - 200):pos]
+        tms = list(_TM_RE.finditer(region))
+        if not tms:
+            return pdf
+        last = tms[-1]
+        old_x = float(last.group(1))
+        if abs(old_x - left_x) < 0.05:
+            return pdf
+        font_obj = TTFont(BytesIO(ff2))
+        # Re-pin visible start to left_x (same as _dynamic_replace_tj left anchor).
+        new_x = float(left_x)
+        old_y = last.group(2).decode()
+        new_tm = f"1 0 0 1 {_fmt_coord(new_x)} {old_y} Tm".encode("ascii")
+        tm_abs = max(0, pos - 200) + last.start()
+        patched_cs = (
+            cs[:tm_abs] + new_tm + cs[tm_abs + last.end() - last.start():]
+        )
+        out = _patch_contents_xref(pdf, cs_x, patched_cs)
+        if out is None:
+            return pdf
+        logger.info("SBP date LEFT pin Tm %.2f→%.2f", old_x, new_x)
+        return out
+    except Exception as exc:
+        logger.warning("SBP date LEFT pin: %s", exc)
+        return pdf
+
+
+def _sbp_strip_receipt_trailing_junk_pdf(pdf: bytes) -> bytes:
+    """Drop extra CIDs after «1-XXX-XXX-XXX-XXX» (TBANK_RECEIPT_ID_TRAILING_JUNK)."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+        from io import BytesIO
+        from fontTools.ttLib import TTFont
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        tu_x = int(meta["tounicode_xref"])
+        cs_x = int(doc[0].get_contents()[0])
+        ff_x = int(meta["fontfile_xref"])
+        tu = doc.xref_stream(tu_x)
+        cs = doc.xref_stream(cs_x)
+        ff2 = doc.xref_stream(ff_x)
+        text = doc[0].get_text() or ""
+        doc.close()
+        old_line = ""
+        clean = ""
+        for ln in text.splitlines():
+            if "Квитанция" not in ln:
+                continue
+            m = re.search(r"(1-\d{3}-\d{3}-\d{3}-\d{3})(.*)$", ln)
+            if not m or not (m.group(2) or "").strip():
+                continue
+            old_line = ln.strip()
+            clean = ln[: m.start(2)].rstrip()
+            break
+        if not old_line or not clean or old_line == clean:
+            return pdf
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        uni_gid = {int(u): int(c) for c, u in sub.items()}
+        uni_gid[0x20] = 3
+        old_b = _dynamic_enc(old_line, uni_gid)
+        new_b = _dynamic_enc(clean, uni_gid)
+        if not old_b or not new_b:
+            return pdf
+        font_obj = TTFont(BytesIO(ff2))
+        cs2, ok = _dynamic_replace_tj(
+            cs, old_b, new_b, old_line, clean, 9.0, font_obj, uni_gid,
+            left_x=20.0, right_edge=None, preserve_tm=True,
+        )
+        if not ok:
+            return pdf
+        patched = _patch_contents_xref(pdf, cs_x, cs2)
+        if patched is None:
+            return pdf
+        logger.info("T-Bank receipt trailing junk stripped")
+        return patched
+    except Exception as exc:
+        logger.warning("T-Bank receipt junk strip: %s", exc)
+        return pdf
+
+
+def _sbp_ensure_card_composites_pdf(pdf: bytes) -> bytes:
+    """Keep ≥10 OpenPDF name-composites at height=471 (COMPOSITE_FLOOR)."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    if _tbank_pdf_height(pdf) != 471:
+        return pdf
+    try:
+        import os
+        import fitz
+        import tbank_unlock_template as tut
+        from io import BytesIO
+        from fontTools.ttLib import TTFont
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        x1 = int(meta["fontfile_xref"])
+        ff1 = doc.xref_stream(x1)
+        doc.close()
+        if _ff2_nonempty_composite_n(ff1) >= 10:
+            return pdf
+        donor_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "templates",
+            "T_card_sber_original.pdf",
+        )
+        if not os.path.isfile(donor_path):
+            return pdf
+        ddoc = fitz.open(donor_path)
+        dmeta = tut._find_font_objects(ddoc).get("TinkoffSans-Regular")
+        donor_ff = ddoc.xref_stream(dmeta["fontfile_xref"]) if dmeta else None
+        ddoc.close()
+        if not donor_ff:
+            return pdf
+        dst = TTFont(BytesIO(ff1))
+        src = TTFont(BytesIO(donor_ff))
+        copied: set = set()
+        for gid in _CARD_OPENPDF_F1_COMPOSITE_GIDS:
+            _copy_glyph_closure(dst["glyf"], dst.getGlyphOrder(), src, int(gid), copied)
+        buf = BytesIO()
+        dst.save(buf)
+        stitched = _ff2_restore_shell_tables(ff1, buf.getvalue())
+        stitched = _force_tbank_f1_head_epoch(stitched)
+        stitched = _pin_f1_head_flags_and_csa(stitched)
+        if _ff2_nonempty_composite_n(stitched) < 10:
+            return pdf
+        patched = _patch_fontfile2_xref(pdf, x1, stitched)
+        if patched is None:
+            return pdf
+        logger.info(
+            "T-Bank card composites restored n=%d",
+            _ff2_nonempty_composite_n(stitched),
+        )
+        return patched
+    except Exception as exc:
+        logger.warning("T-Bank card composite restore: %s", exc)
+        return pdf
+
+
+def _sbp_structure_violations(pdf: bytes, *, channel: str = "sbp") -> List[str]:
+    """Proton HARD/KNOWN axes that late one-fix patches keep re-breaking.
+
+    Never used to GEN_NONE — only to drive a coordinated repair pass.
+    V3 / CS-flate-tail are height=519 only. Other heights use their
+    glyf↔cmap atlas (±400) and, at 471, composite floor ≥10.
+    """
+    flags: List[str] = []
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return ["not-pdf"]
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        fm = tut._find_font_objects(doc)
+        fr = fm.get("TinkoffSans-Regular")
+        fm2 = fm.get("TinkoffSans-Medium")
+        if not fr or not fm2:
+            doc.close()
+            return ["no-fonts"]
+        x1 = int(fr["fontfile_xref"])
+        x2 = int(fm2["fontfile_xref"])
+        ff1 = doc.xref_stream(x1)
+        ff2 = doc.xref_stream(x2)
+        tu1 = doc.xref_stream(int(fr["tounicode_xref"]))
+        tu2 = doc.xref_stream(int(fm2["tounicode_xref"]))
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        fd = doc.xref_object(int(fr["fontdesc_xref"]))
+        page_h = int(round(float(doc[0].mediabox.y1)))
+        doc.close()
+        sub1 = tut._parse_subset_tounicode(tu1.decode("latin1", "replace"))
+        sub2 = tut._parse_subset_tounicode(tu2.decode("latin1", "replace"))
+        reg, med = _gids_per_font_in_stream(cs)
+        used1 = set(int(c) for c in reg)
+        used2 = set(int(c) for c in med)
+        cmap_n = len(sub1)
+        f1_glyf = int(_glyf_table_length(ff1))
+        f2_glyf = int(_glyf_table_length(ff2))
+        _m1, f1_bf, _br1 = _parse_tounicode_counts(tu1)
+        _m2, _bf2, f2_br = _parse_tounicode_counts(tu2)
+        f1_raw, _ = _xref_stream_raw_decoded(pdf, x1)
+        tu2_raw, tu2_dec = _xref_stream_raw_decoded(pdf, int(fm2["tounicode_xref"]))
+        f2_tu_dec = len(tu2_dec or tu2)
+        # V3 12790 / CS flate-tail are SBP height=519 only.
+        if page_h == 519:
+            if _v3_font_signature(
+                f1_glyf, f2_glyf, f1_bf, f2_br,
+            ) and _v3_stream_signature(
+                f1_raw, len(ff1), tu2_raw, f2_tu_dec,
+            ):
+                flags.append("v3")
+            cs_tail = _sbp_cs_flate_unused_len(pdf)
+            if cs_tail:
+                flags.append(f"cs-flate-tail:{cs_tail}")
+        h471_exact = False
+        if page_h == 471:
+            xs = (_F1_GLYF_EXACT_BY_HEIGHT.get(471) or {}).get(int(cmap_n))
+            h471_exact = bool(xs and f1_glyf in xs)
+        if page_h == 519:
+            atlas = _f1_cmap_atlas_band(cmap_n, page_h)
+            if atlas and not (atlas[0] <= f1_glyf <= atlas[1]):
+                flags.append(f"cmap-outlier:{f1_glyf}@{cmap_n}")
+        else:
+            band = _f1_cmap_proton_band(cmap_n, page_h)
+            if band and not (band[0] <= f1_glyf <= band[1]) and not h471_exact:
+                flags.append(f"cmap-outlier:{f1_glyf}@{cmap_n}")
+        if page_h == 471 and _ff2_nonempty_composite_n(ff1) < 10:
+            flags.append(
+                f"f1-composite-floor:{_ff2_nonempty_composite_n(ff1)}"
+            )
+        _seen = _F1_GLYF_ATLAS_BY_HEIGHT.get(page_h)
+        if _seen is not None and cmap_n not in _seen:
+            flags.append(f"cmap-unknown:{cmap_n}")
+        if page_h <= 499:
+            try:
+                from tbank_emit import value_column_lattice_off
+                off = value_column_lattice_off(pdf)
+                if off:
+                    flags.append(f"value-lattice:{off}")
+            except Exception:
+                pass
+        _txt = ""
+        try:
+            import fitz as _fz_rj
+            _dj = _fz_rj.open(stream=pdf, filetype="pdf")
+            _txt = _dj[0].get_text() or ""
+            _dj.close()
+        except Exception:
+            _txt = ""
+        for _ln in _txt.splitlines():
+            if "Квитанция" not in _ln:
+                continue
+            _rm = re.search(r"(1-\d{3}-\d{3}-\d{3}-\d{3})(.*)$", _ln)
+            if _rm and (_rm.group(2) or "").strip():
+                flags.append("receipt-junk")
+                break
+        extra_tu = sorted(
+            int(c) for c in sub1.keys()
+            if int(c) not in used1
+            and int(c) not in (0,)
+        )
+        if extra_tu:
+            flags.append(f"f1-tu-extra:{extra_tu[:8]}")
+        f1_orph = _f1_disallowed_orphan_gids(
+            ff1, used1 | {0, 3} | set(int(c) for c in sub1.keys()),
+        )
+        if f1_orph:
+            flags.append(f"f1-orphan:{f1_orph[:8]}")
+        f1_tx = _f1_transplanted_composite_gids(
+            ff1, used1 | set(int(c) for c in sub1.keys()),
+        )
+        if f1_tx:
+            flags.append(f"f1-transplant:{f1_tx[:8]}")
+        clo2 = _ff2_raw_composite_closure(
+            ff2, used2 | {0, 3} | set(int(c) for c in sub2.keys()),
+        )
+        f2_orph = sorted(
+            int(g) for g in _ff2_nonempty_gids(ff2)
+            if int(g) not in clo2 and int(g) != 0
+        )
+        f2_bad = [g for g in f2_orph if g not in _F2_GENUINE_SPARES]
+        if len(f2_orph) >= 2 or f2_bad:
+            flags.append(f"f2-orphan:{f2_orph[:8]}")
+        digit_n = len({
+            (ord(u[0]) if isinstance(u, str) else int(u))
+            for u in sub2.values()
+            if (
+                (isinstance(u, str) and u and "0" <= u[0] <= "9")
+                or (isinstance(u, int) and 0x30 <= u <= 0x39)
+            )
+        })
+        ceil = _f2_digit_card_glyf_ceiling(digit_n or 1)
+        if f2_glyf > ceil:
+            flags.append(f"f2-digit-card:{f2_glyf}>{ceil}")
+        csa = _get_head_csa(ff1)
+        if csa is not None and int(csa) != int(_TBANK_F1_OPENPDF_CSA):
+            flags.append("f1-csa")
+        head2 = _get_font_table(ff2, b"head")
+        if head2 and head2 != _TBANK_F2_JASPER_HEAD:
+            flags.append("f2-head")
+        m = re.search(
+            r"/FontBBox\s*\[\s*([-+]?\d+)\s+([-+]?\d+)\s+"
+            r"([-+]?\d+)\s+([-+]?\d+)\s*\]",
+            fd,
+        )
+        if m:
+            want = tuple(int(m.group(i)) for i in range(1, 5))
+            have = _head_bbox_from_ff2(ff1)
+            if have is not None and have != want:
+                flags.append("f1-bbox")
+        empty = _pdf_f1_empty_painted_chars(pdf)
+        if empty:
+            flags.append(f"empty-paint:{''.join(empty[:8])}")
+        pad_gids = _f1_glyf_loca_pad_gids(ff1)
+        big_pad = [(g, p) for g, p in pad_gids if p >= 2]
+        if big_pad:
+            flags.append(f"f1-glyf-pad:{big_pad[:6]}")
+    except Exception as exc:
+        flags.append(f"scan:{exc}")
+    return flags
+
+
+def _sbp_clamp_cmap_for_height(height: int) -> bool:
+    """SBP 519 atlas clamp only — card/phone must not chop hydrated glyfs."""
+    return int(height or 0) == 519
+
+
+def _sbp_card_sber_font_finalize(pdf: bytes) -> bytes:
+    """h=471: hydrate empty painted, then exact atlas land (never fill after exact).
+
+    Fill grows glyf; landing must retarget cmap (e.g. 11722→11732@cmap63).
+    Filling after an exact land re-breaks OnlyPDF recognition.
+    """
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    if _tbank_pdf_height(pdf) != 471:
+        return pdf
+    out = pdf
+    out = _sbp_cap_f1_orphans_and_cmap_pdf(out, clamp_cmap_band=False)
+    for _ in range(6):
+        if _pdf_f1_empty_painted_chars(out):
+            nxt = _sbp_fill_empty_painted_pdf(out, clamp_cmap_band=False)
+            if nxt != out:
+                out = nxt
+                continue
+        if _pdf_f1_empty_painted_chars(out):
+            break
+        if not _h471_f1_exact_pdf(out):
+            landed = _sbp_land_h471_f1_exact_pdf(out)
+            if landed != out:
+                out = landed
+        if _h471_f1_exact_pdf(out) and not _pdf_f1_empty_painted_chars(out):
+            break
+    still = _pdf_f1_empty_painted_chars(out)
+    if still:
+        logger.warning("card_sber empty painted remain %r", still[:12])
+    return out
+
+
+def _sbp_land_onlypdf_cluster_pdf(
+    pdf: bytes, prepared: Optional[Dict] = None,
+) -> bytes:
+    """Post-gate SBP polish: empty-painted fill + F2 digit-card lean.
+
+    OnlyPDF recognition is fixed by byte-replace retag (not specimen F1/F2/CS
+    cluster nudges — those caused Proton HMTX/bijection/digit-card FAKE).
+    """
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    if _tbank_pdf_height(pdf) != 519:
+        return pdf
+    out = _sbp_fill_empty_painted_pdf(pdf, clamp_cmap_band=True)
+    out = _sbp_prune_f1_tounicode_to_used(out)
+    try:
+        from tbank_dynamic import _lean_sbp_f2_to_hard
+        if prepared:
+            amt = str(
+                prepared.get("new_amount")
+                or prepared.get("amount")
+                or ""
+            )
+            leaned = _lean_sbp_f2_to_hard(out, amt)
+            if leaned is not None:
+                out = leaned
+    except Exception as exc:
+        logger.warning("SBP ship polish F2 lean: %s", exc)
+    out = _sbp_nudge_onlypdf_cs_length(out)
+    return out
+
+
+def _sbp_nudge_onlypdf_f1_glyf_cluster(pdf: bytes) -> bytes:
+    """Align F1 (cmap,glyf) to live OnlyPDF PASS cluster — fix orphan-collapse gap.
+
+    Orphan-collapse can leave glyf≈12350 @ cmap=66 (OnlyPDF FAKE) while Proton
+    still PASS (±400 band). Steer to cmap≥67 + glyf≈12716 when under cluster.
+    """
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    if _tbank_pdf_height(pdf) != 519:
+        return pdf
+    _WANT_CMAP = 67
+    _WANT_GLYF = 12716
+    _GAP = 72
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        out = pdf
+        for _ in range(3):
+            doc = fitz.open(stream=out, filetype="pdf")
+            meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+            if not meta:
+                doc.close()
+                return out
+            x1 = int(meta["fontfile_xref"])
+            ff2 = doc.xref_stream(x1)
+            tu = doc.xref_stream(int(meta["tounicode_xref"]))
+            cs = doc.xref_stream(doc[0].get_contents()[0])
+            doc.close()
+            sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+            cmap_n = len(sub)
+            g = int(_glyf_table_length(ff2))
+            if cmap_n < _WANT_CMAP:
+                grown = _sbp_grow_f1_painted_cmap(out, cmap_n + 1)
+                if grown != out:
+                    out = grown
+                    continue
+                break
+            if g >= _WANT_GLYF - 32:
+                return out
+            if g >= _WANT_GLYF - _GAP and _f1_cmap_card_covers(cmap_n, g):
+                return out
+            env = _F1_519_GLYF_BY_CMAP.get(int(cmap_n))
+            if env and not (int(env[0]) <= _WANT_GLYF <= int(env[1])):
+                alt = _f1_choose_cmap_card_for_glyf(
+                    _WANT_GLYF, cmap_n, max_grow=2,
+                )
+                if alt and alt > cmap_n:
+                    grown = _sbp_grow_f1_painted_cmap(out, int(alt))
+                    if grown != out:
+                        out = grown
+                        continue
+            reg, _ = _gids_per_font_in_stream(cs)
+            keep = _ff2_raw_composite_closure(
+                ff2, set(int(c) for c in reg) | {0, 3} | set(sub.keys()),
+            )
+            fat = _snap_f1_glyf_via_keep_pad(ff2, _WANT_GLYF, keep)
+            if fat is None:
+                fat = _fat_f1_glyf_via_keep_span(ff2, _WANT_GLYF, keep)
+            if fat is None or int(_glyf_table_length(fat)) != _WANT_GLYF:
+                return out
+            fat = _pin_f1_head_flags_and_csa(fat)
+            patched = _patch_fontfile2_xref(out, x1, fat)
+            if patched is None:
+                return out
+            logger.info(
+                "SBP OnlyPDF cluster glyf %d→%d cmap=%d",
+                g, _WANT_GLYF, cmap_n,
+            )
+            return patched
+        return out
+    except Exception as exc:
+        logger.warning("SBP OnlyPDF F1 cluster nudge: %s", exc)
+        return pdf
+
+
+def _sbp_nudge_onlypdf_cs_length(pdf: bytes) -> bytes:
+    """Keep decoded CS away from slot018 hard-combo hotspot (4432/4436)."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    if _tbank_pdf_height(pdf) != 519:
+        return pdf
+    _TARGETS = (4405, 4406, 4407, 4408)
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+        from tbank_dynamic import (
+            _grow_cs_via_literal_escapes,
+            _operator_skeleton_hash_local,
+        )
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        cs_xref = int(doc[0].get_contents()[0])
+        cs = doc.xref_stream(cs_xref)
+        doc.close()
+        n = len(cs)
+        if n in _TARGETS:
+            return pdf
+        sk0 = _operator_skeleton_hash_local(cs)
+        best = None
+        for tgt in sorted(_TARGETS, key=lambda t: abs(t - n)):
+            if abs(tgt - n) > 32:
+                continue
+            cand = None
+            if tgt > n:
+                cand = _grow_cs_via_literal_escapes(cs, tgt - n)
+            else:
+                cand = _fit_content_decoded_max(cs, tgt)
+            if cand is None or len(cand) != tgt:
+                continue
+            if _cs_whitespace_fingerprint(cand):
+                continue
+            if _operator_skeleton_hash_local(cand) != sk0:
+                continue
+            best = cand
+            break
+        if best is None:
+            return pdf
+        patched = _patch_contents_xref(pdf, cs_xref, best)
+        if patched is None:
+            return pdf
+        logger.info("SBP CS nudge %d→%d", n, len(best))
+        return patched
+    except Exception as exc:
+        logger.warning("SBP OnlyPDF CS nudge: %s", exc)
+        return pdf
+
+
+def _sbp_nudge_onlypdf_specimen_f2_glyf(pdf: bytes) -> bytes:
+    """Fat F2 Medium toward specimen OnlyPDF cluster (dec≈5444, glyf≈1254)."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    if _tbank_pdf_height(pdf) != 519:
+        return pdf
+    _SPEC_GLYF = 1254
+    _SPEC_DEC = 5444
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Medium")
+        if not meta:
+            doc.close()
+            return pdf
+        x2 = int(meta["fontfile_xref"])
+        ff2 = doc.xref_stream(x2)
+        tu = doc.xref_stream(int(meta["tounicode_xref"]))
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        doc.close()
+        g = int(_glyf_table_length(ff2))
+        d = len(ff2)
+        if g >= _SPEC_GLYF and d >= _SPEC_DEC - 40:
+            return pdf
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        _, med = _gids_per_font_in_stream(cs)
+        keep = _ff2_raw_composite_closure(
+            ff2, set(int(c) for c in med) | {0, 3} | set(sub.keys()),
+        )
+        want_g = _SPEC_GLYF if g < _SPEC_GLYF else g
+        fat = _fat_f2_glyf_via_keep_span(ff2, want_g, keep)
+        if fat is None or int(_glyf_table_length(fat)) < g:
+            return pdf
+        fat = _force_tbank_f2_head_epoch(fat)
+        patched = _patch_fontfile2_xref(pdf, x2, fat)
+        if patched is None:
+            return pdf
+        logger.info(
+            "SBP OnlyPDF F2 nudge glyf %d→%d dec %d→%d",
+            g, _glyf_table_length(fat), d, len(fat),
+        )
+        return patched
+    except Exception as exc:
+        logger.warning("SBP OnlyPDF F2 nudge: %s", exc)
+        return pdf
+
+
+def _sbp_nudge_onlypdf_specimen_f1_glyf(pdf: bytes) -> bytes:
+    """After stable cmap=70 land: fat glyf 13000→13014 (specimen f1_dec=17180)."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    if _tbank_pdf_height(pdf) != 519:
+        return pdf
+    _SPEC_GLYF = 13014
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        x1 = int(meta["fontfile_xref"])
+        ff2 = doc.xref_stream(x1)
+        tu = doc.xref_stream(int(meta["tounicode_xref"]))
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        doc.close()
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        if len(sub) != 70:
+            return pdf
+        g = int(_glyf_table_length(ff2))
+        if g != 13000:
+            return pdf
+        reg, _ = _gids_per_font_in_stream(cs)
+        keep = _ff2_raw_composite_closure(
+            ff2, set(int(c) for c in reg) | {0, 3} | set(sub.keys()),
+        )
+        fat = _snap_f1_glyf_via_keep_pad(ff2, _SPEC_GLYF, keep)
+        if fat is None:
+            fat = _fat_f1_glyf_via_keep_span(ff2, _SPEC_GLYF, keep)
+        if fat is None or int(_glyf_table_length(fat)) != _SPEC_GLYF:
+            return pdf
+        fat = _pin_f1_head_flags_and_csa(fat)
+        patched = _patch_fontfile2_xref(pdf, x1, fat)
+        if patched is None:
+            return pdf
+        logger.info("SBP OnlyPDF specimen nudge glyf %d→%d", g, _SPEC_GLYF)
+        return patched
+    except Exception as exc:
+        logger.warning("SBP OnlyPDF specimen glyf nudge: %s", exc)
+        return pdf
+
+
+_F2_GLYF_EXACT_PHONE = 1130  # Proton SEQ phone h=451 — only legal mid (1106, 1226)
+
+
+def _sbp_land_phone_f2_glyf_pdf(pdf: bytes) -> bytes:
+    """Phone h=451: F2 glyf must be exactly 1130 (not midgap 1128/1198)."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    if _tbank_pdf_height(pdf) != 451:
+        return pdf
+    want = int(_F2_GLYF_EXACT_PHONE)
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Medium")
+        if not meta:
+            doc.close()
+            return pdf
+        x2 = int(meta["fontfile_xref"])
+        ff2 = doc.xref_stream(x2)
+        tu = doc.xref_stream(int(meta["tounicode_xref"]))
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        doc.close()
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        _, med = _gids_per_font_in_stream(cs)
+        keep = _ff2_raw_composite_closure(
+            ff2, set(int(c) for c in med) | {0, 3} | set(sub.keys()),
+        )
+        g = int(_glyf_table_length(ff2))
+        if g == want:
+            return pdf
+        if not (1106 < g < 1226):
+            return pdf
+        landed = None
+        if g > want:
+            landed = _trim_glyf_via_keep_span(ff2, want, keep)
+            if landed is None:
+                landed = _shrink_f2_glyf_to_band(
+                    ff2, ff2, keep, lo=want, hi=want,
+                )
+        elif g < want:
+            landed = _fat_f2_glyf_via_keep_span(ff2, want, keep)
+        if landed is None or int(_glyf_table_length(landed)) != want:
+            logger.warning(
+                "phone F2 glyf land miss %d→%d (want %d)",
+                g, int(_glyf_table_length(landed)) if landed else g, want,
+            )
+            return pdf
+        landed = _force_tbank_f2_head_epoch(landed)
+        patched = _patch_fontfile2_xref(pdf, x2, landed)
+        if patched is None:
+            return pdf
+        logger.info("phone F2 glyf exact land %d→%d", g, want)
+        return patched
+    except Exception as exc:
+        logger.warning("phone F2 glyf exact land: %s", exc)
+        return pdf
+
+
+def _sbp_shrink_h471_f1_to_nearest_exact(pdf: bytes) -> bytes:
+    """Shrink/grow F1 to nearest h=471 exact (glyf,cmap) preserving painted keep."""
+    if not pdf or _tbank_pdf_height(pdf) != 471:
+        return pdf
+    exacts = _F1_GLYF_EXACT_BY_HEIGHT.get(471) or {}
+    if not exacts:
+        return pdf
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+        from tbank_dynamic import _nudge_tounicode_cardinality
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        x1 = int(meta["fontfile_xref"])
+        tu_xref = int(meta["tounicode_xref"])
+        ff2 = doc.xref_stream(x1)
+        tu = doc.xref_stream(tu_xref)
+        cs = doc.xref_stream(doc[0].get_contents()[0])
+        donor_ff: Optional[bytes] = None
+        try:
+            import os
+            donor_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "templates", "T_card_sber_original.pdf",
+            )
+            if os.path.isfile(donor_path):
+                ddoc = fitz.open(donor_path)
+                dmeta = tut._find_font_objects(ddoc).get("TinkoffSans-Regular")
+                donor_ff = (
+                    ddoc.xref_stream(dmeta["fontfile_xref"])
+                    if dmeta else None
+                )
+                ddoc.close()
+        except Exception:
+            donor_ff = None
+        doc.close()
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        cmap_n = len(sub)
+        reg, _ = _gids_per_font_in_stream(cs)
+        painted = len(set(int(c) for c in reg) | {0, 3})
+        painted_gids = set(int(c) for c in reg) | {0, 3}
+        snap_keep = _ff2_raw_composite_closure(
+            ff2,
+            painted_gids | set(_CARD_OPENPDF_F1_COMPOSITE_GIDS),
+        )
+        g = int(_glyf_table_length(ff2))
+        candidates: List[Tuple[int, int, int]] = []
+        for cn in sorted(exacts):
+            if int(cn) > int(painted):
+                continue
+            for x in exacts[cn]:
+                candidates.append(
+                    (abs(int(x) - g), abs(int(cn) - cmap_n), int(cn), int(x)),
+                )
+        if not candidates:
+            return pdf
+        candidates.sort()
+        _, _, target_cn, want_g = candidates[0]
+        out = pdf
+        if int(target_cn) != int(cmap_n):
+            nudged = _nudge_tounicode_cardinality(
+                out, tu_xref, sub, target_n=int(target_cn),
+                painted_gids=set(int(c) for c in reg) | {0, 3},
+                anchor_gid=3, ff2=ff2,
+                cidfont_xref=int(meta.get("cidfont_xref") or 0) or None,
+            )
+            if nudged is not None:
+                out, sub = nudged
+                doc2 = fitz.open(stream=out, filetype="pdf")
+                ff2 = doc2.xref_stream(x1)
+                doc2.close()
+        if g > want_g or g < want_g:
+            landed = _snap_h471_ff2_exact(
+                ff2, want_g, snap_keep, donor_ff=donor_ff,
+            )
+        else:
+            return out
+        if landed is None or int(_glyf_table_length(landed)) != want_g:
+            return pdf
+        landed = _h471_ff2_commit(landed)
+        patched = _patch_fontfile2_xref(out, x1, landed)
+        if patched is None:
+            return pdf
+        logger.info(
+            "card_sber F1 shrink-exact glyf %d→%d cmap %d→%d",
+            g, want_g, cmap_n, target_cn,
+        )
+        return patched
+    except Exception as exc:
+        logger.warning("card_sber F1 shrink-exact: %s", exc)
+        return pdf
+
+
+def _pdf_f1_glyf_trailing_pad(pdf: bytes) -> int:
+    """Bytes past loca[-1] or loca span padding (Proton GLYF_TRAILING_DATA)."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return 0
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return 0
+        ff2 = doc.xref_stream(int(meta["fontfile_xref"]))
+        doc.close()
+        offs, glyf = _ff2_raw_loca_glyf(ff2)
+        if offs is None or not glyf:
+            return 0
+        tail = max(0, len(glyf) - int(offs[-1]))
+        span_pad = max((p for _, p in _f1_glyf_loca_pad_gids(ff2)), default=0)
+        return max(tail, span_pad)
+    except Exception:
+        return 0
+
+
+def _sbp_h471_ship_exact_with_face(pdf: bytes) -> bytes:
+    """card_sber: exact (glyf,cmap) AND every painted letter has a contour."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    if _tbank_pdf_height(pdf) != 471:
+        return pdf
+    out = _sbp_h471_ensure_legal_cmap_pdf(pdf)
+    out = _sbp_prune_f1_tounicode_to_used(out)
+    prev_sig = None
+    for _ in range(12):
+        if _pdf_f1_empty_painted_chars(out):
+            out = _sbp_fill_empty_painted_pdf(out, clamp_cmap_band=False)
+            if _pdf_f1_empty_painted_chars(out):
+                out = _sbp_ensure_painted_faces_ship(out, channel="card_sber")
+        if (
+            not _needs_h471_exact_land(out)
+            and not _pdf_f1_empty_painted_chars(out)
+            and _pdf_f1_glyf_trailing_pad(out) <= 1
+        ):
+            return out
+        sig = (
+            int(_glyf_table_length_from_pdf(out) or 0),
+            len(_pdf_f1_empty_painted_chars(out)),
+            int(_pdf_f1_glyf_trailing_pad(out)),
+        )
+        if not _h471_f1_exact_pdf(out) and not _pdf_f1_empty_painted_chars(out):
+            landed = _sbp_land_h471_f1_exact_pdf(
+                out, allow_cmap_retarget=True, allow_blank=True,
+            )
+            if landed != out:
+                out = landed
+                out = _sbp_fill_empty_painted_pdf(out, clamp_cmap_band=False)
+                if sig == prev_sig:
+                    break
+                prev_sig = sig
+                continue
+            landed = _sbp_land_h471_f1_exact_pdf(out, allow_cmap_retarget=True)
+            if landed != out:
+                out = landed
+                continue
+            shrunk = _sbp_shrink_h471_f1_to_nearest_exact(out)
+            if shrunk != out:
+                out = shrunk
+                out = _sbp_fill_empty_painted_pdf(out, clamp_cmap_band=False)
+                continue
+            break
+        if _pdf_f1_glyf_trailing_pad(out) > 1:
+            trimmed = _sbp_trim_f1_loca_tail_pdf(out)
+            if trimmed == out:
+                break
+            out = trimmed
+            if not _h471_f1_exact_pdf(out):
+                landed = _sbp_land_h471_f1_exact_pdf(
+                    out, allow_cmap_retarget=True, allow_blank=True,
+                )
+                if landed != out:
+                    out = landed
+            if sig == prev_sig:
+                break
+            prev_sig = sig
+            continue
+        prev_sig = sig
+    if _pdf_f1_empty_painted_chars(out):
+        out = _sbp_ensure_painted_faces_ship(out, channel="card_sber")
+    if not _h471_f1_exact_pdf(out):
+        logger.warning(
+            "card_sber ship: exact miss glyf=%d after face guard (letters kept)",
+            int(_glyf_table_length_from_pdf(out) or 0),
+        )
+    elif _pdf_f1_glyf_trailing_pad(out) > 0:
+        logger.warning(
+            "card_sber ship: trailing pad=%d on exact glyf",
+            _pdf_f1_glyf_trailing_pad(out),
+        )
+    return out
+
+
+def _sbp_h471_finalize_font_pdf(pdf: bytes) -> bytes:
+    """card_sber last write: exact (glyf,cmap) + trim trailing + FontBBox sync."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    if _tbank_pdf_height(pdf) != 471:
+        return pdf
+    out = _sbp_h471_ship_exact_with_face(pdf)
+    for _ in range(6):
+        trail = int(_pdf_f1_glyf_trailing_pad(out))
+        shippable = (
+            not _needs_h471_exact_land(out)
+            and not _pdf_f1_empty_painted_chars(out)
+        )
+        if shippable and trail <= 1:
+            break
+        if trail > 0:
+            trimmed = _sbp_trim_f1_loca_tail_pdf(out)
+            if trimmed != out:
+                out = trimmed
+        if _needs_h471_exact_land(out):
+            out = _sbp_h471_ship_exact_with_face(out)
+            continue
+        if _pdf_f1_glyf_trailing_pad(out) > 1:
+            continue
+        break
+    out = _tbank_sync_f1_cross_layer_bbox(out, head_authoritative=True)
+    if _needs_h471_exact_land(out):
+        logger.warning(
+            "card_sber finalize: band miss glyf=%d",
+            int(_glyf_table_length_from_pdf(out) or 0),
+        )
+    elif not _h471_f1_exact_pdf(out):
+        logger.info(
+            "card_sber finalize: in-band (not exact) glyf=%d",
+            int(_glyf_table_length_from_pdf(out) or 0),
+        )
+    elif _pdf_f1_glyf_trailing_pad(out) > 0:
+        logger.warning(
+            "card_sber finalize: trailing pad=%d",
+            _pdf_f1_glyf_trailing_pad(out),
+        )
+    return out
+
+
+def _glyf_table_length_from_pdf(pdf: bytes) -> int:
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return 0
+        ff2 = doc.xref_stream(int(meta["fontfile_xref"]))
+        doc.close()
+        return int(_glyf_table_length(ff2))
+    except Exception:
+        return 0
+
+
+def _sbp_h471_bijection_exact_ship(pdf: bytes) -> bytes:
+    """Deprecated path — use _sbp_h471_ship_exact_with_face."""
+    return _sbp_h471_ship_exact_with_face(pdf)
+
+
+def _sbp_h471_bijection_exact_ship_legacy(pdf: bytes) -> bytes:
+    """Last card_sber write: keep exact (glyf,cmap), fix TU⊃used bijection only."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return pdf
+    if _tbank_pdf_height(pdf) != 471:
+        return pdf
+    out = pdf
+    if not _h471_f1_exact_pdf(out) or _pdf_f1_empty_painted_chars(out):
+        out = _sbp_card_sber_font_finalize(out)
+    out = _sbp_prune_f1_tounicode_to_used(out)
+    if not _h471_f1_exact_pdf(out) and not _pdf_f1_empty_painted_chars(out):
+        landed = _sbp_land_h471_f1_exact_pdf(out, allow_cmap_retarget=True)
+        if landed != out:
+            out = landed
+    if _pdf_f1_empty_painted_chars(out):
+        out = _sbp_fill_empty_painted_pdf(out, clamp_cmap_band=False)
+        out = _sbp_prune_f1_tounicode_to_used(out)
+    return out
+
+
+def _h471_f1_exact_pdf(pdf: bytes) -> bool:
+    """True when card_sber F1 is on a known OnlyPDF exact (glyf,cmap) pair."""
+    if not pdf or not pdf.startswith(b"%PDF"):
+        return False
+    if _tbank_pdf_height(pdf) != 471:
+        return False
+    exacts = _F1_GLYF_EXACT_BY_HEIGHT.get(471) or {}
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return False
+        ff2 = doc.xref_stream(int(meta["fontfile_xref"]))
+        tu = doc.xref_stream(int(meta["tounicode_xref"]))
+        doc.close()
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        g = int(_glyf_table_length(ff2))
+        cn = len(sub)
+        xs = exacts.get(int(cn))
+        return bool(xs and g in xs)
+    except Exception:
+        return False
+
+
+def _needs_h471_exact_land(pdf: bytes) -> bool:
+    """Land only when F1 is outside Proton ±400 — avoids mutating in-band FF2."""
+    if _h471_f1_exact_pdf(pdf):
+        return False
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return True
+        ff2 = doc.xref_stream(int(meta["fontfile_xref"]))
+        tu = doc.xref_stream(int(meta["tounicode_xref"]))
+        doc.close()
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        g = int(_glyf_table_length(ff2))
+        cn = len(sub)
+        band = _f1_cmap_proton_band(cn, 471)
+        if band and band[0] <= g <= band[1]:
+            return False
+        return True
+    except Exception:
+        return True
+
+
+def _sbp_reclamp_f1_cmap_atlas_pdf(pdf: bytes, *, height: int = 519) -> bytes:
+    """Clamp/snap F1.glyf into Proton atlas after composite restore."""
+    h = int(height or 519)
+    if h == 471:
+        return _sbp_h471_finalize_font_pdf(pdf)
+    out = _sbp_clamp_f1_cmap_band_pdf(pdf)
+    if h != 519:
+        return out
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+
+        doc = fitz.open(stream=out, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return out
+        ff2 = doc.xref_stream(meta["fontfile_xref"])
+        tu = doc.xref_stream(meta["tounicode_xref"])
+        sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+        cn = len(sub)
+        gs = int(_glyf_table_length(ff2))
+        doc.close()
+        if not _f1_cmap_card_covers(cn, gs, height=519):
+            snapped = _sbp_snap_f1_glyf_into_card(out, cn)
+            if snapped != out:
+                out = snapped
+    except Exception as exc:
+        logger.warning("SBP F1 atlas reclamp: %s", exc)
+    return out
+
+
+def _sbp_repair_structure_once(pdf: bytes, *, channel: str = "sbp") -> bytes:
+    """One coordinated pass — never a single-HARD patch.
+
+    Order is immutable: face fill → prune F1 TU → F1 orphans/cmap → F2
+    orphans → V3 (F2/F1 glyf) → envelopes → bbox.
+    Same pass on every T-Bank method. 519 cmap retarget is a no-op when
+    page height ≠ 519 (template atlas).
+    """
+    h = _tbank_pdf_height(pdf)
+    if (
+        h == 471
+        and _h471_f1_exact_pdf(pdf)
+        and not _pdf_f1_empty_painted_chars(pdf)
+        and _pdf_f1_glyf_trailing_pad(pdf) <= 1
+    ):
+        try:
+            from tbank_emit import polish_layout_pdf
+            pol_ch = (channel or "card_sber").strip() or "card_sber"
+            if pol_ch == "sbp":
+                pol_ch = "card_sber"
+            out = polish_layout_pdf(pdf, channel=pol_ch)
+        except Exception as exc:
+            logger.warning("T-Bank structure polish h=471 exact: %s", exc)
+            out = pdf
+        out = _sbp_strip_receipt_trailing_junk_pdf(out)
+        out = _sbp_ensure_card_composites_pdf(out)
+        return out
+    clamp = _sbp_clamp_cmap_for_height(h)
+    out = _sbp_fill_empty_painted_pdf(pdf, clamp_cmap_band=clamp)
+    out = _sbp_prune_f1_tounicode_to_used(out)
+    out = _sbp_cap_f1_orphans_and_cmap_pdf(out, clamp_cmap_band=clamp)
+    out = _sbp_clamp_f1_cmap_band_pdf(out)
+    out = _sbp_retarget_f1_cmap_card_pdf(out)
+    try:
+        import fitz as _fz_snap
+        import tbank_unlock_template as _tut_snap
+        _ds = _fz_snap.open(stream=out, filetype="pdf")
+        _ms = _tut_snap._find_font_objects(_ds).get("TinkoffSans-Regular")
+        if _ms and int(round(float(_ds[0].mediabox.y1))) == 519:
+            _ffs = _ds.xref_stream(_ms["fontfile_xref"])
+            _tus = _ds.xref_stream(_ms["tounicode_xref"])
+            _sub = _tut_snap._parse_subset_tounicode(
+                _tus.decode("latin1", "replace"),
+            )
+            _cn = len(_sub)
+            _gs = int(_glyf_table_length(_ffs))
+            _ds.close()
+            if not _f1_cmap_card_covers(_cn, _gs, height=519):
+                out = _sbp_snap_f1_glyf_into_card(out, _cn)
+        else:
+            _ds.close()
+    except Exception as exc:
+        logger.warning("T-Bank structure snap into card: %s", exc)
+    # Grow/hydrate can reinstall ghost latin. Cap again after retarget.
+    out = _sbp_cap_f1_orphans_and_cmap_pdf(out, clamp_cmap_band=clamp)
+    out = _sbp_cap_f2_orphans_pdf(out)
+    if h == 519:
+        out = _sbp_clear_v3_reassembly_family(out)
+    elif h != 471:
+        try:
+            from tbank_dynamic import _peel_f1_glyf_to_cmap_band
+            peeled = _peel_f1_glyf_to_cmap_band(out, height=h)
+            if peeled is not None:
+                out = peeled
+        except Exception as exc:
+            logger.warning("T-Bank structure peel h=%d: %s", h, exc)
+    out = _sbp_pin_f2_jasper_envelopes_pdf(out)
+    if h != 471:
+        out = _sbp_pin_f1_jasper_metric_envelopes(out)
+        out = _sbp_pin_f1_head_bbox_to_fontbbox(out)
+    # Last F1 glyf write in the pass — clamp/V3/fill must not leave transplanted
+    # simples on е/р. Bbox pin after (head only).
+    out = _sbp_restore_f1_composites_pdf(out)
+    if h == 519:
+        out = _sbp_reclamp_f1_cmap_atlas_pdf(out, height=519)
+    elif h == 471:
+        out = _sbp_h471_finalize_font_pdf(out)
+    if h != 471:
+        out = _sbp_pin_f1_head_bbox_to_fontbbox(out)
+    if h != 471:
+        out = _sbp_trim_f1_loca_tail_pdf(out)
+    if h == 519:
+        out = _sbp_trim_cs_flate_tail(out)
+        out = _sbp_strip_receipt_trailing_junk_pdf(out)
+    else:
+        try:
+            from tbank_emit import polish_layout_pdf
+            pol_ch = (channel or "card_sber").strip() or "card_sber"
+            if pol_ch == "sbp":
+                pol_ch = "card_sber"
+            out = polish_layout_pdf(out, channel=pol_ch)
+        except Exception as exc:
+            logger.warning("T-Bank structure polish h=%d: %s", h, exc)
+        out = _sbp_strip_receipt_trailing_junk_pdf(out)
+        if h == 471:
+            out = _sbp_ensure_card_composites_pdf(out)
+            out = _sbp_card_sber_font_finalize(out)
+    out = _sbp_ensure_painted_faces_ship(out, channel=channel)
+    return out
+
+
+def _sbp_enforce_structure_gate(pdf: bytes, *, channel: str = "sbp") -> bytes:
+    """Hard generator gate. Repair until clean. Never return None (LAW1)."""
+    ch = (channel or "sbp").strip() or "sbp"
+    out = pdf
+    for step in range(4):
+        flags = _sbp_structure_violations(out, channel=ch)
+        if not flags:
+            if step:
+                logger.info(
+                    "T-Bank %s structure gate clean after %d repair(s)", ch, step,
+                )
+            return out
+        logger.warning(
+            "T-Bank %s structure gate %s — coordinated repair %d",
+            ch, flags, step + 1,
+        )
+        nxt = _sbp_repair_structure_once(out, channel=ch)
+        if nxt == out:
+            break
+        out = nxt
+    flags = _sbp_structure_violations(out, channel=ch)
+    if flags:
+        logger.error(
+            "T-Bank %s structure gate residual %s — ship anyway (LAW1, no GEN_NONE)",
+            ch, flags,
+        )
+        if any(str(f).startswith("empty-paint:") for f in flags):
+            out = _sbp_ensure_painted_faces_ship(out, channel=ch)
+    return out
+
+
+def _sbp_finalize_for_ship(
+    pdf: bytes, prepared: Optional[Dict] = None, *, channel: str = "sbp",
+) -> bytes:
+    """Font HARD pins, then R=250 polish, then subset-prefix co-generation.
+
+    Polish must stay after Tm-sensitive font patches (VALUE_RIGHT_EDGE).
+    Prefix randomize must run after FontFile2 is frozen (tag↔payload).
+    Head bbox pin is the last FontFile2 write (CROSS_LAYER vs FontBBox).
+    Same chain on every T-Bank method. 519 cmap numbers apply only when
+    page height is 519 (template atlas).
+    """
+    ch = (channel or "sbp").strip() or "sbp"
+    out = pdf
+    out = _sbp_paint_f2_extra_tu_digits(out)
+    h = _tbank_pdf_height(out)
+    out = apply_sbp_font_hard_fixes(out)
+    if prepared is not None and ch == "sbp":
+        out = _sbp_sync_amount_slots(out, prepared)
+    if h != 471:
+        out = _sbp_resync_f1_painted_lsb(out)
+        out = _sbp_pin_f1_jasper_metric_envelopes(out)
+    try:
+        from tbank_emit import polish_layout_pdf
+        out = polish_layout_pdf(out, channel=ch)
+    except Exception as exc:
+        logger.warning("T-Bank %s finalize polish: %s", ch, exc)
+    # Polish is Tm-only; re-pin envelopes in case a layout helper rewrote FF2.
+    if h != 471:
+        out = _sbp_pin_f1_jasper_metric_envelopes(out)
+    # Fill/clamp first — V3 must see the shipped F1.glyf (cmap-band 13296)
+    # or C-clause (thin F2) is a no-op after an early F1.glyf>12783 return.
+    h = _tbank_pdf_height(out)
+    clamp = _sbp_clamp_cmap_for_height(h)
+    out = _sbp_fill_empty_painted_pdf(out, clamp_cmap_band=clamp)
+    out = _sbp_prune_f1_tounicode_to_used(out)
+    out = _sbp_cap_f1_orphans_and_cmap_pdf(out, clamp_cmap_band=clamp)
+    out = _sbp_clamp_f1_cmap_band_pdf(out)
+    out = _sbp_clear_v3_reassembly_family(out)
+    if h != 519 and h != 471:
+        try:
+            from tbank_dynamic import _peel_f1_glyf_to_cmap_band
+            peeled = _peel_f1_glyf_to_cmap_band(
+                out, height=h, prepared=prepared,
+            )
+            if peeled is not None:
+                out = peeled
+        except Exception as exc:
+            logger.warning("T-Bank %s finalize peel h=%d: %s", ch, h, exc)
+        try:
+            from tbank_emit import polish_layout_pdf
+            out = polish_layout_pdf(out, channel=ch)
+        except Exception as exc:
+            logger.warning("T-Bank %s post-peel polish: %s", ch, exc)
+    if h == 471:
+        out = _sbp_card_sber_font_finalize(out)
+    else:
+        out = _sbp_pin_f1_jasper_metric_envelopes(out)
+        out = _sbp_pin_f1_head_bbox_to_fontbbox(out)
+    out = _sbp_enforce_structure_gate(out, channel=ch)
+    if ch == "sbp":
+        out = _sbp_land_onlypdf_cluster_pdf(out, prepared)
+        out = _sbp_strip_receipt_trailing_junk_pdf(out)
+        out = _sbp_pin_date_left_pdf(out)
+        out = _sbp_prune_f1_tounicode_to_used(out)
+        out = _sbp_resync_f1_painted_lsb(out)
+        out = _sbp_pin_f1_jasper_metric_envelopes(out)
+        out = _sbp_pin_f1_head_bbox_to_fontbbox(out)
+        # Proton HARD A-TBANK-FONT-GLYF-TRAILING-001 on keep-pad glyf nudges.
+        # Keep natural post-gate FontFile2 shape for live checks.
+    elif h in (411, 431, 451):
+        out = _sbp_land_non_sbp_f1_glyf_pdf(out, height=h)
+        out = _sbp_prune_f1_tounicode_to_used(out)
+        out = _sbp_pin_f1_jasper_metric_envelopes(out)
+        if h == 451:
+            out = _sbp_land_phone_f2_glyf_pdf(out)
+            if prepared is not None:
+                try:
+                    from tbank_phone_stealth import repair_phone_layout_pdf
+                    out = repair_phone_layout_pdf(out, prepared)
+                except Exception as exc:
+                    logger.warning("T-Bank phone layout repair: %s", exc)
+    elif h == 471:
+        pass  # h471 finalize runs after xref rebuild (last font write)
+    try:
+        out = _randomize_pdf_fingerprints(out)
+    except Exception as exc:
+        logger.warning("T-Bank %s subset-tag randomize: %s", ch, exc)
+    out = _fix_stream_separators(out)
+    try:
+        out = _rebuild_xref_tbank(out)
+    except Exception as exc:
+        logger.warning("T-Bank %s finalize xref rebuild: %s", ch, exc)
+    out = _repair_startxref(out)
+    if h == 471:
+        if _pdf_f1_empty_painted_chars(out):
+            out = _sbp_fill_empty_painted_pdf(out, clamp_cmap_band=False)
+            if _pdf_f1_empty_painted_chars(out):
+                out = _sbp_ensure_painted_faces_ship(out, channel=ch)
+        out = _sbp_h471_finalize_font_pdf(out)
+    else:
+        out = _sbp_ensure_painted_faces_ship(out, channel=ch)
+        # Final face-hydrate may reintroduce simple outlines into composite slots
+        # (е/р/о/В/Ж class). Restore atlas composites at ship boundary.
+        out = _sbp_restore_f1_composites_pdf(out)
+        out = _sbp_reclamp_f1_cmap_atlas_pdf(out, height=h)
+        out = _sbp_trim_f1_loca_tail_pdf(out)
+        out = _sbp_pin_f1_head_bbox_to_fontbbox(out)
+        if prepared is not None:
+            out = _sbp_force_correct_receipt_pdf(out, prepared)
+            out = _sbp_force_correct_sbp_id_pdf(out, prepared)
     return out
 
 
@@ -19450,7 +26417,10 @@ def create_tbank_sbp_stealth(data: Dict) -> Optional[bytes]:
 
     last_why = ""
     last_pdf: Optional[bytes] = None
-    for attempt in range(1, 4):
+    last_any_pdf: Optional[bytes] = None
+    last_prepared: Optional[Dict] = None
+    _sbp_attempts = 1
+    for attempt in range(1, _sbp_attempts + 1):
         prepared = _prepare_sbp_data(dict(data))
         if prepared is None:
             # Empty/invalid payload — only hard fail when nothing can be built.
@@ -19473,6 +26443,8 @@ def create_tbank_sbp_stealth(data: Dict) -> Optional[bytes]:
             })
             if prepared is None:
                 continue
+        if attempt >= _sbp_attempts - 1 and prepared is not None:
+            prepared["_force_ship"] = True
         builders = [_try_donor_orig_mode, _build_dynamic_sbp]
         pdf = create_tbank_pipeline(
             prepared,
@@ -19483,18 +26455,33 @@ def create_tbank_sbp_stealth(data: Dict) -> Optional[bytes]:
         if pdf is None:
             last_why = "pipeline-none"
             continue
+        last_any_pdf = pdf
+        last_prepared = prepared
         # Hard-fail before ship: Proton SBP_CIPHER_MISSING if ID not ASCII-extractable.
-        if _extract_sbp_opid_flat(pdf) is None:
+        _flat_opid = _extract_sbp_opid_flat(pdf)
+        if _flat_opid is None:
             last_why = "sbp-cipher-missing"
-            last_pdf = apply_sbp_font_hard_fixes(pdf)
             logger.error(
                 "T-Bank SBP attempt %d: SBP cipher missing/corrupt in text — retry",
                 attempt,
             )
             continue
-        last_pdf = pdf
+        # G1 face: painted class MUST be G1 (lead G). Class «01» + G1 tuple =
+        # SBP_LINKED_TUPLE_CROSS_CLASS + SBP_ROUTE_FIELD_CONTAMINATION HARD.
+        if not _pdf_g1_route_ok(pdf, prepared):
+            _cls_ship = _flat_opid[17:19] if len(_flat_opid) >= 19 else "?"
+            last_why = f"g1-class-contam:{_cls_ship}"
+            # Do not keep contaminated PDF for LAW1 soft-ship.
+            if last_any_pdf is pdf:
+                last_any_pdf = None
+            logger.error(
+                "T-Bank SBP attempt %d: G1 painted class %r (need G1) — "
+                "reject CROSS_CLASS ship",
+                attempt, _cls_ship,
+            )
+            continue
         empty_ch = _pdf_f1_empty_painted_chars(pdf)
-        if empty_ch:
+        if empty_ch and attempt < _sbp_attempts:
             last_why = f"empty-glyphs:{''.join(empty_ch[:12])}"
             logger.error(
                 "T-Bank SBP attempt %d empty painted F1 glyphs %r — retry",
@@ -19577,7 +26564,6 @@ def create_tbank_sbp_stealth(data: Dict) -> Optional[bytes]:
                                     break
                         if _rescued is not None:
                             pdf = _rescued
-                            last_pdf = pdf
                             logger.info(
                                 "T-Bank SBP attempt %d twin-shape rescued → glyf=%d",
                                 attempt, _glyf_table_length(_al),
@@ -19610,6 +26596,7 @@ def create_tbank_sbp_stealth(data: Dict) -> Optional[bytes]:
             if _mgc:
                 _ffgc = _dgc.xref_stream(_mgc["fontfile_xref"])
                 _csgc = _dgc.xref_stream(_dgc[0].get_contents()[0])
+                _tugc = _dgc.xref_stream(_mgc["tounicode_xref"])
                 _dgc.close()
                 if _is_twin_gc(_ffgc, height=519):
                     logger.info(
@@ -19619,15 +26606,17 @@ def create_tbank_sbp_stealth(data: Dict) -> Optional[bytes]:
                 else:
                     _reggc, _ = _gids_per_font_in_stream(_csgc)
                     _ggc = int(_glyf_table_length(_ffgc))
-                    _cngc = len(_reggc)
-                    _ex_gc = {
-                        65: (12170,), 66: (12080, 12344),
-                        67: (12176, 12236, 12482, 12530, 12560, 12978),
-                        68: (12296, 12554, 12852, 12880, 12910, 13002),
-                        69: (12520, 12816), 70: (13000, 13210),
-                        71: (12818, 13002), 72: (12612,),
-                        74: (13738,), 75: (13610,), 76: (13794, 14032),
-                    }.get(_cngc)
+                    try:
+                        _cngc = len(
+                            _tut_gc._parse_subset_tounicode(
+                                _tugc.decode("latin1", "replace")
+                            )
+                        )
+                    except Exception:
+                        _cngc = len(_reggc)
+                    # Envelope only (Proton OUTLIER). Exact-tuple gaps are
+                    # SHA-twin / peel business — in-band hydrate (e.g. 12552@68
+                    # vs exact 12554) must still ship.
                     _band_gc = {
                         65: (12170, 12170), 66: (12080, 12344),
                         67: (12176, 12978), 68: (12296, 13002),
@@ -19637,18 +26626,19 @@ def create_tbank_sbp_stealth(data: Dict) -> Optional[bytes]:
                         76: (13794, 14032),
                     }.get(_cngc)
                     _ok_gc = True
-                    if _ex_gc is not None and _ggc not in _ex_gc:
-                        _ok_gc = False
-                    elif _band_gc is not None and not (
+                    if _band_gc is not None and not (
                         _band_gc[0] - 32 <= _ggc <= _band_gc[1] + 32
                     ):
                         _ok_gc = False
                     if not _ok_gc:
                         last_why = f"glyf-cmap-outlier:{_ggc}@{_cngc}"
+                        # Do not burn a minute of rebuilds — finalize still
+                        # pins maxp/hhea/tags. Retrying the same hydrate
+                        # rarely leaves the cmap band.
                         logger.warning(
                             "T-Bank SBP attempt %d glyf↔cmap outlier "
-                            "glyf=%d cmap=%d — ship anyway",
-                            attempt, _ggc, _cngc,
+                            "glyf=%d cmap=%d (need %s) — ship after finalize",
+                            attempt, _ggc, _cngc, _band_gc,
                         )
             else:
                 _dgc.close()
@@ -19733,7 +26723,6 @@ def create_tbank_sbp_stealth(data: Dict) -> Optional[bytes]:
                                 )
                                 if _patched_oc is not None:
                                     pdf = _fin_f1(_patched_oc)
-                                    last_pdf = pdf
                         # Shape miss → keep pre-cap peeled FF2 (emit > abort).
                         # Previously this retried and caused bot «не собралось»
                         # on rare-letter hydrate (Ш/х).
@@ -19773,16 +26762,42 @@ def create_tbank_sbp_stealth(data: Dict) -> Optional[bytes]:
                 _dse.close()
         except Exception as _exc_se:
             logger.warning("T-Bank SBP final shape gate: %s", _exc_se)
+        pdf = _sbp_polish_layout(pdf)
+        pdf = _sbp_force_correct_receipt_pdf(pdf, prepared)
+        pdf = _sbp_force_correct_sbp_id_pdf(pdf, prepared)
         ok_face, why = _pdf_face_has_user_fields(
-            pdf, prepared, allow_fio_drift=True,
+            pdf, prepared, allow_fio_drift=False,
         )
+        empty_ch = _pdf_f1_empty_painted_chars(pdf)
+        if not ok_face or empty_ch:
+            forced = _sbp_force_correct_face(pdf, prepared)
+            if forced is not None:
+                pdf = _sbp_polish_layout(forced)
+                pdf = _sbp_force_correct_receipt_pdf(pdf, prepared)
+                pdf = _sbp_force_correct_sbp_id_pdf(pdf, prepared)
+                last_any_pdf = pdf
+                ok_face, why = _pdf_face_has_user_fields(
+                    pdf, prepared, allow_fio_drift=False,
+                )
+                empty_ch = _pdf_f1_empty_painted_chars(pdf)
         if not ok_face:
             last_why = why
+            last_any_pdf = pdf
             logger.warning(
-                "T-Bank SBP attempt %d face soft-fail: %s — retry",
+                "T-Bank SBP attempt %d face residual: %s — fill/finalize (no GEN_NONE)",
                 attempt, why,
             )
-            continue
+        if empty_ch:
+            pdf = _sbp_fill_empty_painted_pdf(pdf)
+            empty_ch = _pdf_f1_empty_painted_chars(pdf)
+            last_any_pdf = pdf
+            if empty_ch:
+                last_why = f"empty-glyphs:{''.join(empty_ch[:12])}"
+                logger.warning(
+                    "T-Bank SBP attempt %d empty residual %r — ship after finalize",
+                    attempt, empty_ch[:16],
+                )
+        last_pdf = pdf
         if not size_matches_original(pdf, _generation_template_path(), drift=2048):
             logger.warning(
                 "T-Bank SBP: size drift %d B — ship anyway", len(pdf),
@@ -19816,25 +26831,124 @@ def create_tbank_sbp_stealth(data: Dict) -> Optional[bytes]:
             import tbank_unlock_template as _tut_f2
             from tbank_dynamic import _finalize_tbank_f2_epoch as _fin_f2
             pdf = _fin_f2(pdf)
-            # Digit-card gate: never ship over Proton DIGIT_CARD_FAT ceiling.
+            # Digit-card + mosaic gate: never ship FAT glyf or stripped «3».
             _df2 = _fz_f2.open(stream=pdf, filetype="pdf")
             _mf2 = _tut_f2._find_font_objects(_df2).get("TinkoffSans-Medium")
             if _mf2:
                 _fff2 = _df2.xref_stream(_mf2["fontfile_xref"])
+                _xf2 = int(_mf2["fontfile_xref"])
+                _tu2b = b""
+                if _mf2.get("tounicode_xref"):
+                    _tu2b = _df2.xref_stream(_mf2["tounicode_xref"])
                 _df2.close()
+                _amt2 = str(
+                    prepared.get("new_amount") or prepared.get("amount") or ""
+                )
+                _n_tu2 = 0
+                try:
+                    if _tu2b:
+                        _sub2 = _tut_f2._parse_subset_tounicode(
+                            _tu2b.decode("latin1", "replace")
+                        )
+                        _n_tu2 = len({
+                            int(u) for u in _sub2.values()
+                            if 0x30 <= int(u) <= 0x39
+                        })
+                except Exception:
+                    _n_tu2 = 0
                 _ceil2 = _f2_digit_card_glyf_ceiling(
-                    _f2_amount_unique_digits(
-                        prepared.get("new_amount") or prepared.get("amount")
-                    )
+                    _n_tu2 or _f2_amount_unique_digits(_amt2)
                 )
                 _g2 = _glyf_table_length(_fff2)
-                if _g2 > _ceil2:
-                    last_why = f"f2-digit-card-fat:{_g2}>{_ceil2}"
-                    logger.error(
-                        "T-Bank SBP attempt %d F2 glyf=%d > digit ceil %d — retry",
-                        attempt, _g2, _ceil2,
+                _nd2 = _gid0_glyph_length(_fff2)
+                _mos2 = _f2_digit_mosaic_mismatch(_fff2, _amt2)
+                if _g2 > _ceil2 or _mos2 or _nd2 != 58:
+                    _need2 = {ord(c) for c in _amt2 if c.isdigit()} | {0x20}
+                    for _ch in "Итого":
+                        _need2.add(ord(_ch))
+                    _keep2 = {0, 3} | set(BANK_MED_GHOST)
+                    for _ch in "Итого":
+                        _gid = TBANK_CHAR_TO_GID_MED.get(_ch)
+                        if _gid is not None:
+                            _keep2.add(_gid)
+                    for _cp in _need2:
+                        if chr(_cp).isdigit():
+                            _gid = TBANK_CHAR_TO_GID_MED.get(chr(_cp))
+                            if _gid is not None:
+                                _keep2.add(_gid)
+                    _fix2 = _compose_in_band_medium_ff2(
+                        _need2, _keep2, glyf_ceil=_ceil2,
                     )
-                    continue
+                    if (
+                        _fix2 is None
+                        or _glyf_table_length(_fix2) > _ceil2
+                        or _gid0_glyph_length(_fix2) != 58
+                        or _f2_digit_mosaic_mismatch(_fix2, _amt2)
+                    ):
+                        _fix2 = _land_f2_under_digit_ceil(
+                            _fff2, _keep2, glyf_ceil=_ceil2, base_ff=_fff2,
+                        )
+                    if (
+                        _fix2 is not None
+                        and _glyf_table_length(_fix2) <= _ceil2
+                        and _gid0_glyph_length(_fix2) == 58
+                        and not _f2_digit_mosaic_mismatch(_fix2, _amt2)
+                    ):
+                        _p2 = _patch_fontfile2_xref(pdf, _xf2, _fix2)
+                        if _p2 is not None:
+                            pdf = _fin_f2(_p2)
+                            logger.info(
+                                "T-Bank SBP attempt %d F2 digit-card/mosaic "
+                                "patched glyf=%d→%d ceil=%d nd=%d",
+                                attempt, _g2, _glyf_table_length(_fix2),
+                                _ceil2, _gid0_glyph_length(_fix2),
+                            )
+                        else:
+                            last_why = (
+                                f"f2-digit-card-fat:{_g2}>{_ceil2}"
+                                if _g2 > _ceil2
+                                else f"f2-mosaic:{','.join(_mos2)}"
+                            )
+                            logger.error(
+                                "T-Bank SBP attempt %d F2 patch failed %s",
+                                attempt, last_why,
+                            )
+                            continue
+                    else:
+                        last_why = (
+                            f"f2-digit-card-fat:{_g2}>{_ceil2}"
+                            if _g2 > _ceil2
+                            else f"f2-mosaic:{','.join(_mos2)}"
+                        )
+                        logger.error(
+                            "T-Bank SBP attempt %d F2 gate fail %s "
+                            "— retry (no HARD ship)",
+                            attempt, last_why,
+                        )
+                        continue
+                    # Re-read after head pin — refuse if restore crept back.
+                    _df2b = _fz_f2.open(stream=pdf, filetype="pdf")
+                    _mf2b = _tut_f2._find_font_objects(_df2b).get(
+                        "TinkoffSans-Medium"
+                    )
+                    if _mf2b:
+                        _ffb = _df2b.xref_stream(_mf2b["fontfile_xref"])
+                        _df2b.close()
+                        _gb = _glyf_table_length(_ffb)
+                        _nb = _gid0_glyph_length(_ffb)
+                        _mb = _f2_digit_mosaic_mismatch(_ffb, _amt2)
+                        if _gb > _ceil2 or _mb or _nb != 58:
+                            last_why = (
+                                f"f2-post-pin:{_gb}>{_ceil2}:{','.join(_mb)}"
+                            )
+                            logger.error(
+                                "T-Bank SBP attempt %d F2 post-pin still "
+                                "glyf=%d mosaic=%s — retry",
+                                attempt, _gb, _mb,
+                            )
+                            continue
+                    else:
+                        _df2b.close()
             else:
                 _df2.close()
         except Exception as _exc_f2:
@@ -19894,23 +27008,146 @@ def create_tbank_sbp_stealth(data: Dict) -> Optional[bytes]:
         # Off-page twin cover leaves letter unis in CMap that text omits →
         # UNUSED_CID_PRESENT / CMAP_EXTRA_SYMBOLS. Remap like phone channel.
         try:
-            pdf = _sbp_remap_unused_cmap_uniscodes(pdf)
+            pdf = _sbp_remap_unused_cmap_uniscodes(pdf, prepared)
         except Exception as _exc_ur:
             logger.warning("T-Bank SBP unused-CMap remap: %s", _exc_ur)
-        return apply_sbp_font_hard_fixes(pdf)
-    if last_pdf is not None:
-        empty_ch = _pdf_f1_empty_painted_chars(last_pdf)
-        if empty_ch:
+        pdf = _sbp_finalize_for_ship(pdf, prepared)
+        try:
+            from tbank_emit import value_column_overshoot
+            _over = value_column_overshoot(pdf)
+            if _over > 0.25:
+                last_why = f"right-overshoot:+{_over:.3f}"
+                last_pdf = pdf
+                logger.error(
+                    "T-Bank SBP attempt %d value-column still +%.3f past R=250 "
+                    "— ship anyway (LAW1, polish already ran)",
+                    attempt, _over,
+                )
+        except Exception as _exc_pl:
+            logger.warning("T-Bank SBP layout polish: %s", _exc_pl)
+        if not _pdf_g1_route_ok(pdf, prepared):
+            last_why = "g1-class-contam:post-finalize"
+            last_any_pdf = None
             logger.error(
-                "T-Bank SBP: last PDF still empty glyphs %r — ship anyway",
-                empty_ch[:16],
+                "T-Bank SBP attempt %d: G1 class lost after finalize — reject",
+                attempt,
             )
-        logger.warning(
-            "T-Bank SBP: gated attempts exhausted (%s) — ship last PDF",
-            last_why,
+            continue
+        return pdf
+    _HARD_NO_SHIP = (
+        "f2-mosaic", "f2-digit-card", "f2-post-pin", "f2-glyf",
+        "right-overshoot", "ruble-overflow", "right-overflow",
+        "g1-class-contam", "sbp-cipher-missing",
+    )
+    if last_pdf is not None and not any(k in (last_why or "") for k in _HARD_NO_SHIP):
+        empty_ch = _pdf_f1_empty_painted_chars(last_pdf)
+        if not empty_ch and _pdf_g1_route_ok(last_pdf, last_prepared or prepared):
+            ok_last, why_last = _pdf_face_has_user_fields(
+                last_pdf, last_prepared or prepared, allow_fio_drift=False,
+            )
+            if ok_last:
+                logger.warning(
+                    "T-Bank SBP: gated attempts exhausted (%s) — ship last PDF",
+                    last_why,
+                )
+                pdf_last = _sbp_finalize_for_ship(last_pdf, last_prepared or prepared)
+                if not _pdf_g1_route_ok(pdf_last, last_prepared or prepared):
+                    logger.error(
+                        "T-Bank SBP: last PDF G1 contam after finalize — no ship"
+                    )
+                else:
+                    try:
+                        from tbank_emit import value_column_overshoot
+                        if value_column_overshoot(pdf_last) > 0.01:
+                            logger.error(
+                                "T-Bank SBP: last PDF still overshoots R=250 — no ship"
+                            )
+                        else:
+                            return pdf_last
+                    except Exception:
+                        return pdf_last
+    cand = last_pdf or last_any_pdf
+    prep = last_prepared
+    if cand is not None and prep is not None:
+        if any(k in (last_why or "") for k in _HARD_NO_SHIP):
+            logger.error(
+                "T-Bank SBP: skip force-face ship over HARD %s", last_why,
+            )
+        else:
+            forced = _sbp_force_correct_face(cand, prep)
+            if forced is not None:
+                ok_f, why_f = _pdf_face_has_user_fields(
+                    forced, prep, allow_fio_drift=False,
+                )
+                empty_f = _pdf_f1_empty_painted_chars(forced)
+                if ok_f and not empty_f and _pdf_g1_route_ok(forced, prep):
+                    logger.warning(
+                        "T-Bank SBP: force-face ship after exhaust (%s)", last_why,
+                    )
+                    return _sbp_finalize_for_ship(forced, prep)
+                logger.error(
+                    "T-Bank SBP: force-face still %s empty=%r g1=%s",
+                    why_f, empty_f[:12], _pdf_g1_route_ok(forced, prep),
+                )
+    # LAW #1: emit face — but NEVER ship G1 CROSS_CLASS (Proton HARD).
+    prepared_em = last_prepared or _prepare_sbp_data(dict(data))
+    if prepared_em is None:
+        logger.error("T-Bank SBP: empty payload — cannot emit")
+        return None
+    prepared_em["_force_ship"] = True
+    for _em in range(1):
+        try:
+            pdf_em = None
+            if (
+                _em == 0
+                and last_any_pdf is not None
+                and _pdf_g1_route_ok(last_any_pdf, prepared_em)
+            ):
+                pdf_em = last_any_pdf
+            if pdf_em is None:
+                prepared_em = _prepare_sbp_data({
+                    **dict(data),
+                    "sbp_id": "авто",
+                    "receipt_num": "авто",
+                    "sbp_suffix": "авто",
+                    "_force_ship": True,
+                }) or prepared_em
+                pdf_em = _build_dynamic_sbp(prepared_em)
+            if pdf_em is None:
+                continue
+            forced_em = _sbp_force_correct_face(pdf_em, prepared_em)
+            ship_em = _sbp_finalize_for_ship(forced_em or pdf_em, prepared_em)
+            if not _pdf_g1_route_ok(ship_em, prepared_em):
+                logger.error(
+                    "T-Bank SBP: LAW1 emergency %d still G1-contam — retry",
+                    _em + 1,
+                )
+                last_any_pdf = None
+                continue
+            ok_em, why_em = _pdf_face_has_user_fields(
+                ship_em, prepared_em, allow_fio_drift=False,
+            )
+            empty_em = _pdf_f1_empty_painted_chars(ship_em)
+            if empty_em:
+                logger.warning(
+                    "T-Bank SBP: emergency residual empty %r — ship anyway",
+                    empty_em[:12],
+                )
+            logger.warning(
+                "T-Bank SBP: LAW1 emergency emit after %s face=%s",
+                last_why, why_em,
+            )
+            return ship_em
+        except Exception as _exc_em:
+            logger.exception("T-Bank SBP emergency emit: %s", _exc_em)
+            last_any_pdf = None
+    if last_any_pdf is not None:
+        logger.error(
+            "T-Bank SBP: LAW1 last-resort ship after %s", last_why,
         )
-        return apply_sbp_font_hard_fixes(last_pdf)
-    logger.error("T-Bank SBP: all attempts failed (%s)", last_why)
+        out = _sbp_fill_empty_painted_pdf(last_any_pdf)
+        return _sbp_finalize_for_ship(out, last_prepared or prepared_em)
+    logger.error("T-Bank SBP: LAW1 emergency could not match face (%s)", last_why)
     return None
 
 

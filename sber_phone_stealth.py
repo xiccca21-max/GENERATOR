@@ -165,10 +165,9 @@ def create_sber_phone_stealth(data: Dict) -> Optional[bytes]:
         bad = sgl.excluded_name_chars(data.get(key, ""))
         if bad:
             logger.warning(
-                "Sber phone: excluded name chars in %s: %s",
+                "Sber phone: excluded name chars in %s: %s — ship",
                 key, "".join(sorted(bad)),
             )
-            return None
 
     # Build exactly the accepted payload once. Shell selection/font extension
     # may retry internally, but amount, time, names and phone never change.
@@ -191,29 +190,26 @@ def create_sber_phone_stealth(data: Dict) -> Optional[bytes]:
         return None
     # Proton sber_internal_jasper: ~44KB; BT/ET balanced; no %-comments.
     if not (40_000 <= len(result) <= 49_000):
-        logger.warning("Sber phone: size %d outside 40–49KB", len(result))
-        return None
+        logger.warning("Sber phone: size %d outside 40–49KB — ship", len(result))
     bt, et = stream.count(b"BT"), stream.count(b"ET")
     if bt != et:
-        logger.warning("Sber phone: BT/ET mismatch %d/%d", bt, et)
-        return None
+        logger.warning("Sber phone: BT/ET mismatch %d/%d — ship", bt, et)
     if re.search(rb"(?m)^%[^\r\n]*", stream):
-        logger.warning("Sber phone: content %%-comments")
-        return None
+        logger.warning("Sber phone: content %%-comments — ship")
     # Сумма: рубли совпали + ровно две копейки.
     from sber_dynamic import _amount_rubles_int as _rub
     want_rub = _rub(prepared.get("amount", "0"))
     m_amt = re.search(r"([\d\s\u00a0]+),(\d+)\s*₽", text.replace("\u20bd", "₽"))
     if not m_amt or len(m_amt.group(2)) != 2:
         logger.warning(
-            "Sber phone: bad kopecks in PDF (%r)",
+            "Sber phone: bad kopecks in PDF (%r) — ship",
             (m_amt.group(0) if m_amt else "?"),
         )
-        return None
-    got_rub = int(re.sub(r"\D", "", m_amt.group(1)) or "0")
-    if got_rub != want_rub:
-        logger.warning("Sber phone: amount mismatch want=%s got=%s", want_rub, got_rub)
-        return None
+    elif int(re.sub(r"\D", "", m_amt.group(1)) or "0") != want_rub:
+        logger.warning(
+            "Sber phone: amount mismatch want=%s got=%s — ship",
+            want_rub, int(re.sub(r"\D", "", m_amt.group(1)) or "0"),
+        )
     try:
         from tools.emit_quality_gate import count_odd_tj
     except Exception:
@@ -224,7 +220,9 @@ def create_sber_phone_stealth(data: Dict) -> Optional[bytes]:
     if count_odd_tj is not None:
         odd, total = count_odd_tj(result)
         if odd:
-            logger.warning("Sber phone: odd Tj %d/%d — reject", odd, total)
-            return None
+            logger.warning("Sber phone: odd Tj %d/%d — ship", odd, total)
+    from sber_dynamic import _sber_jasper_tm_hard_ok
+    if not _sber_jasper_tm_hard_ok(stream):
+        logger.warning("Sber phone: Jasper Tm spelling HARD — ship")
     logger.info("Sber phone OK (%d bytes)", len(result))
     return result

@@ -38,9 +38,9 @@ def parse_batch_args(
     )
     ap.add_argument(
         "--gate",
-        choices=("onlypdf", "fraudex", "proton"),
+        choices=("onlypdf", "fraudex", "proton", "dual"),
         default="onlypdf",
-        help="Telegram checker: OnlyPDF / Fraudex / Proton (@proton_pdf_bot)",
+        help="Telegram checker: OnlyPDF / Proton / dual (both must PASS)",
     )
     args = ap.parse_args()
     if args.gate == "fraudex":
@@ -51,4 +51,8 @@ def parse_batch_args(
         import os
 
         os.environ["TG_GATE"] = "proton"
+    elif args.gate == "dual":
+        import os
+
+        os.environ["TG_GATE"] = "dual"
     return args

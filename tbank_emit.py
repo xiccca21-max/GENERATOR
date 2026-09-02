@@ -17,7 +17,9 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 logger = logging.getLogger(__name__)
 
 _VALUE_RIGHT = 250.0
-_OVERSHOOT_HARD = 0.01
+# Proton TBANK_VALUE_RIGHT_EDGE_OVERSHOOT is HARD above +0.01 pt
+# (Jasper originals stay ≤0.005). 0.25 used to let +0.148 ship as FAKE.
+_OVERSHOOT_HARD = 0.009
 _RIGHT_EDGE_INSET_PT = 0.25
 _AMOUNT_SM_RIGHT_MAX = 243.68
 _AMOUNT_BG_RIGHT_MAX = 237.77
@@ -339,7 +341,12 @@ _SBP_ID_Y_BAND = (0.0, -1.0)  # disabled — overflowing SBP-id must be shifted
 
 
 def _overflowing_value_lines(pdf: bytes) -> list:
-    """(baseline_y, overshoot) for value-column lines past R=250."""
+    """(baseline_y, overshoot) for value-column spans past R=250.
+
+    Labels sit at x≈20 and values at x≈180–250. MuPDF often groups them as
+    one line (x0<100). Proton scores only the value spans (x0≥100). Skip the
+    label, keep the value x1 — otherwise nudge never sees footer amount/₽.
+    """
     import fitz
 
     hits = []
@@ -350,18 +357,19 @@ def _overflowing_value_lines(pdf: bytes) -> list:
                 continue
             for line in block.get("lines", []):
                 spans = line.get("spans") or []
-                boxes = [sp["bbox"] for sp in spans if sp.get("bbox")]
-                if not boxes:
+                value_boxes = [
+                    sp["bbox"]
+                    for sp in spans
+                    if sp.get("bbox") and float(sp["bbox"][0]) >= 100.0
+                ]
+                if not value_boxes:
                     continue
-                x0 = min(float(b[0]) for b in boxes)
-                x1 = max(float(b[2]) for b in boxes)
-                if x0 < 100 or x1 < 180:
-                    continue
+                x1 = max(float(b[2]) for b in value_boxes)
                 over = x1 - _VALUE_RIGHT
                 if over <= 0.005:
                     continue
-                y0 = min(float(b[1]) for b in boxes)
-                y1 = max(float(b[3]) for b in boxes)
+                y0 = min(float(b[1]) for b in value_boxes)
+                y1 = max(float(b[3]) for b in value_boxes)
                 hits.append(((y0 + y1) / 2.0, over))
     finally:
         doc.close()
@@ -372,6 +380,281 @@ def value_column_overshoot(pdf: bytes) -> float:
     """Max (line x1 − 250) for value-column lines (x0≥100)."""
     hits = _overflowing_value_lines(pdf)
     return max((h[1] for h in hits), default=0.0)
+
+
+def f1_value_column_x1s(pdf: bytes) -> list:
+    """Painted x1 of F1 Regular value-column spans (Proton SPREAD n=9).
+
+    Skip labels (x0<100), Medium/₽, and amount digits that sit before ₽
+    (x1≤244.2 — donor Сумма/комиссия). Remaining FIO/phone/bank/account/
+    SBP-id/suffix/status must share one vertical.
+    """
+    import fitz
+
+    out = []
+    doc = fitz.open(stream=pdf, filetype="pdf")
+    try:
+        for block in doc[0].get_text("dict").get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for sp in line.get("spans") or []:
+                    bbox = sp.get("bbox") or [0, 0, 0, 0]
+                    x0, _y0, x1, _y1 = (float(b) for b in bbox)
+                    if x0 < 100.0:
+                        continue
+                    font = str(sp.get("font") or "")
+                    if "Medium" in font or "ALSRubl" in font:
+                        continue
+                    if x1 <= 244.2:
+                        continue
+                    out.append((x0, x1, float(bbox[1]), str(sp.get("text") or "")))
+    finally:
+        doc.close()
+    return out
+
+
+def value_column_spread(pdf: bytes) -> float:
+    """max(x1)−min(x1) of F1 value spans. Proton HARD above 2.0 pt."""
+    xs = [t[1] for t in f1_value_column_x1s(pdf)]
+    if len(xs) < 2:
+        return 0.0
+    return max(xs) - min(xs)
+
+
+def pin_f1_value_column_spread_pdf(pdf: bytes, *, x0_slop: float = 0.08) -> bytes:
+    """Shift F1 value Tm so painted x1 lands on 250 (RIGHT_EDGE_SPREAD).
+
+    Equal-CID SBP-id inplace keeps donor Tm; a narrower live ID then
+    undershoots by several pt. Measure bbox and move that Tm only.
+    Amount digits before ₽ stay on 243.68 / 237.77.
+    """
+    import re as _re
+
+    tm_re = _re.compile(rb"1 0 0 1 ([0-9.]+) ([0-9.]+) Tm")
+    right = _VALUE_RIGHT
+    slop = float(x0_slop)
+    for _round in range(4):
+        spans = f1_value_column_x1s(pdf)
+        drift = [
+            (x0, x1) for x0, x1, _y, _t in spans if abs(x1 - right) > 0.05
+        ]
+        if not drift:
+            return pdf
+        import fitz
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        try:
+            xref = int(doc[0].get_contents()[0])
+            stream = doc.xref_stream(xref)
+        finally:
+            doc.close()
+        n = 0
+        out = bytearray()
+        pos = 0
+        for m in tm_re.finditer(stream):
+            out.extend(stream[pos:m.start()])
+            tx = float(m.group(1))
+            shifted = False
+            if tx >= 50.0:
+                best = None
+                best_d = slop
+                for x0, x1 in drift:
+                    d = abs(tx - x0)
+                    if d <= best_d:
+                        best_d = d
+                        best = (x0, x1)
+                if best is not None:
+                    x0, x1 = best
+                    new_x = tx + (right - x1)
+                    out.extend(
+                        b"1 0 0 1 "
+                        + jasper_fmt_token(new_x).encode("ascii")
+                        + b" "
+                        + m.group(2)
+                        + b" Tm"
+                    )
+                    n += 1
+                    shifted = True
+            if not shifted:
+                out.extend(m.group(0))
+            pos = m.end()
+        out.extend(stream[pos:])
+        if not n:
+            logger.warning(
+                "Jasper value-column spread %.3f but no Tm matched x0",
+                value_column_spread(pdf),
+            )
+            return pdf
+        committed = _commit_contents_inplace(pdf, xref, bytes(out))
+        if committed is None:
+            return pdf
+        pdf = committed
+        logger.info("Jasper value-column spread pin %d Tm", n)
+    return pdf
+
+
+def _value_column_line_edges(pdf: bytes):
+    """Proton line-level value-column x1 (x0≥100, x1≥180) + page height."""
+    import fitz
+
+    doc = fitz.open(stream=pdf, filetype="pdf")
+    try:
+        height = float(doc[0].rect.height)
+        d = doc[0].get_text("dict")
+    finally:
+        doc.close()
+    lines = []
+    for block in d.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            spans = line.get("spans") or []
+            if not spans:
+                continue
+            txt = "".join(sp.get("text", "") for sp in spans).strip()
+            if not txt or len(txt) < 2:
+                continue
+            boxes = [sp["bbox"] for sp in spans if sp.get("bbox")]
+            if not boxes:
+                continue
+            x0 = min(float(b[0]) for b in boxes)
+            x1 = max(float(b[2]) for b in boxes)
+            y0 = min(float(b[1]) for b in boxes)
+            y1 = max(float(b[3]) for b in boxes)
+            if x0 < 100 or x1 < 180:
+                continue
+            lines.append((x0, x1, y0, y1))
+    return lines, height
+
+
+def value_column_lattice_off(pdf: bytes) -> list:
+    """Quantized residuals not in {-1.0, 0.0} (Proton OFF_LATTICE)."""
+    lines, height = _value_column_line_edges(pdf)
+    if height > 499.0 or len(lines) < 4:
+        return []
+    off = []
+    for _x0, x1, _y0, _y1 in lines:
+        r = x1 - _VALUE_RIGHT
+        q = round(round(r / 0.05) * 0.05, 2)
+        if q not in (-1.0, 0.0):
+            off.append(q)
+    return sorted(set(off))
+
+
+def snap_value_column_lattice_pdf(pdf: bytes) -> bytes:
+    """card/phone: line x1 residual must quantize to {-1.0, 0.0} (0.05 pt).
+
+    Proton measures the whole line bbox (amount+₽), not F1 spans alone.
+    Shift the value Tm whose x matches the line's x0 (donor values start
+    at 181–237). Do not steal the rightmost Tm on a ±14 pt y-band — that
+    pulled neighbouring rows off R=250.
+    """
+    import re as _re
+
+    tm_re = _re.compile(rb"1 0 0 1 ([0-9.]+) ([0-9.]+) Tm")
+    right = _VALUE_RIGHT
+    allowed = (-1.0, 0.0)
+
+    for _round in range(6):
+        lines, height = _value_column_line_edges(pdf)
+        if height > 499.0:
+            return pdf
+        drift = []
+        for x0, x1, y0, y1 in lines:
+            r = x1 - right
+            q = round(round(r / 0.05) * 0.05, 2)
+            if q in allowed:
+                continue
+            tgt_r = -1.0 if r < -0.5 else 0.0
+            drift.append((x0, x1, (y0 + y1) / 2.0, right + tgt_r))
+        if not drift:
+            return pdf
+        import fitz
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        try:
+            xref = int(doc[0].get_contents()[0])
+            stream = doc.xref_stream(xref)
+        finally:
+            doc.close()
+        tms = [
+            (m.start(), m.end(), float(m.group(1)), float(m.group(2)), m.group(2))
+            for m in tm_re.finditer(stream)
+        ]
+        shifts = {}
+        used = set()
+        for lx0, x1, ymid, tgt in drift:
+            delta = tgt - x1
+            cands = [
+                (i, tx, ty, abs(tx - lx0), abs(ty - ymid))
+                for i, (_s, _e, tx, ty, _yb) in enumerate(tms)
+                if tx >= 50.0 and i not in used and abs(ty - ymid) <= 8.0
+            ]
+            if not cands:
+                continue
+            # Shift the rightmost value Tm on the row — line x1 follows max x,
+            # not the left anchor Tm (Proton OFF_LATTICE -0.05 on phone).
+            i, tx, _ty, _dx, _dy = max(cands, key=lambda t: (t[1], -t[3]))
+            shifts[i] = tx + delta
+            used.add(i)
+        if not shifts:
+            logger.warning("Jasper value lattice residual off but no Tm on row")
+            return pdf
+        out = bytearray()
+        pos = 0
+        for i, (s, e, tx, _ty, yb) in enumerate(tms):
+            out.extend(stream[pos:s])
+            if i in shifts:
+                out.extend(
+                    b"1 0 0 1 "
+                    + jasper_fmt_token(shifts[i]).encode("ascii")
+                    + b" "
+                    + yb
+                    + b" Tm"
+                )
+            else:
+                out.extend(stream[s:e])
+            pos = e
+        out.extend(stream[pos:])
+        committed = _commit_contents_inplace(pdf, xref, bytes(out))
+        if committed is None:
+            return pdf
+        pdf = committed
+        logger.info("Jasper value-column lattice snap %d Tm", len(shifts))
+    return pdf
+
+
+def _commit_contents_inplace(pdf: bytes, xref: int, new_stream: bytes) -> Optional[bytes]:
+    """Swap decoded Contents without fitz.tobytes.
+
+    Prefer same compressed /Length. If a Tm nudge changes flate size, update
+    /Length + xref rather than silently keeping the overflowing layout
+    (Proton TBANK_VALUE_RIGHT_EDGE_OVERSHOOT HARD > +0.01).
+    """
+    from tbank_orig_mode import _find_stream_pos_for_xref
+    from tbank_stealth_v3 import (
+        _best_compress,
+        _pad_to_compressed_size,
+        _patch_length_and_rebuild,
+    )
+
+    pos = _find_stream_pos_for_xref(pdf, int(xref))
+    if not pos:
+        return None
+    cs, ce = pos
+    orig_len = ce - cs
+    packed = _pad_to_compressed_size(bytes(new_stream), orig_len)
+    if packed is not None and len(packed) == orig_len:
+        return pdf[:cs] + packed + pdf[ce:]
+    packed = _best_compress(bytes(new_stream))
+    if not packed:
+        return None
+    rebuilt = _patch_length_and_rebuild(bytearray(pdf), cs, ce, packed)
+    if rebuilt is None:
+        logger.warning("Jasper Contents /Length rebuild failed after Tm nudge")
+        return None
+    return rebuilt
 
 
 def jasper_fmt_token(v: float) -> str:
@@ -422,9 +705,11 @@ def sanitize_contents_tm(pdf: bytes) -> bytes:
             pos = m.end()
         out.extend(stream[pos:])
         if n:
-            doc.update_stream(xref, bytes(out))
-            pdf = doc.tobytes(deflate=False, garbage=0, clean=False)
+            committed = _commit_contents_inplace(pdf, xref, bytes(out))
+            if committed is None:
+                return pdf
             logger.info("Jasper Tm sanitize %d tokens", n)
+            return committed
         return pdf
     finally:
         doc.close()
@@ -488,9 +773,11 @@ def repin_sbp_amount_y_pdf(pdf: bytes) -> bytes:
             pos = m.end()
         out.extend(stream[pos:])
         if n:
-            doc.update_stream(xref, bytes(out))
-            pdf = doc.tobytes(deflate=False, garbage=0, clean=False)
+            committed = _commit_contents_inplace(pdf, xref, bytes(out))
+            if committed is None:
+                return pdf
             logger.info("SBP amount Y repin %d slot(s)", n)
+            return committed
         return pdf
     finally:
         doc.close()
@@ -510,7 +797,7 @@ def nudge_value_column_pdf(pdf: bytes) -> bytes:
     def _x_tok(new_x: float) -> bytes:
         return jasper_fmt_token(new_x).encode("ascii")
 
-    for _round in range(3):
+    for _round in range(8):
         hits = _overflowing_value_lines(pdf)
         if not hits:
             return pdf
@@ -518,6 +805,7 @@ def nudge_value_column_pdf(pdf: bytes) -> bytes:
         try:
             xref = doc[0].get_contents()[0]
             stream = doc.xref_stream(xref)
+            page_h = float(doc[0].mediabox.y1)
             out = bytearray()
             pos = 0
             n = 0
@@ -528,8 +816,11 @@ def nudge_value_column_pdf(pdf: bytes) -> bytes:
                 delta = 0.0
                 if x >= 50.0:
                     for ly, over in hits:
-                        if abs(ly - y) <= 14.0 or abs((519.0 - ly) - y) <= 14.0:
-                            delta = max(delta, over + 0.02)
+                        if (
+                            abs(ly - y) <= 14.0
+                            or abs((page_h - ly) - y) <= 14.0
+                        ):
+                            delta = max(delta, over + 0.006)
                 if delta > 0:
                     out.extend(
                         b"1 0 0 1 " + _x_tok(x - delta) + b" " + m.group(2) + b" Tm"
@@ -555,7 +846,7 @@ def nudge_value_column_pdf(pdf: bytes) -> bytes:
                         max_over,
                     )
                     return pdf
-                delta = max_over + 0.02
+                delta = max_over + 0.006
                 stream = (
                     stream[:best.start()]
                     + b"1 0 0 1 " + _x_tok(best_x - delta) + b" " + best.group(2) + b" Tm"
@@ -563,8 +854,10 @@ def nudge_value_column_pdf(pdf: bytes) -> bytes:
                 )
                 n = 1
                 out = bytearray(stream)
-            doc.update_stream(xref, bytes(out))
-            pdf = doc.tobytes(deflate=False, garbage=0, clean=False)
+            committed = _commit_contents_inplace(pdf, xref, bytes(out))
+            if committed is None:
+                return pdf
+            pdf = committed
             logger.info(
                 "Jasper value-column nudge %d Tm (max +%.3f)",
                 n, max(h[1] for h in hits),
@@ -574,12 +867,52 @@ def nudge_value_column_pdf(pdf: bytes) -> bytes:
     return pdf
 
 
+def polish_layout_pdf(pdf: bytes, *, channel: str = "sbp") -> bytes:
+    """Last Contents pass: Jasper Tm tokens, R=250 pin, SBP amount Y baselines.
+
+    Card/phone/nocomm: lattice snap only. The +0.006 overshoot nudge fights
+    Proton residual lattice {-1, 0} and walks x1 to -1.7/-0.1.
+    """
+    out = sanitize_contents_tm(pdf)
+    if channel == "sbp":
+        out = nudge_value_column_pdf(out)
+        out = repin_sbp_amount_y_pdf(out)
+        out = nudge_value_column_pdf(out)
+        out = pin_f1_value_column_spread_pdf(out)
+    elif channel == "phone":
+        # Generic lattice snap breaks phone: commission Tm flies off-page,
+        # «Телефон получателя» drifts left, stamp « ET» corrupts.
+        pass
+    elif channel in (
+        "card_sber", "card_tbank", "nocomm", "statement",
+    ):
+        out = snap_value_column_lattice_pdf(out)
+        if value_column_lattice_off(out):
+            out = snap_value_column_lattice_pdf(out)
+        if value_column_overshoot(out) > _OVERSHOOT_HARD:
+            out = nudge_value_column_pdf(out)
+            out = snap_value_column_lattice_pdf(out)
+    over = value_column_overshoot(out)
+    if over > 0.005:
+        logger.warning(
+            "Jasper layout polish still right-overshoot +%.3f after nudge",
+            over,
+        )
+    spread = value_column_spread(out)
+    if spread > 2.0:
+        logger.warning(
+            "Jasper layout polish still value-column spread %.3f",
+            spread,
+        )
+    return out
+
+
 def emit_invariants(pdf: bytes, *, channel: str = "sbp") -> str:
     """Empty string = Jasper subset closed. Else rebuild reason (Alfa emit_invariants)."""
     import fitz
     import tbank_unlock_template as tut
     from tbank_dynamic import (
-        _F1_GLYF_CMAP_EXACTS,
+        _load_corpus_f1_twin_for_glyf,
         _tbank_ff2_is_corpus_twin,
     )
     from tbank_sbp_stealth import _glyf_table_length
@@ -625,13 +958,42 @@ def emit_invariants(pdf: bytes, *, channel: str = "sbp") -> str:
         pass
 
     g = int(_glyf_table_length(ff1)) if ff1 else 0
-    xs = (_F1_GLYF_CMAP_EXACTS.get(int(h)) or {}).get(int(cmap_n)) or ()
-    if xs and not _tbank_ff2_is_corpus_twin(ff1, height=h):
-        lo, hi = min(int(x) for x in xs) - 32, max(int(x) for x in xs) + 32
-        if not (lo <= g <= hi):
-            return f"glyph mismatch cmap-outlier:{g}@{cmap_n}"
-        if g in xs:
+    if g and _load_corpus_f1_twin_for_glyf(g) is not None:
+        if not _tbank_ff2_is_corpus_twin(ff1, height=h):
             return f"glyph mismatch mutated-twin-glyf:{g}@{cmap_n}"
+    # Proton TBANK_F1_GLYF_CMAP_OUTLIER — hydrate/unpeeled glyf outside atlas.
+    if g and not _tbank_ff2_is_corpus_twin(ff1, height=h):
+        _band = {
+            411: {
+                57: (10700, 10804), 58: (10898, 10958), 59: (11024, 11230),
+                60: (11674, 11674),
+            },
+            431: {
+                57: (10918, 10918), 58: (11174, 11174), 59: (10908, 11348),
+                60: (11068, 11412), 61: (11126, 11628), 62: (11398, 11656),
+                63: (11610, 11878),
+            },
+            451: {
+                61: (11332, 11332), 62: (11366, 11626), 63: (11716, 11716),
+                64: (11868, 11946), 65: (12430, 12430),
+            },
+            471: {
+                59: (11088, 11102), 60: (11142, 11142), 61: (11614, 11620),
+                62: (11302, 11342), 63: (11732, 11732),
+            },
+            519: {
+                65: (12170, 12170), 66: (12080, 12344), 67: (12176, 12978),
+                68: (12296, 13002), 69: (12520, 12816), 70: (13000, 13210),
+                71: (12818, 13002), 72: (12612, 12612), 74: (13738, 13738),
+                75: (13610, 13610), 76: (13794, 14032),
+            },
+            539: {
+                66: (12328, 12328), 67: (12328, 12442), 68: (12864, 13038),
+                69: (12236, 12236), 73: (13264, 13264),
+            },
+        }.get(int(h), {}).get(int(cmap_n))
+        if _band and not (_band[0] - 32 <= g <= _band[1] + 32):
+            return f"glyph mismatch glyf-cmap-outlier:{g}@{cmap_n}"
     try:
         from tbank_dynamic import _f1_loca_tables
         offs, glyf_ba, _itl, _ng = _f1_loca_tables(ff1)

@@ -27,6 +27,7 @@ EXAMPLE = """Банки с логотипом — пиши точно одно �
 
 ФИО: Петров Вадим Сергеевич
 Имя: Вадим
+Счёт: 6324
 Баланс: 999999.99
 Траты: 12345
 Доходы: 50000
@@ -37,9 +38,19 @@ EXAMPLE = """Банки с логотипом — пиши точно одно �
 -162310
 Тимур В.
 Переводы
+Тип: сбп
 Банк: Сбербанк
 Тел: +79998882266
-Время: 18.08.2026 22:57"""
+Время: 18.08.2026 22:57
+
+Оп2:
+-100
+Альфа-карта МИР
+Переводы
+Тип: карта
+Банк: Т-Банк
+Карта: ··1666
+Время: 13.08.2026 21:51"""
 
 
 class ParseError(ValueError):
@@ -47,7 +58,7 @@ class ParseError(ValueError):
 
 
 _KV_RE = re.compile(
-    r"^(ФИО|Имя|Баланс|Траты|Доходы|Почта|Телефон)\s*:\s*(.+)$",
+    r"^(ФИО|Имя|Баланс|Траты|Доходы|Почта|Телефон|Сч[её]т|Account)\s*:\s*(.+)$",
     re.IGNORECASE,
 )
 _OP_SPLIT_RE = re.compile(r"^Оп\s*(\d+)\s*:\s*$", re.IGNORECASE | re.MULTILINE)
@@ -142,6 +153,15 @@ def _split_ops(text: str) -> list[str]:
     return chunks
 
 
+def _parse_transfer_kind(raw: str) -> str:
+    low = (raw or "").strip().lower().replace("ё", "е")
+    if low in ("карта", "card", "карт", "на карту", "по карте", "card2card"):
+        return "card"
+    if low in ("сбп", "sbp", "быстрые платежи"):
+        return "sbp"
+    return ""
+
+
 def _parse_op(block: str, index: int, cabinet: str = "alfa") -> dict[str, Any]:
     lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
     if len(lines) < 3:
@@ -154,12 +174,18 @@ def _parse_op(block: str, index: int, cabinet: str = "alfa") -> dict[str, Any]:
     date_raw = ""
     time_raw = ""
     extra_dt = ""
+    kind_raw = ""
+    card_raw = ""
     for ln in lines[3:]:
         low = ln.lower()
-        if low.startswith("банк"):
+        if low.startswith("тип"):
+            kind_raw = ln.split(":", 1)[-1].strip() if ":" in ln else ln[3:].strip()
+        elif low.startswith("банк"):
             bank_raw = ln.split(":", 1)[-1].strip() if ":" in ln else ln[4:].strip()
         elif low.startswith("тел"):
             phone_raw = ln.split(":", 1)[-1].strip() if ":" in ln else ln[3:].strip()
+        elif low.startswith("карт"):
+            card_raw = ln.split(":", 1)[-1].strip() if ":" in ln else ln[4:].strip()
         elif low.startswith("время"):
             time_raw = ln.split(":", 1)[-1].strip() if ":" in ln else ln[5:].strip()
         elif low.startswith("дата"):
@@ -168,19 +194,33 @@ def _parse_op(block: str, index: int, cabinet: str = "alfa") -> dict[str, Any]:
             extra_dt = ln
     if not bank_raw:
         raise ParseError(f"Не разобрал данные: Оп{index + 1} — нет «Банк:»")
-    if not phone_raw:
-        raise ParseError(f"Не разобрал данные: Оп{index + 1} — нет «Тел:»")
+    transfer_kind = _parse_transfer_kind(kind_raw) or "sbp"
+    if transfer_kind == "sbp" and not phone_raw:
+        raise ParseError(f"Не разобрал данные: Оп{index + 1} — нет «Тел:» (для СБП)")
     bank = resolve_bank(bank_raw, cabinet)
-    parts = parse_phone_parts(phone_raw)
     dt = _parse_op_datetime(" ".join(x for x in (date_raw, time_raw) if x)) or _parse_op_datetime(time_raw or date_raw or extra_dt)
+    # Live cabinet card→other-bank: title is product «Альфа-карта МИР», not FIO.
+    if transfer_kind == "card" and not re.search(r"карт", name, re.IGNORECASE):
+        name = "Альфа-карта МИР"
     out: dict[str, Any] = {
         "description": name,
         "brand": name,
         "amount": _num(amount_s, f"Оп{index + 1} сумма"),
         "category": category,
         "bank": bank,
-        "phone": phone_e164(parts),
+        "transferKind": transfer_kind,
     }
+    if phone_raw:
+        parts = parse_phone_parts(phone_raw)
+        out["phone"] = phone_e164(parts)
+    if card_raw:
+        digits = re.sub(r"\D", "", card_raw)
+        if len(digits) >= 4:
+            out["cardLast4"] = digits[-4:]
+        else:
+            tail = re.sub(r"^[·.•\s]+", "", card_raw).strip()
+            if tail:
+                out["cardLast4"] = tail[-4:]
     if dt:
         out["dateTime"] = _alfa_iso(dt)
         out["atMs"] = int(dt.timestamp() * 1000)
@@ -219,6 +259,11 @@ def parse_payload(text: str, cabinet: str = "alfa") -> dict[str, Any]:
     if len(ops) > 3:
         raise ParseError("Не разобрал данные: больше 3 операций")
 
+    acc_raw = folded.get("счёт") or folded.get("счет") or folded.get("account") or ""
+    acc_digits = re.sub(r"\D", "", acc_raw)
+    account_number = acc_digits[:20] if len(acc_digits) >= 20 else ""
+    account_last4 = acc_digits[-4:] if len(acc_digits) >= 4 else ""
+
     return {
         "firstName": header_name,
         "lastName": last_name,
@@ -230,6 +275,8 @@ def parse_payload(text: str, cabinet: str = "alfa") -> dict[str, Any]:
         "balance": _num(_need(folded, "баланс"), "Баланс"),
         "spending": _num(_need(folded, "траты"), "Траты"),
         "income": _num(_need(folded, "доходы"), "Доходы"),
+        "accountNumber": account_number,
+        "accountLast4": account_last4,
         "operations": ops,
     }
 
@@ -239,6 +286,11 @@ def confirm_text(data: dict[str, Any]) -> str:
     lines = [
         f"ФИО: {data['displayName']}",
         f"Имя (шапка кабинета): {data['firstName']}",
+        (
+            f"Счёт (маска): ••{data['accountLast4']}"
+            if data.get("accountLast4")
+            else "Счёт (маска): как в кабинете"
+        ),
         f"Баланс: {data['balance']}",
         f"Почта (профиль): {data['email']}",
         f"Телефон (профиль): {data['profilePhone']}",
@@ -252,14 +304,20 @@ def confirm_text(data: dict[str, Any]) -> str:
         when = ""
         if op.get("dateTime"):
             when = f", {op['dateTime'][8:10]}.{op['dateTime'][5:7]}.{op['dateTime'][:4]} {op['dateTime'][11:16]}"
-        lines.append(f"  {i}. {op['amount']} — {op['description']} ({bank}{extra}, {op['phone']}{when})")
-    n = max(len(ops), 1)
+        phone = op.get("phone") or "—"
+        kind = "карта" if op.get("transferKind") == "card" else "СБП"
+        lines.append(
+            f"  {i}. {op['amount']} — {op['description']} ({kind}, {bank}{extra}, {phone}{when})"
+        )
+    n_ops = min(len(ops), 3)
+    need = n_ops + 1
     lines.append("")
     if ops:
         lines.append(
-            f"Пришли до {n} PDF (первый = самая свежая операция). /done — собрать без PDF."
+            f"Пришли {need} PDF: сначала {n_ops} чек(а) операций, затем PDF выписки "
+            f"(верхняя в «Справки и выписки» + кнопка «Получить»). /done — без выписки."
         )
     else:
-        lines.append("/done — собрать сейчас.")
+        lines.append("Пришли PDF выписки (верхняя в «Справки и выписки»). Или /done.")
     lines.append("/done — собрать сейчас.")
     return "\n".join(lines)

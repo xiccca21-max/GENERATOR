@@ -26,11 +26,13 @@ sys.path.insert(0, str(_DIR))
 logging.basicConfig(level=logging.ERROR)
 
 from onlypdf_gate import generate_onlypdf_batch  # noqa: E402
+from orig_match_gate import wrap_validate  # noqa: E402
 from onlypdf_safe_names import (  # noqa: E402
     CYR_NO_YO_TVERD,
     coverage_report,
-    pick_hard_tbank_pair,
-    pick_hard_tbank_recv,
+    diverse_amount,
+    pick_diverse_tbank_face,
+    strip_yo,
 )
 from tbank_stealth_v3 import create_tbank_stealth  # noqa: E402
 import fitz  # noqa: E402
@@ -47,27 +49,20 @@ def _stem(receipt: str) -> str:
 
 def _payload(i: int, attempt: int = 0) -> dict:
     rng = random.Random(22072026 + i * 211 + attempt * 809)
-    fn, ln = pick_hard_tbank_pair(i, attempt)
+    sender, receiver = pick_diverse_tbank_face(i, attempt)
+    sender = strip_yo(sender)
+    receiver = strip_yo(receiver)
+    amt = int(diverse_amount(i, attempt))
     hh, mm = rng.randint(8, 22), rng.randint(0, 59)
     day = 10 + ((i * 3 + attempt * 5) % 19)  # 10..28
-    # Prefer amount lengths that fit corpus zero-comm slots (≈7 chars with spaces)
-    amt = rng.choice(
-        [
-            rng.randint(3000, 9999),
-            rng.randint(10000, 19999),
-            rng.randint(20000, 49999),
-            rng.randint(50000, 89999),
-        ]
-    )
     last4 = f"{(i * 137 + attempt * 41) % 10000:04d}"
     bin3 = rng.choice(["220220", "427612", "553691", "220070", "546938"])
     card = f"{bin3}******{last4}"
-    recv = pick_hard_tbank_recv(i, attempt)
     return {
         "date_time": f"{day:02d}.07.2026, {hh:02d}:{mm:02d}",
         "amount": str(amt),
-        "sender": f"{fn} {ln}",
-        "receiver": recv,
+        "sender": sender,
+        "receiver": receiver,
         "recipient_bank": "Сбербанк",
         "card": card,
         "commission": "0",
@@ -79,7 +74,72 @@ def _gen(data: dict):
     return create_tbank_stealth(data)
 
 
+def _f1_ok_advisories(pdf: bytes) -> str:
+    """Hard-local: skip Proton-known glyf/bbox FAKE before live send."""
+    try:
+        from tbank_sbp_stealth import (
+            _glyf_table_length,
+            _h471_f1_exact_pdf,
+            _h471_glyf_in_proton_band,
+            _pdf_f1_glyf_trailing_pad,
+            _sbp_structure_violations,
+        )
+
+        if not _h471_f1_exact_pdf(pdf):
+            try:
+                import fitz
+                import tbank_unlock_template as tut
+                _doc = fitz.open(stream=pdf, filetype="pdf")
+                _fr = tut._find_font_objects(_doc).get("TinkoffSans-Regular")
+                if not _fr:
+                    _doc.close()
+                    return "hard-local:glyf-cmap-outlier"
+                _ff = _doc.xref_stream(_fr["fontfile_xref"])
+                _tu = _doc.xref_stream(_fr["tounicode_xref"])
+                _doc.close()
+                _sub = tut._parse_subset_tounicode(
+                    _tu.decode("latin1", "replace"),
+                )
+                _g = int(_glyf_table_length(_ff))
+                _cn = len(_sub)
+                if not _h471_glyf_in_proton_band(_g, _cn):
+                    return "hard-local:glyf-cmap-outlier"
+            except Exception:
+                return "hard-local:glyf-cmap-outlier"
+        if _pdf_f1_glyf_trailing_pad(pdf) > 1:
+            return "hard-local:glyf-trailing"
+        flags = _sbp_structure_violations(pdf, channel="card_sber")
+        if any(str(f).startswith("f1-bbox") for f in flags):
+            return "hard-local:f1-bbox"
+        if any(str(f).startswith("cmap-outlier") for f in flags):
+            return "hard-local:glyf-cmap-outlier"
+        if any(str(f).startswith("cmap-unknown") for f in flags):
+            return "hard-local:glyf-cmap-outlier"
+        if any(str(f).startswith("f1-glyf-pad") for f in flags):
+            return "hard-local:glyf-trailing"
+    except Exception:
+        pass
+    try:
+        from tbank_emit import emit_invariants
+
+        why = emit_invariants(pdf, channel="card_sber")
+        if why:
+            print(f"  local-advisory {why} — send to bots", flush=True)
+            if why.startswith("glyph mismatch mutated-twin-glyf"):
+                return "hard-local:mutated-twin-glyf"
+            if why.startswith("glyph mismatch glyf-cmap-outlier"):
+                return "hard-local:glyf-cmap-outlier"
+            if why.startswith("glyph mismatch trailing-junk"):
+                return "hard-local:glyf-trailing"
+    except Exception:
+        pass
+    return ""
+
+
 def _local_ok(pdf: bytes) -> tuple[bool, str]:
+    adv = _f1_ok_advisories(pdf)
+    if adv:
+        return False, adv
     try:
         doc = fitz.open(stream=pdf, filetype="pdf")
         text = doc[0].get_text()
@@ -132,7 +192,7 @@ async def main() -> int:
         n=n,
         payload_fn=_payload,
         gen_fn=_gen,
-        validate_fn=_local_ok,
+        validate_fn=wrap_validate("tbank_card_sber", _local_ok),
         prefix="card_sber",
         max_attempts=25,
         fresh=not args.keep,

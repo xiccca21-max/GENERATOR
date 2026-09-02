@@ -106,13 +106,16 @@ def _prepare_nc_data(data: Dict) -> Dict:
     sender_raw = str(data.get("sender", _ORIG_SENDER_NC))
     sender = _normalize_tbank_sender(sender_raw) or sender_raw
 
+    sender = _strip_yo_tverd(sender)
     return {
         "new_date":         new_date,
         "new_amount":       new_amount,
         "new_amount_total": new_amount_total,
-        "sender":           _strip_yo_tverd(sender),
+        "sender":           sender,
         "card":             _format_card_num(str(data.get("card", _ORIG_CARD_NC))),
         "receipt_raw":      receipt_raw,
+        "_user_sender": sender,
+        "_shell_sender": _ORIG_SENDER_NC,
     }
 
 
@@ -336,11 +339,18 @@ def _try_orig_mode_on(
         pdf[cs:ce] = raw
     else:
         from tbank_channel_common import compress_orig_stream
+        from tbank_sbp_stealth import _patch_length_and_rebuild
 
         new_compressed = compress_orig_stream(stream, orig_comp_len)
-        if new_compressed is None or len(new_compressed) != orig_comp_len:
+        if new_compressed is None:
             return None
-        pdf[cs:ce] = new_compressed
+        if len(new_compressed) != orig_comp_len:
+            rebuilt = _patch_length_and_rebuild(pdf, cs, ce, new_compressed)
+            if rebuilt is None:
+                return None
+            pdf = bytearray(rebuilt)
+        else:
+            pdf[cs:ce] = new_compressed
 
     from tbank_channel_common import finalize_orig_result
 
@@ -490,10 +500,16 @@ def create_tbank_nocomm_stealth(data: Dict) -> Optional[bytes]:
         dynamic_builder=_build_dynamic_nc,
     )
     if not pdf:
+        try:
+            pdf = _build_dynamic_nc(dict(prepared))
+        except Exception as exc:
+            logger.error("NOCOMM LAW1 dynamic retry: %s", exc)
+            pdf = None
+    if not pdf:
         return None
     lean = _lean_nocomm_fonts_after_face(pdf, prepared)
     if lean is None:
-        logger.error("nocomm lean miss — ship unleaned")
+        logger.error("nocomm lean miss — finish unleaned")
         lean = pdf
     if not _nocomm_font_sizes_ok(lean):
         logger.error("nocomm F1/F2 size gate — ship anyway")
@@ -501,8 +517,12 @@ def create_tbank_nocomm_stealth(data: Dict) -> Optional[bytes]:
         lean, prepared, donor_senders=(_ORIG_SENDER_NC,),
     )
     if not ok:
-        logger.error("NOCOMM: %s — ship anyway", why)
-    return lean
+        logger.error("NOCOMM: %s — finish anyway", why)
+    from tbank_dynamic import _tbank_finish_non_sbp_ship
+
+    return _tbank_finish_non_sbp_ship(
+        lean, height=411, prepared=prepared, channel="nocomm",
+    )
 
 
 def _nocomm_font_sizes_ok(pdf: bytes) -> bool:

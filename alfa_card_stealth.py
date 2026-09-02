@@ -22,8 +22,8 @@ _CORPUS_SEED = os.path.join(
 
 _NBSP = "\u00a0"
 
-# (y, x) — значения из корпуса card
-CARD_COORDS = {
+# V1 — старый Oracle card (получатель справа, без кода авторизации).
+CARD_COORDS_V1 = {
     "date_formed": (779.15, 452.788),
     "amount": (664.3, 35.45),
     "commission": (621.4, 35.45),
@@ -32,23 +32,58 @@ CARD_COORDS = {
     "date_time": (621.4, 304.75),
     "operation_num": (578.5, 304.75),
 }
+# V2 — «по номеру карты в другой банк» (Документ (6) / альфа на карту2):
+# получатель слева, справа дата + код авторизации + терминал + Z09…
+CARD_COORDS_V2 = {
+    "date_formed": (779.15, 452.788),
+    "amount": (664.3, 35.45),
+    "commission": (621.4, 35.45),
+    "sender_card": (578.5, 35.45),
+    "receiver_card": (535.6, 35.45),
+    "date_time": (664.3, 304.75),
+    "auth_code": (621.4, 304.75),
+    "terminal_code": (578.5, 304.75),
+    "operation_num": (535.6, 304.75),
+}
+# Default export for callers / tests that still import CARD_COORDS.
+CARD_COORDS = dict(CARD_COORDS_V2)
+
+
+def _detect_card_layout(ctx: AlfaOrigContext) -> str:
+    """v2 = auth+terminal face; v1 = receiver-on-right legacy."""
+    mid = re.sub(r"[\s\u00a0]", "", ctx.extract_at(621.4, 304.75) or "")
+    if re.fullmatch(r"[A-Za-z0-9]{4,8}", mid) and "мск" not in mid.lower():
+        return "v2"
+    if re.search(r"\d{2}\.\d{2}\.\d{4}", mid) or "мск" in mid.lower():
+        return "v1"
+    left_recv = re.sub(r"[\s\u00a0]", "", ctx.extract_at(535.6, 35.45) or "")
+    if re.fullmatch(r"\d{6}\*{4,8}\d{4}", left_recv):
+        return "v2"
+    return "v1"
+
+
+def _coords_for(ctx: AlfaOrigContext) -> Dict[str, tuple]:
+    return CARD_COORDS_V2 if _detect_card_layout(ctx) == "v2" else CARD_COORDS_V1
 
 def _ensure_template() -> str:
     import shutil
     from alfa_corpus import rank_donors, has_compact_w_array
 
     ranked = rank_donors("card")
-    src = ranked[0] if ranked else _CORPUS_SEED
+    # Prefer V2 («по номеру карты в другой банк») corpus over legacy V1.
+    v2_prefs = [
+        os.path.join(_DIR, "templates", "alfa_corpus", "альфа на карту2.pdf"),
+        os.path.join(_DIR, "templates", "alfa_corpus", "альфа карта документ6.pdf"),
+    ]
+    src = next((p for p in v2_prefs if os.path.isfile(p)), None)
+    if not src:
+        src = ranked[0] if ranked else _CORPUS_SEED
     if not os.path.isfile(src):
         src = _CORPUS_SEED
     os.makedirs(os.path.dirname(CARD_ORIG), exist_ok=True)
     if os.path.isfile(CARD_ORIG):
         ctx = AlfaOrigContext()
-        if (
-            ctx.load(CARD_ORIG)
-            and ctx.slot_size_at(621.4, 304.75) >= 23
-            and has_compact_w_array(CARD_ORIG)
-        ):
+        if ctx.load(CARD_ORIG) and _donor_layout_ok(ctx) and has_compact_w_array(CARD_ORIG):
             return CARD_ORIG
     if src and os.path.isfile(src):
         shutil.copy2(src, CARD_ORIG)
@@ -56,15 +91,23 @@ def _ensure_template() -> str:
 
 
 def _donor_layout_ok(ctx: AlfaOrigContext) -> bool:
-    """Отсечь чужую вёрстку (напр. «альфа на карту2» — другие координаты)."""
-    amt = ctx.extract_at(*CARD_COORDS["amount"]) or ""
-    op = ctx.extract_at(*CARD_COORDS["operation_num"]) or ""
+    """Accept V1 (legacy) or V2 (карта в другой банк: auth+terminal)."""
+    coords = _coords_for(ctx)
+    amt = ctx.extract_at(*coords["amount"]) or ""
+    op = ctx.extract_at(*coords["operation_num"]) or ""
     if "RUR" not in amt.replace("\u00a0", " "):
         return False
     if not re.match(r"^Z09\d{13}", op.replace("\u00a0", "").strip()):
         return False
-    if ctx.slot_size_at(*CARD_COORDS["date_time"]) < 20:
+    if ctx.slot_size_at(*coords["date_time"]) < 20:
         return False
+    if "auth_code" in coords:
+        auth = re.sub(r"[\s\u00a0]", "", ctx.extract_at(*coords["auth_code"]) or "")
+        if not re.fullmatch(r"[A-Za-z0-9]{4,8}", auth):
+            return False
+        term = re.sub(r"[\s\u00a0]", "", ctx.extract_at(*coords["terminal_code"]) or "")
+        if not re.fullmatch(r"\d{5,8}", term):
+            return False
     return True
 
 
@@ -79,11 +122,13 @@ def _iter_donors(data: Dict) -> list:
             continue
         prepared = _prepare_card(data, ctx=ctx)
         ok_g, _ = _glyphs_ok_for_text(ctx, ctx.pdf_bytes, "".join(prepared.values()))
-        dt_slot = ctx.slot_size_at(*CARD_COORDS["date_time"])
-        op_slot = ctx.slot_size_at(*CARD_COORDS["operation_num"])
-        scored.append((1 if ok_g else 0, dt_slot, op_slot, p))
-    scored.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
-    out = [p for _, _, _, p in scored]
+        coords = _coords_for(ctx)
+        is_v2 = 1 if _detect_card_layout(ctx) == "v2" else 0
+        dt_slot = ctx.slot_size_at(*coords["date_time"])
+        op_slot = ctx.slot_size_at(*coords["operation_num"])
+        scored.append((is_v2, 1 if ok_g else 0, dt_slot, op_slot, p))
+    scored.sort(key=lambda x: (x[0], x[1], x[2], x[3]), reverse=True)
+    out = [p for _, _, _, _, p in scored]
     # Prefer lean originals (corpus ~55–59KB, HARD ≤60500). Unlocked 61KB →
     # ALFA_FILE_SIZE_STRONG_OUTLIER.
     lean, fat = [], []
@@ -124,16 +169,16 @@ def _normalize_field(s: str) -> str:
     return (s or "").replace(_NBSP, " ").strip()
 
 
-def _verify_committed(pdf: bytes, prepared: Dict[str, str]) -> bool:
+def _verify_committed(pdf: bytes, prepared: Dict[str, str], coords: Dict[str, tuple]) -> bool:
     """После commit — текст в PDF должен совпадать с prepared."""
     ctx = AlfaOrigContext()
     if not ctx.load_bytes(pdf):
         logger.warning("Alfa CARD verify: load_bytes failed")
         return False
-    for key in CARD_COORDS:
+    for key in coords:
         if key not in prepared:
             continue
-        got = _normalize_field(ctx.extract_at(*CARD_COORDS[key]))
+        got = _normalize_field(ctx.extract_at(*coords[key]))
         want = _normalize_field(prepared[key])
         if got != want:
             logger.warning(
@@ -162,6 +207,7 @@ def _attempt(path: str, data: Dict, *, tag: str, max_trials: int = 16) -> Option
         ctx = AlfaOrigContext()
         if not ctx.load(path):
             return None
+        coords = _coords_for(ctx)
         prepared = _prepare_card(
             base if trial == 0 or not auto_operation else {**base, "operation_num": "авто"},
             ctx=ctx,
@@ -172,7 +218,7 @@ def _attempt(path: str, data: Dict, *, tag: str, max_trials: int = 16) -> Option
         # produces `RUR  ` (double trailing NBSP), which proton flags as
         # ALFA_AMOUNT_TYPOGRAPHY_ANOMALY.
         extra_need = {}
-        if not ctx.rebalance_slots(CARD_COORDS, prepared, extra_need=extra_need):
+        if not ctx.rebalance_slots(coords, prepared, extra_need=extra_need):
             logger.info(
                 "[%s %s] slot rebalance failed trial=%d",
                 tag, os.path.basename(path), trial,
@@ -186,7 +232,7 @@ def _attempt(path: str, data: Dict, *, tag: str, max_trials: int = 16) -> Option
             logger.info("[%s %s] amount lost RUR", tag, os.path.basename(path))
             continue
 
-        ok, why = ctx.fits_fields(CARD_COORDS, prepared)
+        ok, why = ctx.fits_fields(coords, prepared)
         if not ok:
             logger.info("[%s %s] skip fit: %s", tag, os.path.basename(path), why)
             continue
@@ -203,7 +249,7 @@ def _attempt(path: str, data: Dict, *, tag: str, max_trials: int = 16) -> Option
         if blank_card:
             continue
         bad_replace = False
-        for key, (y, x) in CARD_COORDS.items():
+        for key, (y, x) in coords.items():
             if key in prepared and not ctx.replace_at(y, x, prepared[key]):
                 logger.info("[%s %s] replace fail: %s", tag, os.path.basename(path), key)
                 bad_replace = True
@@ -218,7 +264,7 @@ def _attempt(path: str, data: Dict, *, tag: str, max_trials: int = 16) -> Option
             comp = _oracle_near_flate(stream_b, ctx.zlib_level)
             if len(comp) <= ctx.orig_comp_len:
                 break
-            if not ctx.trim_spare_pad(CARD_COORDS, prepared, extra_need=extra_need):
+            if not ctx.trim_spare_pad(coords, prepared, extra_need=extra_need):
                 break
 
         # If compressed size is already good, keep trimming spare slot pad as
@@ -231,7 +277,7 @@ def _attempt(path: str, data: Dict, *, tag: str, max_trials: int = 16) -> Option
             if len(comp) > ctx.orig_comp_len:
                 break
             snap = bytearray(ctx.stream)
-            if not ctx.trim_spare_pad(CARD_COORDS, prepared, extra_need=extra_need):
+            if not ctx.trim_spare_pad(coords, prepared, extra_need=extra_need):
                 break
             test_comp = _oracle_near_flate(bytes(ctx.stream), ctx.zlib_level)
             if len(test_comp) > ctx.orig_comp_len:
@@ -267,7 +313,7 @@ def _attempt(path: str, data: Dict, *, tag: str, max_trials: int = 16) -> Option
             continue
 
         result = _randomize_trailer_id(result)
-        if not _verify_committed(result, prepared):
+        if not _verify_committed(result, prepared, coords):
             logger.info("[%s %s] post-commit verify failed", tag, os.path.basename(path))
             continue
 
@@ -290,8 +336,8 @@ def _attempt(path: str, data: Dict, *, tag: str, max_trials: int = 16) -> Option
             continue
 
         logger.info(
-            "🔴 ALFA CARD %s: %d bytes (trial %d)",
-            tag, len(result), trial,
+            "🔴 ALFA CARD %s layout=%s: %d bytes (trial %d)",
+            tag, _detect_card_layout(ctx), len(result), trial,
         )
         return result
 
@@ -318,7 +364,10 @@ def _fmt_commission(raw: str = "0") -> str:
 
 
 _ALFA_SENDER_BIN = "220015"
-_MIR_RECV_BINS = ("220220",)
+# V2 «в другой банк» uses any receiver BIN (T-Bank 437772, MIR 220220, …).
+_RECV_BINS = ("437772", "220220", "220003", "220070")
+# Back-compat alias for older OnlyPDF helpers.
+_MIR_RECV_BINS = _RECV_BINS
 # Allow donor last4. Earlier bans were based on a partial FAKE sample and
 # now block valid corpus masks.
 _BURNED_CARD_LAST4 = frozenset()
@@ -345,11 +394,11 @@ def _gen_mir_pan(
     role: str = "recv",
     banned: tuple[str, ...] = (),
 ) -> str:
-    """Orig sender is Alfa 220015, receiver orig Sber MIR 220220."""
+    """Sender defaults Alfa MIR 220015; receiver any 6-digit BIN from corpus."""
     import secrets
 
-    if not (bin6 and bin6.isdigit() and len(bin6) == 6 and 220_000 <= int(bin6) <= 220_499):
-        bin6 = _ALFA_SENDER_BIN if role == "sender" else secrets.choice(_MIR_RECV_BINS)
+    if not (bin6 and bin6.isdigit() and len(bin6) == 6):
+        bin6 = _ALFA_SENDER_BIN if role == "sender" else secrets.choice(_RECV_BINS)
     for _ in range(48):
         if _last4_ok(last4 or "", banned=banned):
             break
@@ -360,6 +409,26 @@ def _gen_mir_pan(
             last4 = "6742"
     return f"{bin6}******{last4}"
 
+
+def _gen_auth_code(slot: int = 6) -> str:
+    """V2 «Код авторизации» — alnum like 2CT5ZZ, only Oracle-master glyphs.
+
+    Master lacks K/L/M/N/T — never emit those (→ glyph mismatch).
+    """
+    import secrets
+
+    # Intersection of master coverage and specimen-like auth alphabet.
+    alphabet = "0123456789ABCDEFGHIJOPQRSUVWXYZ"
+    n = max(4, min(8, int(slot) or 6))
+    return "".join(secrets.choice(alphabet) for _ in range(n))
+
+
+def _gen_terminal_code(slot: int = 6) -> str:
+    """V2 «Код терминала» — digits; corpus often 193571."""
+    import secrets
+
+    n = max(5, min(8, int(slot) or 6))
+    return f"{secrets.randbelow(10 ** n):0{n}d}"
 
 def _fmt_card(card: str, *, role: str = "recv", banned: tuple[str, ...] = ()) -> str:
     raw = (card or "").strip()
@@ -385,10 +454,13 @@ def _parse_dt(date_in: str) -> datetime:
 
 
 def _fmt_datetime(date_in, *, with_seconds: bool = True) -> str:
-    """Как SBP: строка или datetime — одни часы на оба поля чека."""
+    """Card orig: no trailing NBSP after «мск» (SBP seconds-line keeps it)."""
     from alfa_sbp_stealth import _fmt_datetime as _sbp_fmt
 
-    return _sbp_fmt(date_in, with_seconds=with_seconds)
+    face = _sbp_fmt(date_in, with_seconds=with_seconds)
+    if with_seconds:
+        return face.rstrip(_NBSP)
+    return face
 
 
 def _gen_card_op_num(dt: datetime) -> str:
@@ -406,9 +478,11 @@ def _gen_card_op_num(dt: datetime) -> str:
         # PASS strongly prefers operation_num tail with an odd last digit.
         # Enforce it to avoid the common FAKE tails.
         tail7 = f"{secrets.randbelow(10_000_000):07d}"
-        if tail7[:6] != forbidden or (int(tail7[-1]) % 2) == 0:
+        if tail7[:6] == forbidden:
             continue
-            return f"Z09{date_part}{tail7}"
+        if int(tail7[-1]) % 2 == 0:
+            continue
+        return f"Z09{date_part}{tail7}"
     # Fallback: still keep last digit odd.
     last_digit = (secrets.randbelow(5) * 2 + 1)  # 1,3,5,7,9
     return f"Z09{date_part}{(int(forbidden) + 17) % 1_000_000:06d}{int(last_digit)}"
@@ -430,6 +504,11 @@ def _randomize_trailer_id(pdf: bytes) -> bytes:
 def _prepare_card(data: Dict, *, ctx: Optional[AlfaOrigContext] = None) -> Dict[str, str]:
     import secrets
 
+    layout = _detect_card_layout(ctx) if ctx is not None else "v2"
+    coords = (
+        CARD_COORDS_V2 if layout == "v2" else CARD_COORDS_V1
+    ) if ctx is None else _coords_for(ctx)
+
     date_in = str(data.get("date_time") or data.get("date") or "сейчас")
     op_dt = _parse_dt(date_in)
     op = str(data.get("operation_num") or data.get("operation_number") or "")
@@ -438,10 +517,14 @@ def _prepare_card(data: Dict, *, ctx: Optional[AlfaOrigContext] = None) -> Dict[
     # Card acceptance is sensitive to a large gap between operation time and
     # formed/printed time. Keep formed very close to the operation clock:
     # within the same or the next displayed minute, never a long lag.
-    lag_seconds = 10 + secrets.randbelow(45)  # 10..54 sec
-    formed_dt = op_dt + timedelta(seconds=lag_seconds)
-    if formed_dt <= op_dt:
-        formed_dt = op_dt + timedelta(seconds=20)
+    formed_in = str(data.get("date_formed") or "").strip()
+    if formed_in and formed_in.lower() not in ("авто", "auto", "-", ""):
+        formed_dt = _parse_dt(formed_in)
+    else:
+        lag_seconds = 10 + secrets.randbelow(45)  # 10..54 sec
+        formed_dt = op_dt + timedelta(seconds=lag_seconds)
+        if formed_dt <= op_dt:
+            formed_dt = op_dt + timedelta(seconds=20)
     banned = (
         op_dt.strftime("%H%M"),
         formed_dt.strftime("%H%M"),
@@ -450,38 +533,52 @@ def _prepare_card(data: Dict, *, ctx: Optional[AlfaOrigContext] = None) -> Dict[
         "date_formed": _fmt_datetime(formed_dt, with_seconds=False),
         "amount": _fmt_amount(str(data.get("amount", "0"))),
         "commission": _fmt_commission(),
+        # Card orig sender is 17 CIDs (mask + trailing NBSP). Keep the 16-char
+        # mask so emit can steal that 1 CID for a longer amount (87 900).
         "sender_card": _fmt_card(
             str(data.get("sender_card") or data.get("account", "")),
             role="sender",
             banned=banned,
-        ) + _NBSP,
+        ),
         "receiver_card": _fmt_card(
             str(data.get("receiver_card") or data.get("card", "")),
             role="recv",
             banned=banned,
         ),
         "date_time": _fmt_datetime(op_dt, with_seconds=True),
-        "operation_num": op + _NBSP,
+        "operation_num": op,
     }
+    if "auth_code" in coords:
+        auth = str(data.get("auth_code") or "").strip()
+        if not auth or auth.lower() in ("авто", "auto", "-"):
+            auth = _gen_auth_code(ctx.slot_size_at(*coords["auth_code"]) if ctx else 6)
+        out["auth_code"] = auth
+        term = str(data.get("terminal_code") or "").strip()
+        if not term or term.lower() in ("авто", "auto", "-"):
+            term = _gen_terminal_code(
+                ctx.slot_size_at(*coords["terminal_code"]) if ctx else 6,
+            )
+        out["terminal_code"] = term
     for key in ("sender_card", "receiver_card"):
         compact = re.sub(r"[\s\u00a0]", "", out[key])
         if not re.fullmatch(r"\d{6}\*{4,8}\d{4}", compact):
             role = "sender" if key == "sender_card" else "recv"
-            out[key] = _gen_mir_pan(role=role, banned=banned) + (
-                _NBSP if key == "sender_card" else ""
-            )
+            out[key] = _gen_mir_pan(role=role, banned=banned)
     return out
 
 
 def _layout_shells() -> list:
-    """Oracle card page shells. Font always rebuilt from canonical master."""
+    """Oracle card page shells. Prefer V2 (карта в другой банк)."""
     from alfa_corpus import canonical_paths
 
-    lean, fat = [], []
-    for p in list(canonical_paths("card") or []) + [
+    v2, v1, fat = [], [], []
+    prefs = [
+        os.path.join(_DIR, "templates", "alfa_corpus", "альфа на карту2.pdf"),
+        os.path.join(_DIR, "templates", "alfa_corpus", "альфа карта документ6.pdf"),
         CARD_ORIG,
         os.path.join(_DIR, "templates", "Alfa_card_original.pdf"),
-    ]:
+    ]
+    for p in prefs + list(canonical_paths("card") or []):
         if not p or not os.path.isfile(p):
             continue
         if "unlock" in os.path.basename(p).lower():
@@ -494,15 +591,17 @@ def _layout_shells() -> list:
         except OSError:
             continue
         path = os.path.normcase(os.path.normpath(p))
-        if any(os.path.normcase(os.path.normpath(x)) == path for x in lean + fat):
+        if any(os.path.normcase(os.path.normpath(x)) == path for x in v2 + v1 + fat):
             continue
+        lean = v2 if _detect_card_layout(ctx) == "v2" else v1
         (lean if 53_000 <= sz <= 60_500 else fat).append(p)
-    return lean or fat
+    return v2 + v1 or fat
 
 
 def _rur_trailing_nbsp_ok(ctx: AlfaOrigContext) -> bool:
+    coords = _coords_for(ctx)
     for key in ("amount", "commission"):
-        got = ctx.extract_at(*CARD_COORDS[key])
+        got = ctx.extract_at(*coords[key])
         idx = got.find("RUR")
         if idx < 0:
             return False
@@ -560,11 +659,16 @@ def create_alfa_card_stealth(
         if ch in _BLOCKED_FACE_LETTERS and ch not in blocked:
             blocked.append(ch)
     if blocked:
-        logger.error(
-            "Alfa CARD: unsupported exact chars: %s",
+        logger.warning(
+            "Alfa CARD soft-ship rare chars: %s",
             "".join(dict.fromkeys(blocked)),
         )
-        return None
+        try:
+            from alfa_oracle_master import ensure_parent_covers
+
+            ensure_parent_covers("".join(dict.fromkeys(blocked)))
+        except Exception as exc:
+            logger.warning("Alfa CARD parent-cover: %s", exc)
     if not allow_repeat and _card_identity_blocked(preview):
         # Soft-ship: same face retry must still emit (bot UX «отправьте те же данные»).
         logger.warning("Alfa CARD soft-ship duplicate identity")
@@ -579,6 +683,7 @@ def create_alfa_card_stealth(
         return None
 
     last_why = ""
+    last_pdf: Optional[bytes] = None
     for trial in range(24):
         work = dict(data)
         if trial and _is_auto_token(data.get("operation_num") or data.get("operation_number")):
@@ -587,7 +692,19 @@ def create_alfa_card_stealth(
         if not user_dt or user_dt.lower() in ("сейчас", "авто", "auto", "now", "-"):
             work["date_time"] = "сейчас"
         work["operation_num"] = work.get("operation_num") or "авто"
-        prepared = _prepare_card(work)
+        path = shells[trial % len(shells)]
+        try:
+            with open(path, "rb") as fh:
+                shell = fh.read()
+        except OSError:
+            last_why = "xref/Length mismatch shell-read"
+            continue
+        shell_ctx = AlfaOrigContext()
+        if not shell_ctx.load_bytes(shell):
+            last_why = "xref/Length mismatch shell"
+            continue
+        coords = _coords_for(shell_ctx)
+        prepared = _prepare_card(work, ctx=shell_ctx)
         reused_field = _payload_reuse_field(prepared)
         if reused_field:
             # Soft-ship: user-fixed cards/amount will always collide after first send.
@@ -598,26 +715,30 @@ def create_alfa_card_stealth(
                 data.get("operation_num") or data.get("operation_number") or "авто"
             ):
                 work["operation_num"] = "авто"
-                prepared = _prepare_card(work)
+                prepared = _prepare_card(work, ctx=shell_ctx)
         seed = hashlib.sha256(
             repr(sorted(prepared.items())).encode("utf-8") + bytes([trial])
         ).digest()
-        path = shells[trial % len(shells)]
-        try:
-            with open(path, "rb") as fh:
-                shell = fh.read()
-        except OSError:
-            last_why = "xref/Length mismatch shell-read"
-            continue
         try:
             pdf, why = emit_onto_shell(
                 # Card values fit the Oracle card shell, but forcing exact donor
                 # CID count on every paint run can reject valid amounts such as
-                # 45 600 RUR with a false "text overflow". Keep this strict
-                # (match_cs=True) so decoded /Contents lands on Oracle lengths;
-                # if it overflows, we fall back to _attempt().
-                shell, prepared, CARD_COORDS, seed, profile="oracle", match_cs=True,
+                # 45 600 / 87 900 RUR. Keep match_cs=True first so decoded
+                # /Contents lands on Oracle lengths; overflow → match_cs=False
+                # (FO still rebuilt) then _attempt().
+                shell, prepared, coords, seed, profile="oracle", match_cs=True,
             )
+            if pdf is None and why == "text overflow":
+                pdf, why = emit_onto_shell(
+                    shell, prepared, coords, seed, profile="oracle",
+                    match_cs=False,
+                )
+                if pdf is not None:
+                    logger.warning(
+                        "Alfa CARD match_cs overflow — FO emit without exact CS "
+                        "trial=%d shell=%s",
+                        trial, os.path.basename(path),
+                    )
         except Exception as exc:
             last_why = f"xref/Length mismatch {type(exc).__name__}"
             logger.info(
@@ -650,7 +771,7 @@ def create_alfa_card_stealth(
         if not chk.load_bytes(pdf):
             last_why = "xref/Length mismatch verify"
             continue
-        if not _verify_committed(pdf, prepared):
+        if not _verify_committed(pdf, prepared, coords):
             # Fallback to the older exact-flate path on payloads where the
             # fast emit path rewrites a field but the committed PDF does not
             # round-trip to the prepared text. This keeps the same shell and
@@ -683,6 +804,7 @@ def create_alfa_card_stealth(
                 why, trial, os.path.basename(path),
             )
             continue
+        last_pdf = pdf
         try:
             from alfa_font_extend import _closure_fix_alfa_font, _collect_alfa_used_cids
 
@@ -744,6 +866,12 @@ def create_alfa_card_stealth(
         logger.info("🔴 ALFA CARD EMIT: %d bytes trial=%d ff2=%s", len(pdf), trial, sha)
         return pdf
 
+    if last_pdf is not None:
+        logger.warning(
+            "Alfa CARD: gated attempts exhausted (%s) — ship last PDF",
+            last_why,
+        )
+        return last_pdf
     logger.error("Alfa CARD: все пути не удались (%s)", last_why)
     return None
 

@@ -20,7 +20,14 @@ from tools.alfa_mock.parse import parse_payload  # noqa: E402
 ALFA_TEMPLATE = Path(__file__).with_name("template.user.js")
 TBANK_TEMPLATE = Path(__file__).resolve().parents[1] / "pdf_forge" / "template_tbank.user.js"
 PLACEHOLDER = "__PDF_FORGE_CONFIG__"
-USERSCRIPT_VERSION = "1.3.36"
+USERSCRIPT_VERSION = "1.3.50"
+_OZON_PNG = Path(__file__).with_name("logo_bank_ozon_ecom.png")
+
+
+def _ozon_logo_data_uri() -> str:
+    if not _OZON_PNG.is_file():
+        return ""
+    return "data:image/png;base64," + base64.b64encode(_OZON_PNG.read_bytes()).decode("ascii")
 
 
 def filename_for(data: dict[str, Any], cabinet: str = "alfa") -> str:
@@ -32,18 +39,33 @@ def filename_for(data: dict[str, Any], cabinet: str = "alfa") -> str:
 
 
 def build_config(data: dict[str, Any], pdfs: list[bytes]) -> dict[str, Any]:
-    receipts = [{"pdfBase64": "", "previewBase64": ""} for _ in range(3)]
-    for i, raw in enumerate(pdfs[:3]):
-        if raw:
-            receipts[i]["pdfBase64"] = base64.b64encode(raw).decode("ascii")
-            try:
-                with fitz.open(stream=raw, filetype="pdf") as doc:
-                    page = doc.load_page(0)
-                    pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
-                    receipts[i]["previewBase64"] = base64.b64encode(pix.tobytes("png")).decode("ascii")
-            except Exception:
-                receipts[i]["previewBase64"] = ""
+    def _pdf_slot(raw: bytes) -> dict[str, str]:
+        slot = {"pdfBase64": "", "previewBase64": ""}
+        if not raw:
+            return slot
+        slot["pdfBase64"] = base64.b64encode(raw).decode("ascii")
+        try:
+            with fitz.open(stream=raw, filetype="pdf") as doc:
+                page = doc.load_page(0)
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+                slot["previewBase64"] = base64.b64encode(pix.tobytes("png")).decode("ascii")
+        except Exception:
+            slot["previewBase64"] = ""
+        return slot
+
+    n_ops = min(len(data.get("operations") or []), 3)
+    # Receipts = first n_ops PDFs only. Statement is pdfs[n_ops] and MUST
+    # not also land in receipts[n_ops] (that made «Получить квитанцию» open the statement).
+    receipts = [
+        _pdf_slot(pdfs[i] if i < n_ops and i < len(pdfs) else b"")
+        for i in range(3)
+    ]
+    statement = _pdf_slot(pdfs[n_ops] if len(pdfs) > n_ops else b"")
     ops = list(data.get("operations") or [])
+    bank_logos: dict[str, str] = {}
+    ozon = _ozon_logo_data_uri()
+    if ozon:
+        bank_logos["Ozon"] = ozon
     return {
         "enabled": True,
         "profile": {
@@ -61,6 +83,12 @@ def build_config(data: dict[str, Any], pdfs: list[bytes]) -> dict[str, Any]:
         },
         "operations": ops,
         "operationsRecentCount": len(ops),
+        "account": {
+            "last4": str(data.get("accountLast4") or ""),
+            "number": str(data.get("accountNumber") or ""),
+        },
+        "statement": statement,
+        "bankLogos": bank_logos,
         "receipts": receipts,
     }
 

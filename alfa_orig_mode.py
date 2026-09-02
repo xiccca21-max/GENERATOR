@@ -15,10 +15,11 @@ _NBSP = "\u00a0"
 _TM_RE = re.compile(
     rb"(?:1 0 0 1|[\d.]+ 0 0 [\d.]+) ([\d.]+) ([\d.]+)\s+Tm"
 )
-# Semantic trailing NBSP (CID 000A): datetime, operation id, FIO, RUR amounts.
+# Semantic trailing NBSP (CID 000A): operation id, FIO, date_time (with seconds).
+# date_formed is minute-only «DD.MM.YYYY HH:MM мск» — no trailing NBSP (donor slot).
 # phone / bank / account / SBP / message — no trailing NBSP.
 _TRAILING_NBSP_KEYS = frozenset({
-    "receiver", "operation_num", "date_time", "date_formed",
+    "receiver", "operation_num", "date_time",
 })
 
 

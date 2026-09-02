@@ -37,8 +37,9 @@ PDF forge ({label})
 1) Одним сообщением — ФИО, баланс, траты, доходы, до 3 операций.
    Имя в шапке (Главный): строка «Имя: …» или 2-е слово в «ФИО: Фамилия Имя …».
    Это имя не подставляется в историю и фильтры.
+   Счёт: 6324 — маска «Текущий счёт ••6324» на странице «Получить».
    Оп1 — новая строка в истории (как «Алина А.»), не перезапись чужого перевода.
-2) Бот попросит PDF — пришли 1–3 файла (первый = самая свежая операция).
+2) PDF: сначала чеки операций, затем PDF выписки (верхняя в «Справки и выписки»).
 3) /done — собрать файл.
 
 /example — скопировать готовый шаблон
@@ -47,7 +48,11 @@ PDF forge ({label})
   Сбербанк · Озон · Т-Банк · Альфа-Банк · ВТБ · Райффайзен
 Другое название — операция будет, логотип как не загрузился.
 
-В операции: Банк + Тел (чек). По желанию — Время: 18.08.2026 22:57 (или только 22:57 = сегодня).
+В операции: Банк + Тип: сбп|карта.
+  СБП — Тел обязателен; в истории «Переводы · СБП · Банк», имя как «Имя Ф.».
+  Карта (= по номеру карты в другой банк) — без СБП: «Переводы · Т-Банк»,
+  заголовок «Альфа-карта МИР», опционально «Карта: ··1666». Тел не нужен.
+По желанию — Время: 18.08.2026 22:57 (или только 22:57 = сегодня).
 Профиль: Почта + Телефон.
 Кабинет: {cabinet}
 
@@ -159,7 +164,15 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not data:
         await update.effective_message.reply_text("Сначала пришли данные. /example — шаблон.")
         raise ApplicationHandlerStop
-    await _ship(update, st, data, st.get("pdfs") or [])
+    pdfs = st.get("pdfs") or []
+    ops = data.get("operations") or []
+    if ops and not pdfs:
+        await update.effective_message.reply_text(
+            "Нет PDF — Альфа откроет свой HTML «Перевод по СБП», не твой документ.\n"
+            "Пришли PDF (как документ.pdf), потом снова /done."
+        )
+        raise ApplicationHandlerStop
+    await _ship(update, st, data, pdfs)
     context.user_data.pop(SESSION_KEY, None)
     raise ApplicationHandlerStop
 
@@ -202,7 +215,8 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.effective_message.reply_text("Нужен PDF.")
         raise ApplicationHandlerStop
     pdfs: list[bytes] = st.setdefault("pdfs", [])
-    need = min(len(data.get("operations") or []), 3) or 1
+    n_ops = min(len(data.get("operations") or []), 3)
+    need = n_ops + 1
     if len(pdfs) >= need:
         await update.effective_message.reply_text("Уже достаточно PDF. /done — собрать.")
         raise ApplicationHandlerStop
@@ -210,7 +224,10 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     pdfs.append(bytes(await tg_file.download_as_bytearray()))
     left = need - len(pdfs)
     if left > 0:
-        await update.effective_message.reply_text(f"PDF {len(pdfs)}/{need}. Ещё {left} или /done.")
+        kind = "выписки" if len(pdfs) >= n_ops else "операции"
+        await update.effective_message.reply_text(
+            f"PDF {len(pdfs)}/{need} ({kind}). Ещё {left} или /done."
+        )
         raise ApplicationHandlerStop
     await _ship(update, st, data, pdfs)
     context.user_data.pop(SESSION_KEY, None)
@@ -219,6 +236,9 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def _ship(update: Update, st: dict, data: dict, pdfs: list[bytes]) -> None:
     cabinet = st.get("cabinet") or "alfa"
+    pdfs = list(pdfs or [])
+    n_pdf = sum(1 for p in pdfs if p)
+    n_ops = len(data.get("operations") or [])
     js = assemble(data, pdfs, cabinet)
     fname = filename_for(data, cabinet)
     ver = "2.0.3" if cabinet == "tbank" else USERSCRIPT_VERSION
@@ -229,10 +249,16 @@ async def _ship(update: Update, st: dict, data: dict, pdfs: list[bytes]) -> None
         f"Имя в шапке: {data['firstName']}\n"
         f"Почта: {data['email']}\n"
         f"Телефон: {data['profilePhone']}\n"
-        f"Баланс: {data['balance']}; операций: {len(data.get('operations') or [])}\n"
+        f"Счёт: ••{data.get('accountLast4') or '—'}\n"
+        f"Баланс: {data['balance']}; операций: {n_ops}; PDF вшито: {n_pdf}\n"
         "Userscripts → замени файл → перезапусти Safari.\n"
         f"{st.get('url') or ''}"
     )
+    if n_ops and n_pdf < min(n_ops, 3):
+        caption += (
+            "\n⚠️ Без PDF на каждую операцию Альфа покажет свой HTML-чек "
+            "«Перевод по СБП», не Oracle-документ."
+        )
     buf = BytesIO(js.encode("utf-8"))
     await update.effective_message.reply_document(
         document=buf,

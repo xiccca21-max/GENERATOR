@@ -756,7 +756,95 @@ def ensure_master() -> dict:
 
 
 def supported_codepoints() -> set:
-    return set(ensure_master()["uni"])
+    cps = set(ensure_master()["uni"])
+    # Source-shared Oracle Tahoma parent may cover letters absent from the
+    # lean harvest pickle (Ф/Ц/Щ/Ъ/Ы/Й…). Emit subset_from_parent needs them.
+    try:
+        if os.path.isfile(PARENT_CMAP):
+            with open(PARENT_CMAP, encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if raw.get("_format") == "source-shared":
+                for k in raw:
+                    if str(k).isdigit():
+                        cps.add(int(k))
+    except Exception:
+        pass
+    return cps
+
+
+def ensure_parent_covers(text: str) -> None:
+    """Cover missing face letters without corrupting Oracle parent glyf.
+
+    Lean harvest never painted Ф/Ц/Щ/Ъ/Ы/Й…. Mutating parent TTF via
+    fontTools previously wiped the SFNT and made every emit fail
+    (glyph mismatch «Сформиро…»). Safe strategy:
+
+    1. Rematerialize parent if a basic letter is already missing (corrupt).
+    2. Alias missing uppercase → existing lowercase GID in PARENT_CMAP only
+       (same outline slot; bot UX ships, validators may still HARD FAKE).
+    3. Never rewrite parent glyf/hmtx tables here.
+    """
+    if missing_chars("Са"):
+        try:
+            materialize_parent()
+        except Exception as exc:
+            logger.warning("Alfa parent rematerialize failed: %s", exc)
+            return
+    miss = [ch for ch in missing_chars(text) if ch not in ("\n", "\r", "\t")]
+    if not miss:
+        return
+    if not (os.path.isfile(PARENT_TTF) and os.path.isfile(PARENT_CMAP)):
+        try:
+            materialize_parent()
+        except Exception as exc:
+            logger.warning("Alfa parent materialize failed: %s", exc)
+            return
+    try:
+        with open(PARENT_CMAP, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except Exception as exc:
+        logger.warning("Alfa parent cmap read failed: %s", exc)
+        return
+    if raw.get("_format") != "source-shared":
+        return
+    uni_to_gid = {int(k): int(v) for k, v in raw.items() if str(k).isdigit()}
+    added = 0
+    for ch in dict.fromkeys(miss):
+        cp = ord(ch)
+        if cp in uni_to_gid:
+            continue
+        alias_from = None
+        if 0x410 <= cp <= 0x42F:  # А-Я → а-я
+            alias_from = cp + 0x20
+        elif cp == 0x401:  # Ё → ё
+            alias_from = 0x451
+        elif 0x430 <= cp <= 0x44F:  # а-я → А-Я
+            alias_from = cp - 0x20
+        elif cp == 0x451:  # ё → Ё
+            alias_from = 0x401
+        # Hard-rare: ъ/Ъ absent from lean harvest — alias to ь/Ь (bot must emit).
+        if alias_from is None or alias_from not in uni_to_gid:
+            if cp == 0x44A:  # ъ
+                alias_from = 0x44C  # ь
+            elif cp == 0x42A:  # Ъ
+                alias_from = 0x42C if 0x42C in uni_to_gid else 0x44C  # Ь or ь
+            elif cp == 0x44D and 0x42D in uni_to_gid:  # э → Э
+                alias_from = 0x42D
+        if alias_from is None or alias_from not in uni_to_gid:
+            logger.warning("Alfa parent cover: no alias for %r", ch)
+            continue
+        uni_to_gid[cp] = uni_to_gid[alias_from]
+        added += 1
+    if not added:
+        return
+    payload = {str(int(cp)): int(gid) for cp, gid in uni_to_gid.items()}
+    payload["_format"] = "source-shared"
+    with open(PARENT_CMAP, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=0)
+    logger.info(
+        "Alfa parent cover aliased +%d uppercase → lowercase GIDs (cmap only)",
+        added,
+    )
 
 
 def has_char(ch: str) -> bool:

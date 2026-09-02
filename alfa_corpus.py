@@ -38,7 +38,7 @@ CORPUS_DIR = _resolve_corpus_dir()
 
 _KIND_LABELS = {
     "sbp": "СБП",
-    "card": "Карта на карту",
+    "card": "По номеру карты в другой банк",
     "phone": "По телефону (Альфа→Альфа)",
     "unknown": "неизвестно",
 }
@@ -59,7 +59,11 @@ def classify_lines(lines: List[str], filename: str = "") -> str:
             return "phone"
     if "карт" in low_text and "на карту" in low_text:
         return "card"
-    if "карт" in low and ("на карту" in low or "карта" in low):
+    if "код авторизации" in low_text and "код терминала" in low_text:
+        return "card"
+    if "карт" in low and (
+        "на карту" in low or "карта" in low or "документ6" in low or "карту2" in low
+    ):
         return "card"
     if "сбп" in low_text or low.startswith("сбп") or "альфа сбп" in low:
         return "sbp"
@@ -218,9 +222,22 @@ def rank_donors(kind: str) -> List[str]:
             if kind == "sbp":
                 bank = ctx.slot_size_at(621.4, 304.75)
             elif kind == "card":
-                dt = ctx.slot_size_at(621.4, 304.75)
-                op = ctx.slot_size_at(578.5, 304.75)
+                from alfa_card_stealth import _coords_for, _detect_card_layout
+
+                coords = _coords_for(ctx)
+                dt = ctx.slot_size_at(*coords["date_time"])
+                op = ctx.slot_size_at(*coords["operation_num"])
                 bank = min(dt, op)
+                # Prefer V2 auth+terminal face for «карта в другой банк».
+                v2 = 1 if _detect_card_layout(ctx) == "v2" else 0
+                compact = 1 if has_compact_w_array(p) else 0
+                return (
+                    v2,
+                    compact,
+                    bank,
+                    len(ctx.available_chars),
+                    -abs(os.path.getsize(p) - _SIZE_TARGET.get(kind, 55326)),
+                )
             elif kind == "phone":
                 from alfa_phone_orig_mode import AlfaPhoneOrigContext
 

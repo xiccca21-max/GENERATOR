@@ -57,9 +57,97 @@ _PHONE_DATE_LEFT = 20.0  # originals: date x0=20 (LEFT), never right-column
 _PHONE_F3_W_9 = 6.3  # ALSRubl «i» at 9pt (same as amount line)
 _PHONE_F3_W_16 = 12.23  # ALSRubl «i» at 16pt — digits end ~237.77, F3→250
 _LEGACY_COMMISSION = "Без комиссии"
+# Static face rows in phone shell (never rewrite «Успешно» with commission/amount).
+_PHONE_STATUS_Y = 288.78
+_PHONE_COMMISSION_Y = 247.78
+_PHONE_AMOUNT_SMALL_Y = 268.78
+_PHONE_AMOUNT_BIG_Y = 344.39
+# Jasper stamp: empty ()Tj at Tm (0, page-h). Filling it → first-line mojibake.
+_PHONE_STAMP_Y_MIN = 449.0
 # Proton TBANK_FILE_SIZE_STRONG_OUTLIER: HARD ceiling now 62000 (was 63500).
 # Etalon ~58–61KB — unlocked ~63484 always FAKE. Lean shell only.
 _PHONE_HARD_MAX = 62000
+
+
+def _phone_tm_y_before(stream: bytes, pos: int, *, window: int = 120) -> Optional[float]:
+    """Y from the Tm immediately preceding a Tj at ``pos``."""
+    look = stream[max(0, pos - window) : pos]
+    tms = list(_TM_RE.finditer(look))
+    if not tms:
+        return None
+    try:
+        return float(tms[-1].group(2))
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _phone_y_near(y: Optional[float], target: float, tol: float = 1.5) -> bool:
+    return y is not None and abs(float(y) - float(target)) <= tol
+
+
+def _phone_restore_stamp_tj(stream: bytes) -> bytes:
+    """Keep Jasper top stamp as empty ``()Tj`` at Tm x=0.
+
+    A leftover FIO in this slot is the first extractable line
+    (TBANK_DATE_LINE_CORRUPTED: «ле се Л.» instead of DD.MM.YYYY).
+    """
+    out = stream
+    guard = 0
+    while guard < 4:
+        guard += 1
+        found = False
+        for m in re.finditer(rb"1 0 0 1 ([0-9.]+) ([0-9.]+) Tm", out):
+            try:
+                y = float(m.group(2))
+            except ValueError:
+                continue
+            if y < _PHONE_STAMP_Y_MIN:
+                continue
+            rest = out[m.end() :]
+            et = rest.find(b"ET")
+            if et < 0:
+                continue
+            tj = re.search(rb"\((?:\\.|[^\\()])*\)Tj", rest[:et])
+            if not tj:
+                continue
+            inner = tj.group(0)[1:-3]
+            tm_ok = m.group(1) in (b"0", b"0.0")
+            if tm_ok and inner == b"":
+                continue
+            new_tm = b"1 0 0 1 0 " + m.group(2) + b" Tm"
+            out = (
+                out[: m.start()]
+                + new_tm
+                + out[m.end() : m.end() + tj.start()]
+                + b"()Tj"
+                + out[m.end() + tj.end() :]
+            )
+            found = True
+            break
+        if not found:
+            break
+    return out
+
+
+def _phone_restore_stamp_in_pdf(pdf: bytes) -> bytes:
+    if not pdf:
+        return pdf
+    try:
+        import fitz
+        from tbank_sbp_stealth import _patch_contents_xref
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        cs_x = int(doc[0].get_contents()[0])
+        cs = doc.xref_stream(cs_x)
+        doc.close()
+        cs2 = _phone_restore_stamp_tj(cs)
+        if cs2 == cs:
+            return pdf
+        patched = _patch_contents_xref(pdf, cs_x, cs2)
+        return patched if patched is not None else pdf
+    except Exception as exc:
+        logger.warning("phone stamp restore: %s", exc)
+        return pdf
 
 
 def _ensure_phone_template() -> None:
@@ -152,51 +240,15 @@ def _phone_reg_has_atlas_raw(ch: str) -> bool:
 
 
 def _soft_cover_phone_reg_text(ctx, text: str) -> str:
-    """Map FIO letters without atlas-safe contours onto safe lookalikes.
-
-    Phone Regular inject from Jasper master for Ш/Щ/ъ trips Proton
-    K-TBANK-GLYPH-ATLAS-001 (only non-shell outlines in raw cache).
-    """
-    if not text:
-        return text
-    uni = getattr(ctx, "uni_to_cid_reg", None) or {}
-    out: list = []
-    changed = False
-    for ch in text:
-        cp = ord(ch)
-        if cp in uni or not ch.isalpha():
-            out.append(ch)
-            continue
-        if _phone_reg_has_atlas_raw(ch):
-            out.append(ch)
-            continue
-        alt = ch.translate(_PHONE_ATLAS_UNSAFE)
-        if alt != ch and (
-            ord(alt) in uni or _phone_reg_has_atlas_raw(alt)
-        ):
-            out.append(alt)
-            changed = True
-            continue
-        # Last resort: fold to a shell letter of same case.
-        fold = "А" if ch.isupper() else "а"
-        for cand in (ch.translate(_PHONE_ATLAS_UNSAFE), "С" if ch.isupper() else "с", fold):
-            if ord(cand) in uni or _phone_reg_has_atlas_raw(cand):
-                out.append(cand)
-                changed = True
-                break
-        else:
-            out.append(ch)
-    remapped = "".join(out)
-    if changed and remapped != text:
-        logger.info("phone FIO soft-cover atlas-unsafe %r → %r", text, remapped)
-    return remapped
+    """Identity — never remap FIO letters (hydrate / inject instead)."""
+    return text
 
 
 def _prepare_phone_data(data: Dict) -> Dict:
     from tbank_sbp_stealth import _normalize_tbank_sender, _normalize_tbank_receiver
 
     dt_raw = str(data.get("date_time", _ORIG_DATE)).strip()
-    if dt_raw.lower() in ("сейчас", "now", "-", ""):
+    if dt_raw.lower() in ("сейчас", "now", "-", "", "авто", "auto"):
                 dt_raw = now_msk().strftime("%d.%m.%Y  %H:%M:%S")
     new_date = _fmt_date(dt_raw)
 
@@ -217,14 +269,20 @@ def _prepare_phone_data(data: Dict) -> Dict:
     sender = _normalize_tbank_sender(sender_raw) or sender_raw
     receiver = _normalize_tbank_receiver(str(data.get("receiver", _ORIG_RECEIVER)))
 
+    sender = _strip_yo_tverd(sender)
+    receiver = _strip_yo_tverd(receiver)
     return {
         "new_date":    new_date,
         "new_amount":  new_amount,
-        "sender":      _strip_yo_tverd(sender),
+        "sender":      sender,
         "phone":       str(data.get("phone", _ORIG_PHONE)),
-        "receiver":    _strip_yo_tverd(receiver),
+        "receiver":    receiver,
         "receipt_raw": receipt_raw,
         "_receipt_auto": receipt_auto,
+        "_user_sender": sender,
+        "_user_receiver": receiver,
+        "_shell_sender": _ORIG_SENDER,
+        "_shell_receiver": _ORIG_RECEIVER,
     }
 
 
@@ -569,6 +627,9 @@ def _realign_phone_f3_amounts(ctx, stream: bytes) -> bytes:
             if len(inner) % 2 != 0 or len(inner) > 48:
                 continue
             look = out[max(0, m.start() - 140) : m.start()]
+            y = _phone_tm_y_before(out, m.start(), window=140)
+            if _phone_y_near(y, _PHONE_STATUS_Y):
+                continue
             medium = b"16 Tf" in look or b"16.00 Tf" in look
             sz = 16.0 if medium else 9.0
             text = _phone_decode_tj_inner(ctx, inner, medium=medium)
@@ -617,11 +678,12 @@ def _replace_tj_right(ctx, stream, old, new, sz, medium=False, *, preserve_layou
         )
     enc = lambda t: ctx.enc(t, medium=medium)
     enc_old, enc_new = enc(old), enc(new)
+    if not enc_old or not enc_new:
+        # Empty old encodes as ``()Tj`` — the Jasper stamp at y=451.
+        return stream, False
     needle = b"(" + enc_old + b")Tj"
     pos = stream.find(needle)
     if pos < 0:
-        return stream, False
-    if not enc_new:
         return stream, False
     if enc_old == enc_new:
         return stream, True
@@ -646,14 +708,14 @@ def _replace_tj_left(
             return stream2, True
     enc = lambda t: ctx.enc(t, medium=medium)
     enc_old, enc_new = enc(old), enc(new)
+    if not enc_old or not enc_new:
+        return stream, False
     needle = b"(" + enc_old + b")Tj"
     pos = stream.find(needle)
     if pos < 0:
         return stream, False
     if enc_old == enc_new:
         return stream, True
-    if not enc_new:
-        return stream, False
     stream2, pos2 = _tm_rewrite_before_tj(stream, pos, left_x)
     return stream2[:pos2] + b"(" + enc_new + b")Tj" + stream2[pos2 + len(needle) :], True
 
@@ -758,44 +820,330 @@ def _find_best_phone_donor(prepared: Dict) -> Optional[Tuple[str, Dict, List[str
     )
 
 
+def _phone_commission_tm_x(stream: bytes, pos: int) -> Optional[float]:
+    look = stream[max(0, pos - 200) : pos]
+    tms = list(_TM_RE.finditer(look))
+    if not tms:
+        return None
+    try:
+        return float(tms[-1].group(1))
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
 def _force_phone_commission_zero(ctx, stream: bytes) -> Tuple[bytes, bool]:
     """Always show «0 ₽» (F1 «0 » + F3 i), never «Без комиссии».
 
-    Always Tm-realign so F3 lands on x1=250 (never leave donor/over-padded x).
+    LEFT x≈20 at y=247.78 is the «Комиссия» label — never remove it.
+    RIGHT x>80 at the same Y is the value («Без комиссии» or «0 »+F3).
     """
     from tbank_sbp_stealth import _inject_f3_ruble_after_tj
 
-    new_b = ctx.enc(_DISPLAY_COMMISSION)
-    if not new_b:
+    zero = ctx.enc("0")
+    if not zero:
         return stream, False
+    # Space must be CID 3. Remapped unused letters (239/Д) also have TU U+0020
+    # — encoding "0 " with those paints «0Д».
+    new_b = zero + b"\x00\x03"
 
     new_w = ctx.text_width(_DISPLAY_COMMISSION, 9.0, medium=False)
     new_x = _PHONE_COL_RIGHT - _PHONE_F3_W_9 - new_w
     needle_new = b"(" + new_b + b")Tj"
 
-    # Prefer existing «0 »+/F3 commission slot — re-anchor Tm only.
+    def _replace_right_commission(s: bytes, pos: int, old_needle: bytes) -> bytes:
+        s2, pos2 = _tm_rewrite_before_tj(s, pos, new_x)
+        s2 = s2[:pos2] + b"(" + new_b + b")Tj" + s2[pos2 + len(old_needle) :]
+        return _inject_f3_ruble_after_tj(s2, new_b, tm_y=_PHONE_COMMISSION_Y)
+
+    # Right-column slot (value): Tm x > 80 at commission Y.
+    for m in re.finditer(rb"\((?:\\.|[^\\()])*\)Tj", stream):
+        if not _phone_y_near(_phone_tm_y_before(stream, m.start()), _PHONE_COMMISSION_Y):
+            continue
+        tm_x = _phone_commission_tm_x(stream, m.start())
+        if tm_x is None or tm_x <= 80:
+            continue
+        old_needle = m.group(0)
+        inner = old_needle[1:-3]
+        tail = stream[m.end() : m.end() + 48]
+        if inner == new_b and b"/F3" in tail and b"0 g\n0 g" not in stream[m.end() : m.end() + 64]:
+            stream2, _ = _tm_rewrite_before_tj(stream, m.start(), new_x)
+            return stream2, True
+        return _replace_right_commission(stream, m.start(), old_needle), True
+
+    # Existing «0 » without F3 (broken shell) — anchor + inject ₽.
     for m in re.finditer(re.escape(needle_new), stream):
-        look = stream[max(0, m.start() - 80) : m.start()]
-        if b"247.78" not in look:
+        if not _phone_y_near(_phone_tm_y_before(stream, m.start()), _PHONE_COMMISSION_Y):
             continue
         tail = stream[m.end() : m.end() + 40]
-        stream2, pos2 = _tm_rewrite_before_tj(stream, m.start(), new_x)
+        stream2, _ = _tm_rewrite_before_tj(stream, m.start(), new_x)
         if b"/F3" not in tail or b"0 g\n0 g" in stream[m.end() : m.end() + 64]:
-            stream2 = _inject_f3_ruble_after_tj(stream2, new_b)
+            stream2 = _inject_f3_ruble_after_tj(
+                stream2, new_b, tm_y=_PHONE_COMMISSION_Y,
+            )
         return stream2, True
 
+    # Legacy «Без комиссии» bytes from this shell's cmap.
     old_b = ctx.enc(_LEGACY_COMMISSION) or ctx.enc("Без комиссии")
-    if not old_b:
-        return stream, False
-    needle_old = b"(" + old_b + b")Tj"
-    pos = stream.find(needle_old)
-    if pos < 0:
-        return stream, False
+    if old_b:
+        needle_old = b"(" + old_b + b")Tj"
+        for m in re.finditer(re.escape(needle_old), stream):
+            if not _phone_y_near(_phone_tm_y_before(stream, m.start()), _PHONE_COMMISSION_Y):
+                continue
+            tm_x = _phone_commission_tm_x(stream, m.start())
+            if tm_x is None or tm_x <= 80:
+                continue
+            return _replace_right_commission(stream, m.start(), needle_old), True
 
-    stream2, pos2 = _tm_rewrite_before_tj(stream, pos, new_x)
-    stream2 = stream2[:pos2] + b"(" + new_b + b")Tj" + stream2[pos2 + len(needle_old) :]
-    stream2 = _inject_f3_ruble_after_tj(stream2, new_b)
-    return stream2, True
+    return stream, False
+
+
+def _phone_force_che_tounicode(pdf: bytes) -> bytes:
+    """CID 258 must stay U+0427 «Ч» — remap-to-space / prune → Ă / missing initial."""
+    if not pdf:
+        return pdf
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+        from tbank_orig_mode import _find_stream_pos_for_xref
+        from tbank_sbp_stealth import _patch_tounicode_xref
+
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return pdf
+        tu_x = int(meta["tounicode_xref"])
+        tu = doc.xref_stream(tu_x)
+        doc.close()
+        pat = re.compile(rb"<(0102)><(0102)><([0-9A-Fa-f]{4})>", re.I)
+        m = pat.search(tu)
+        if m and m.group(3).upper() == b"0427":
+            return pdf
+        if m:
+            patched_tu = tu[: m.start(3)] + b"0427" + tu[m.end(3) :]
+        else:
+            ins = tu.find(b"beginbfrange")
+            if ins < 0:
+                return pdf
+            nl = tu.find(b"\n", ins)
+            if nl < 0:
+                return pdf
+            patched_tu = tu[: nl + 1] + b"<0102><0102><0427>\n" + tu[nl + 1 :]
+        if patched_tu == tu:
+            return pdf
+        if len(patched_tu) == len(tu):
+            cs, ce = _find_stream_pos_for_xref(pdf, tu_x)
+            if cs is not None:
+                from openpdf_deflate import openpdf_deflate
+
+                need = ce - cs
+                raw = pdf[cs:ce]
+                comp = openpdf_deflate(patched_tu, 6)
+                if comp is not None and len(comp) == need:
+                    out = bytearray(pdf)
+                    out[cs:ce] = comp
+                    return bytes(out)
+                try:
+                    from openpdf_deflate import compress_to_size
+
+                    comp2 = compress_to_size(patched_tu, need, raw)
+                    if comp2 is not None and len(comp2) == need:
+                        out = bytearray(pdf)
+                        out[cs:ce] = comp2
+                        return bytes(out)
+                except Exception:
+                    pass
+        landed = _patch_tounicode_xref(pdf, tu_x, patched_tu)
+        return landed if landed is not None else pdf
+    except Exception as exc:
+        logger.warning("phone Ч ToUnicode: %s", exc)
+        return pdf
+
+
+def _phone_install_receiver_che(pdf: bytes, prepared: Dict) -> bytes:
+    """Install atlas «Ч»@258 + TU U+0427 so the initial is Ч, not a fat Ă."""
+    recv = str((prepared or {}).get("receiver") or "")
+    if "Ч" not in recv or not pdf:
+        return pdf
+    try:
+        import fitz
+        import tbank_unlock_template as tut
+        from tbank_sbp_stealth import (
+            _install_raw_glyph_bytes,
+            _patch_fontfile2_xref,
+            _pin_f1_head_flags_and_csa,
+            _raw_glyph_entry,
+        )
+
+        entry = _raw_glyph_entry(ord("Ч"), 258, is_medium=False)
+        if not entry or not entry.get("raw"):
+            logger.warning("phone Ч atlas miss — TU only")
+            return _phone_force_che_tounicode(pdf)
+        doc = fitz.open(stream=pdf, filetype="pdf")
+        meta = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+        if not meta:
+            doc.close()
+            return _phone_force_che_tounicode(pdf)
+        x1 = int(meta["fontfile_xref"])
+        ff2 = doc.xref_stream(x1)
+        doc.close()
+        out_ff = _pin_f1_head_flags_and_csa(
+            _install_raw_glyph_bytes(ff2, {258: entry})
+        )
+        patched = _patch_fontfile2_xref(pdf, x1, out_ff)
+        if patched is None:
+            patched = pdf
+        return _phone_force_che_tounicode(patched)
+    except Exception as exc:
+        logger.warning("phone Ч install: %s", exc)
+        return _phone_force_che_tounicode(pdf)
+
+
+def _fix_phone_et_whitespace_stream(stream: bytes) -> bytes:
+    """Proton TBANK_CONTENT_ET_WHITESPACE_ANOMALY — only «\\nET», not « ET»."""
+    out = stream
+    while True:
+        m = re.search(rb"(?:\r?\n)(?:[ \t]*(?:\r?\n))+[ \t]*ET\b", out)
+        if not m:
+            break
+        out = out[: m.start()] + b"\nET" + out[m.end() :]
+    while True:
+        m = re.search(rb"\n([ \t]+)ET\b", out)
+        if not m:
+            break
+        out = out[: m.start()] + b"\nET" + out[m.end() :]
+    return out
+
+
+def _realign_phone_value_fields(ctx, stream: bytes, prepared: Dict) -> bytes:
+    """RIGHT-pin sender / phone / receiver after any layout pass."""
+    out = stream
+    for key in ("sender", "phone", "receiver"):
+        text = str(prepared.get(key) or "").strip()
+        if not text:
+            continue
+        enc = ctx.enc(text)
+        if not enc:
+            continue
+        needle = b"(" + enc + b")Tj"
+        new_w = ctx.text_width(text, 9.0, medium=False)
+        new_x = _PHONE_COL_RIGHT - new_w
+        for m in re.finditer(re.escape(needle), out):
+            tm_x = _phone_commission_tm_x(out, m.start())
+            if tm_x is not None and tm_x <= 80:
+                continue
+            out, _ = _tm_rewrite_before_tj(out, m.start(), new_x)
+            break
+    return out
+
+
+def _commit_phone_contents(pdf: bytes, ctx, stream: bytes) -> bytes:
+    """Write decoded CS back preserving compressed /Length when possible."""
+    from openpdf_deflate import openpdf_deflate
+    from tbank_stealth_v3 import _patch_length_and_rebuild
+
+    if stream == ctx.cs_dec:
+        return pdf
+    out = bytearray(pdf)
+    cs, ce, raw = ctx.cs_cs, ctx.cs_ce, ctx.cs_raw
+    comp = openpdf_deflate(stream, 6)
+    if comp is not None and len(comp) == len(raw):
+        out[cs:ce] = comp
+        return bytes(out)
+    if comp is None:
+        return pdf
+    rebuilt = _patch_length_and_rebuild(out, cs, ce, comp)
+    return rebuilt if rebuilt is not None else pdf
+
+
+def repair_phone_layout_pdf(
+    pdf: bytes, prepared: Optional[Dict] = None,
+) -> bytes:
+    """Undo generic polish damage; restore commission, value column, ET."""
+    import os
+    import tempfile
+
+    from tbank_orig_mode import OrigContext
+
+    if not pdf or not prepared:
+        return pdf
+    path = ""
+    try:
+        fd, path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        with open(path, "wb") as f:
+            f.write(pdf)
+        ctx = OrigContext()
+        if not ctx.load(path):
+            return pdf
+        stream = bytes(ctx.cs_dec)
+        stream = _fix_phone_et_whitespace_stream(stream)
+        stream = re.sub(
+            rb"(q 175 0 0 63\.23 66 103\.77 cm /img3 Do Q\nBT\n)"
+            rb"1 0 0 1 [\d.]+ 103\.77 Tm",
+            rb"\g<1>1 0 0 1 66 103.77 Tm",
+            stream,
+        )
+        stream = _phone_restore_stamp_tj(stream)
+        stream, _ = _force_phone_commission_zero(ctx, stream)
+        stream = _fix_phone_amount_right_edge(ctx, stream)
+        stream = _realign_phone_value_fields(ctx, stream, prepared)
+        stream = _fix_phone_amount_right_edge(ctx, stream)
+        return _commit_phone_contents(pdf, ctx, stream)
+    except Exception as exc:
+        logger.warning("phone layout repair: %s", exc)
+        return pdf
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def _patch_phone_commission_in_pdf(pdf: bytes) -> bytes:
+    """Final safety pass: force commission «0 ₽» on shipped phone PDF."""
+    import os
+    import tempfile
+
+    from openpdf_deflate import openpdf_deflate
+    from tbank_orig_mode import OrigContext
+
+    path = ""
+    try:
+        fd, path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        with open(path, "wb") as f:
+            f.write(pdf)
+        ctx = OrigContext()
+        if not ctx.load(path):
+            return pdf
+        stream2, ok = _force_phone_commission_zero(ctx, bytes(ctx.cs_dec))
+        if not ok or stream2 == ctx.cs_dec:
+            return pdf
+        out = bytearray(pdf)
+        cs, ce, raw = ctx.cs_cs, ctx.cs_ce, ctx.cs_raw
+        comp = openpdf_deflate(stream2, 6)
+        if comp is not None and len(comp) == len(raw):
+            out[cs:ce] = comp
+            return bytes(out)
+        if comp is None:
+            logger.warning("phone commission post-patch: deflate miss")
+            return pdf
+        rebuilt = _patch_length_and_rebuild(out, cs, ce, comp)
+        if rebuilt is None:
+            logger.warning("phone commission post-patch: Length-rebuild miss")
+            return pdf
+        return rebuilt
+    except Exception as exc:
+        logger.warning("phone commission post-patch: %s", exc)
+        return pdf
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 def _try_orig_mode_on(
@@ -885,6 +1233,7 @@ def _try_orig_mode_on(
     stream, ok["commission"] = _force_phone_commission_zero(ctx, stream)
     # Lock amount/commission F3 on x1=250 (no walking right edge).
     stream = _fix_phone_amount_right_edge(ctx, stream)
+    stream = _phone_restore_stamp_tj(stream)
     # Amount/commission may change decoded CS length; Length rebuild below.
 
     # Proton TBANK_CONTENT_ET_WHITESPACE_ANOMALY: only «\nET» is legal.
@@ -1549,6 +1898,11 @@ def _build_dynamic_phone(prepared: Dict) -> Optional[bytes]:
         stream, ok["receipt"] = _replace_card_receipt(stream, er, o_receipt, p["receipt_raw"])
         return stream, ok
 
+    def _phone_dynamic_post(pdf: bytes) -> Optional[bytes]:
+        if len(pdf) > _PHONE_HARD_MAX:
+            logger.warning("phone dynamic size %d > HARD max — ship", len(pdf))
+        return _patch_phone_commission_in_pdf(pdf)
+
     return build_dynamic_tbank(
         orig_path=base,
         need_r_texts=need_r,
@@ -1557,7 +1911,7 @@ def _build_dynamic_phone(prepared: Dict) -> Optional[bytes]:
         metadata_date=p["new_date"],
         patch_metadata_fn=_patch_pdf_metadata,
         log_label="📱 PHONE DYNAMIC",
-        post_process=lambda pdf: pdf if len(pdf) <= _PHONE_HARD_MAX else None,
+        post_process=_phone_dynamic_post,
     )
 
 
@@ -1737,6 +2091,8 @@ def _lean_phone_regular_after_face(pdf: bytes, prepared: Dict) -> Optional[bytes
             ff2, keep, lo=_F1_PHONE_DEC_LO, hi=_F1_PHONE_DEC_HI,
         )
         lean = _ff2_restore_shell_tables(ff2, lean)
+        from tbank_sbp_stealth import _sync_hmtx_lsb_to_xmin
+        lean = _sync_hmtx_lsb_to_xmin(lean, keep)
         shell_bb = _head_bbox_from_ff2(ff2)
         if shell_bb is not None:
             lean = _restore_head_bbox(lean, shell_bb)
@@ -1787,6 +2143,9 @@ def _phone_layout_ok(pdf: bytes, prepared: Dict) -> Tuple[bool, str]:
                 x1 = max(s["bbox"][2] for s in spans)
                 checks.append((t, x0, x1))
         doc.close()
+        first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+        if not re.match(r"^\d{2}\.\d{2}\.\d{4}", first_line):
+            return False, f"date-line-corrupted:{first_line[:40]!r}"
         # date left
         date_hits = [c for c in checks if date and date in c[0]]
         if not date_hits:
@@ -1831,6 +2190,8 @@ def _phone_layout_ok(pdf: bytes, prepared: Dict) -> Tuple[bool, str]:
                 return False, "amount-mismatch"
         if "Дамир Сеничев" in text and "Дамир Сеничев" not in (sender, receiver):
             return False, "donor-fio-leaked"
+        if "Без комиссии" in text:
+            return False, "commission-not-zero"
         if "Марина Ч." in text and "Марина Ч." not in (sender, receiver):
             return False, "donor-fio-leaked"
         if "Итого" not in text:
@@ -1867,7 +2228,9 @@ def _phone_layout_ok(pdf: bytes, prepared: Dict) -> Tuple[bool, str]:
         return False, f"layout-exc:{exc}"
 
 
-def _phone_remap_unused_cmap_uniscodes(pdf: bytes) -> bytes:
+def _phone_remap_unused_cmap_uniscodes(
+    pdf: bytes, prepared: Optional[Dict] = None,
+) -> bytes:
     """In-place: unused letter unis in ToUnicode → U+0020 (same hex width).
 
     Proton UNUSED_CID_PRESENT / CMAP_EXTRA_SYMBOLS when donor letters (БДМЧ…)
@@ -1884,6 +2247,11 @@ def _phone_remap_unused_cmap_uniscodes(pdf: bytes) -> bytes:
         fonts = tut._find_font_objects(doc)
         text = doc[0].get_text()
         face = set(text)
+        try:
+            from tbank_sbp_stealth import _tbank_keep_face_uniscodes
+            keep_unis = _tbank_keep_face_uniscodes(prepared) | face
+        except Exception:
+            keep_unis = face | set("Итого")
         out = bytearray(pdf)
         changed = False
         for key in ("TinkoffSans-Regular", "TinkoffSans-Medium"):
@@ -1896,7 +2264,7 @@ def _phone_remap_unused_cmap_uniscodes(pdf: bytes) -> bytes:
             unused_unis = {
                 int(u)
                 for _cid, u in sub.items()
-                if chr(u) not in face and ("А" <= chr(u) <= "я" or chr(u) in "Ёё")
+                if chr(u) not in keep_unis and ("А" <= chr(u) <= "я" or chr(u) in "Ёё")
             }
             if not unused_unis:
                 continue
@@ -2044,8 +2412,17 @@ def create_tbank_phone_stealth(data: Dict) -> Optional[bytes]:
     if prepared is None:
         return None
     pdf = create_tbank_pipeline(
-        prepared, [_try_donor_orig_phone], channel="phone", dynamic_builder=None,
+        prepared,
+        [_try_donor_orig_phone, _build_dynamic_phone],
+        channel="phone",
+        dynamic_builder=_build_dynamic_phone,
     )
+    if not pdf:
+        try:
+            pdf = _build_dynamic_phone(dict(prepared))
+        except Exception as exc:
+            logger.error("phone LAW1 dynamic retry: %s", exc)
+            pdf = None
     if not pdf:
         return None
     if len(pdf) > _PHONE_HARD_MAX:
@@ -2067,8 +2444,11 @@ def create_tbank_phone_stealth(data: Dict) -> Optional[bytes]:
     fok, fwhy = _phone_f2_size_ok(pdf)
     if not fok:
         logger.warning("phone F2 size gate: %s — ship", fwhy)
+    # Stamp first: leftover FIO at y=451 is Proton's first line (DATE_LINE).
+    pdf = _phone_restore_stamp_in_pdf(pdf)
+    pdf = _phone_install_receiver_che(pdf, prepared)
     # Drop unused donor CMap leftovers (UNUSED_CID_PRESENT / CMAP_EXTRA_SYMBOLS).
-    pdf = _phone_remap_unused_cmap_uniscodes(pdf)
+    pdf = _phone_remap_unused_cmap_uniscodes(pdf, prepared)
     pdf = _phone_sync_head_bbox_to_fontdesc(pdf)
     try:
         import fitz
@@ -2101,14 +2481,17 @@ def create_tbank_phone_stealth(data: Dict) -> Optional[bytes]:
     lok, lwhy = _phone_layout_ok(pdf, prepared)
     if not lok:
         logger.error("phone layout gate: %s — ship anyway", lwhy)
-    from tbank_dynamic import _finalize_tbank_f1_epoch, _finalize_tbank_f2_epoch
-
-    pdf = _finalize_tbank_f1_epoch(pdf)
-    pdf = _finalize_tbank_f2_epoch(pdf)
+    pdf = _patch_phone_commission_in_pdf(pdf)
+    pdf = _phone_install_receiver_che(pdf, prepared)
+    pdf = _phone_restore_stamp_in_pdf(pdf)
     fok2, fwhy2 = _phone_f2_size_ok(pdf)
     if not fok2:
-        logger.warning("phone F2 size gate (post-epoch): %s — ship", fwhy2)
-    return pdf
+        logger.warning("phone F2 size gate (pre-finish): %s — ship", fwhy2)
+    from tbank_dynamic import _tbank_finish_non_sbp_ship
+
+    return _tbank_finish_non_sbp_ship(
+        pdf, height=451, prepared=prepared, channel="phone",
+    )
 
 
 if __name__ == "__main__":

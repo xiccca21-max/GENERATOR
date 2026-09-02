@@ -1,0 +1,25 @@
+---
+description: T-Bank SBP structure ship-gate — repair until Proton HARD axes are clean; never GEN_NONE
+alwaysApply: true
+---
+
+# T-Bank SBP structure gate (K-TBANK-SBP-STRUCTURE-GATE-001)
+
+Generator law. Does **not** restrict the bot: any valid payload still ships an exact-face PDF (LAW #1).
+
+## Must
+
+1. After every FontFile2/ToUnicode write, `_sbp_finalize_for_ship` ends in `_sbp_enforce_structure_gate`.
+2. Gate checks **all** of: V3 (font∧stream), F1 glyf↔cmap band, F1 TU extras, F1/F2 orphan residue, F2 digit-card, F1 CSA, F2 head, FontBBox↔head, empty painted.
+3. On any flag: one **coordinated** repair (`_sbp_repair_structure_once`) — fill → prune F1 TU → F1 orphans/cmap → F2 orphans → V3 → envelopes → bbox. Loop until clean.
+4. Residual flags after retries → log and **still ship**. Never `create_tbank_sbp_stealth` → `None` for a filled payload.
+
+## Forbidden
+
+- One-HARD late patches that undo another axis (V3 fat then leave orphans; fill then skip cmap/orphan; extra F1 «г»=271).
+- Post-finalize `fill` / FontFile2 writes (emergency path included).
+- Blocking send, shrinking charset, or GEN_NONE to “keep structure”.
+
+## When adding a Proton HARD fix
+
+Add the check to `_sbp_structure_violations` and the repair step to `_sbp_repair_structure_once`. Do not append a new one-off at the end of finalize.

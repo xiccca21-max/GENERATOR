@@ -239,7 +239,7 @@ def _deflate_oneshot(data: bytes, level: int) -> Optional[bytes]:
             [java, "-cp", f"{_DIR}{os.pathsep}{_JAR}", "OpenPdfDeflate", str(level)],
             input=payload,
             capture_output=True,
-            timeout=30,
+            timeout=5,
             check=True,
         )
         return r.stdout
@@ -261,6 +261,23 @@ def _budget_ok() -> bool:
     return True
 
 
+def _strip_zlib_unused_tail(comp: Optional[bytes]) -> Optional[bytes]:
+    """Drop bytes after DEFLATE EOF (Length+1 ``\\n`` → STREAM_INTEGRITY HARD)."""
+    if not comp:
+        return comp
+    import zlib
+
+    try:
+        dec = zlib.decompressobj()
+        dec.decompress(comp)
+        unused = dec.unused_data or b""
+        if unused:
+            return comp[: len(comp) - len(unused)]
+    except Exception:
+        return comp
+    return comp
+
+
 def openpdf_deflate(data: bytes, level: int = 6) -> Optional[bytes]:
     """Compress like OpenPDF 1.3.30 / JasperReports (not stdlib zlib)."""
     if not _budget_ok():
@@ -270,14 +287,14 @@ def openpdf_deflate(data: bytes, level: int = 6) -> Optional[bytes]:
     lvl = level if 1 <= int(level) <= 9 else 6
     out = _deflate_via_worker(data, lvl)
     if out is not None:
-        return out
+        return _strip_zlib_unused_tail(out)
     # Worker died mid-batch (common under parallel probes) — one clean restart.
     with _worker_lock:
         _kill_worker_unlocked()
     out = _deflate_via_worker(data, lvl)
     if out is not None:
-        return out
-    return _deflate_oneshot(data, lvl)
+        return _strip_zlib_unused_tail(out)
+    return _strip_zlib_unused_tail(_deflate_oneshot(data, lvl))
 
 
 def compress_like_jasper(data: bytes, level: int = 6) -> bytes:

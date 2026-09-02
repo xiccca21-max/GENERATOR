@@ -95,14 +95,20 @@ def _prepare_ct_data(data: Dict) -> Dict:
     sender_raw = str(data.get("sender", _ORIG_SENDER_CT))
     sender = _normalize_tbank_sender(sender_raw) or sender_raw
 
+    sender = _strip_yo_tverd(sender)
+    receiver = _normalize_receiver(str(data.get("receiver", _ORIG_RECEIVER_CT)))
     return {
         "new_date":         new_date,
         "new_amount":       new_amount,
         "new_amount_total": new_amount_total,
-        "sender":           _strip_yo_tverd(sender),
-        "receiver":         _normalize_receiver(str(data.get("receiver", _ORIG_RECEIVER_CT))),
+        "sender":           sender,
+        "receiver":         receiver,
         "card":             _format_card_tail(str(data.get("card", _ORIG_CARD_CT))),
         "receipt_raw":      receipt_raw,
+        "_user_sender": sender,
+        "_user_receiver": receiver,
+        "_shell_sender": _ORIG_SENDER_CT,
+        "_shell_receiver": _ORIG_RECEIVER_CT,
     }
 
 
@@ -328,11 +334,18 @@ def _try_orig_mode_on(
         pdf[cs:ce] = raw
     else:
         from tbank_channel_common import compress_orig_stream
+        from tbank_sbp_stealth import _patch_length_and_rebuild
 
         new_compressed = compress_orig_stream(stream, orig_comp_len)
-        if new_compressed is None or len(new_compressed) != orig_comp_len:
+        if new_compressed is None:
             return None
-        pdf[cs:ce] = new_compressed
+        if len(new_compressed) != orig_comp_len:
+            rebuilt = _patch_length_and_rebuild(pdf, cs, ce, new_compressed)
+            if rebuilt is None:
+                return None
+            pdf = bytearray(rebuilt)
+        else:
+            pdf[cs:ce] = new_compressed
 
     from tbank_channel_common import finalize_orig_result
 
@@ -490,6 +503,12 @@ def create_tbank_card_tbank_stealth(data: Dict) -> Optional[bytes]:
         channel="card_tbank",
         dynamic_builder=_build_dynamic_ct,
     )
+    if pdf is None:
+        try:
+            pdf = _build_dynamic_ct(dict(prepared))
+        except Exception as exc:
+            logger.error("CARD_TBANK LAW1 dynamic retry: %s", exc)
+            pdf = None
     if pdf is None:
         return None
     ok, why = pdf_face_matches_user(

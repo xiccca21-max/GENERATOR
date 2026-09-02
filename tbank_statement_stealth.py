@@ -391,6 +391,8 @@ def _prepare_statement_data(data: Dict) -> Dict:
             "card4":    str(op.get("card4", orig["card4"])).strip()[-4:],
         })
     p["ops"] = ops
+    p["sender"] = p["fio"]
+    p["_user_sender"] = p["fio"]
     return p
 
 
@@ -449,11 +451,24 @@ def create_tbank_statement(data: Dict) -> Optional[bytes]:
         from tbank_channel_common import create_channel_stealth
 
         prepared = _prepare_statement_data(data)
-        return create_channel_stealth(
+        pdf = create_channel_stealth(
             prepared,
             _try_donor_orig_statement,
             _build_dynamic_statement,
             channel="statement",
+        )
+        if pdf is None:
+            try:
+                pdf = _build_dynamic_statement(dict(prepared))
+            except Exception as exc:
+                logger.error("STATEMENT LAW1 dynamic retry: %s", exc)
+                pdf = None
+        if not pdf:
+            return None
+        from tbank_dynamic import _tbank_finish_non_sbp_ship
+
+        return _tbank_finish_non_sbp_ship(
+            pdf, height=0, prepared=prepared, channel="statement",
         )
     except Exception as e:
         logger.error(f"create_tbank_statement error: {e}", exc_info=True)

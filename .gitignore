@@ -40,6 +40,15 @@ tinkoff_f*.ttf
 _kern_table.json
 
 # локальные тестовые PDF-пакеты (не коммитить)
+# Без этого git status обходит ~10k PDF — Cursor OOM / лаги
+_test*/
+_strict50*/
+_proton*/
+_quick*/
+validator_proton_10x/
+tools/apache-maven-3.9.9/
+tbank-jasper/target/
+*.jar
 output/
 _test_batch/
 _test_gen/

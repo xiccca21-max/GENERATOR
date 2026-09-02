@@ -34,6 +34,33 @@ def _gate_is_proton() -> bool:
     )
 
 
+def _gate_is_dual() -> bool:
+    import os
+
+    return (os.environ.get("TG_GATE") or "").strip().lower() in (
+        "dual",
+        "both",
+        "proton+onlypdf",
+        "onlypdf+proton",
+    )
+
+
+def _gate_local_advisory() -> bool:
+    """Live marathon: local validate never blocks Telegram — bots are truth."""
+    import os
+
+    return (os.environ.get("TG_GATE") or "").strip().lower() in (
+        "dual",
+        "both",
+        "proton+onlypdf",
+        "onlypdf+proton",
+        "proton",
+        "proton_pdf",
+        "proton_pdf_bot",
+        "onlypdf",
+    )
+
+
 def _norm_bot(name: str, default: str) -> str:
     bot = (name or default).strip() or default
     if not bot.startswith("@"):
@@ -194,12 +221,50 @@ async def _wait_verdict(
     return "TIMEOUT"
 
 
+async def _send_pdf_with_retry(
+    client,
+    bot: str,
+    path: Path,
+    *,
+    pdf_bytes: Optional[bytes] = None,
+    tries: int = 6,
+) -> None:
+    """OneDrive / AV can hide just-written PDFs — send from memory when possible."""
+    last_exc: Optional[BaseException] = None
+    data = pdf_bytes
+    for try_i in range(tries):
+        if data is None:
+            if path.is_file():
+                data = path.read_bytes()
+            else:
+                await asyncio.sleep(0.35 + try_i * 0.25)
+                continue
+        try:
+            from telethon.tl.types import DocumentAttributeFilename
+            await client.send_file(
+                bot,
+                file=data,
+                force_document=True,
+                attributes=[DocumentAttributeFilename(file_name=path.name)],
+            )
+            return
+        except ValueError as exc:
+            last_exc = exc
+            if "Not an existing file" in str(exc) and try_i < tries - 1:
+                data = None
+                await asyncio.sleep(0.35 + try_i * 0.25)
+                continue
+            raise
+    raise FileNotFoundError(f"PDF missing after {tries} tries: {path}") from last_exc
+
+
 async def onlypdf_verdict(
     client,
     path: Path,
     cfg: Dict[str, str],
     *,
     bot: Optional[str] = None,
+    pdf_bytes: Optional[bytes] = None,
 ) -> str:
     bot = _norm_bot(bot or cfg.get("TG_ONLYPDF_BOT", DEFAULT_ONLYPDF), DEFAULT_ONLYPDF)
     for reconnect in range(4):
@@ -209,9 +274,9 @@ async def onlypdf_verdict(
             msgs = await client.get_messages(bot, limit=1)
             after = msgs[0].id if msgs else 0
             await _pace_onlypdf_send()
-            await client.send_file(bot, str(path))
+            await _send_pdf_with_retry(client, bot, path, pdf_bytes=pdf_bytes)
             return await _wait_verdict(client, bot, after, cfg, parser=_parse_onlypdf)
-        except (ConnectionError, OSError, sqlite3.OperationalError) as exc:
+        except (ConnectionError, OSError, FileNotFoundError, ValueError, sqlite3.OperationalError) as exc:
             print(f"tg reconnect after {type(exc).__name__}: {exc}", flush=True)
             try:
                 await client.disconnect()
@@ -228,6 +293,7 @@ async def proton_verdict(
     cfg: Dict[str, str],
     *,
     bot: Optional[str] = None,
+    pdf_bytes: Optional[bytes] = None,
 ) -> str:
     bot = _norm_bot(bot or cfg.get("TG_PROTON_BOT", DEFAULT_PROTON), DEFAULT_PROTON)
     for reconnect in range(4):
@@ -237,12 +303,12 @@ async def proton_verdict(
             msgs = await client.get_messages(bot, limit=1)
             after = msgs[0].id if msgs else 0
             await _pace_onlypdf_send()
-            await client.send_file(bot, str(path))
+            await _send_pdf_with_retry(client, bot, path, pdf_bytes=pdf_bytes)
             wait = float(cfg.get("TG_WAIT_SECONDS", "90"))
             return await _wait_verdict(
                 client, bot, after, cfg, parser=_parse_proton, timeout=max(wait, 90.0),
             )
-        except (ConnectionError, OSError, sqlite3.OperationalError) as exc:
+        except (ConnectionError, OSError, FileNotFoundError, sqlite3.OperationalError) as exc:
             print(f"tg reconnect proton after {type(exc).__name__}: {exc}", flush=True)
             try:
                 await client.disconnect()
@@ -258,9 +324,95 @@ async def dual_verdict_parallel(
     path: Path,
     cfg: Dict[str, str],
 ) -> Tuple[str, str]:
-    """OnlyPDF-only. Second value always SKIP (Proton disabled)."""
+    """OnlyPDF-only (30/30 gate). Second value always SKIP.
+
+    Live Proton+OnlyPDF is ``dual_verdict_both`` — do not skip Proton there.
+    """
     v = await onlypdf_verdict(client, path, cfg)
     return v, "SKIP"
+
+
+async def dual_verdict_both(
+    client,
+    path: Path,
+    cfg: Dict[str, str],
+) -> Tuple[str, str]:
+    """Live Proton then OnlyPDF. Neither checker is disabled."""
+    vp = await proton_verdict(client, path, cfg)
+    vo = await onlypdf_verdict(client, path, cfg)
+    return vo, vp
+
+
+async def dual_accept_both_verdict(
+    client,
+    path: Path,
+    cfg: Dict[str, str],
+    *,
+    pause: float = 0.2,
+    reject_dir: Optional[Path] = None,
+    pdf_bytes: Optional[bytes] = None,
+) -> str:
+    """Require live Proton PASS **and** OnlyPDF PASS (30/30 dual gate)."""
+    _ = pause
+    vp = "TIMEOUT"
+    vo = "TIMEOUT"
+    tries = 5
+    for try_i in range(1, tries + 1):
+        vp = await proton_verdict(client, path, cfg, pdf_bytes=pdf_bytes)
+        print(
+            f"  proton={vp}"
+            + (f" (try {try_i}/{tries})" if try_i > 1 and vp != "PASS" else ""),
+            flush=True,
+        )
+        if vp == "PASS":
+            break
+        if vp in ("FAKE", "UNKNOWN"):
+            break
+        if vp == "TIMEOUT" and try_i < tries:
+            await asyncio.sleep(2.0 + try_i)
+            continue
+        if vp == "SERVICE_ERROR":
+            await asyncio.sleep(3)
+        break
+    if vp != "PASS":
+        try:
+            rej_dir = reject_dir or (path.parent / "_rejects")
+            rej_dir.mkdir(parents=True, exist_ok=True)
+            rej = rej_dir / f"{path.stem}_rej_proton_{vp}.pdf"
+            blob = pdf_bytes if pdf_bytes is not None else path.read_bytes()
+            rej.write_bytes(blob)
+            print(f"  saved reject → {rej}", flush=True)
+        except Exception as exc:
+            print(f"  reject-save err: {exc}", flush=True)
+        return vp
+
+    for try_i in range(1, tries + 1):
+        vo = await onlypdf_verdict(client, path, cfg, pdf_bytes=pdf_bytes)
+        print(
+            f"  onlypdf={vo}"
+            + (f" (try {try_i}/{tries})" if try_i > 1 and vo != "PASS" else ""),
+            flush=True,
+        )
+        if vo == "PASS":
+            return "PASS"
+        if vo in ("FAKE", "UNKNOWN"):
+            break
+        if vo == "TIMEOUT" and try_i < tries:
+            await asyncio.sleep(2.0 + try_i)
+            continue
+        if vo == "SERVICE_ERROR":
+            await asyncio.sleep(3)
+        break
+    try:
+        rej_dir = reject_dir or (path.parent / "_rejects")
+        rej_dir.mkdir(parents=True, exist_ok=True)
+        rej = rej_dir / f"{path.stem}_rej_onlypdf_{vo}.pdf"
+        blob = pdf_bytes if pdf_bytes is not None else path.read_bytes()
+        rej.write_bytes(blob)
+        print(f"  saved reject → {rej}", flush=True)
+    except Exception as exc:
+        print(f"  reject-save err: {exc}", flush=True)
+    return vo
 
 
 async def dual_accept_verdict(
@@ -372,6 +524,20 @@ async def onlypdf_accept_double(
 
 async def open_onlypdf_client(cfg: Optional[Dict[str, str]] = None):
     cfg = cfg or _load_env()
+    import os
+    # Allow per-run isolated Telethon session/proxy from environment.
+    for key in (
+        "TG_SESSION",
+        "TG_PROXY",
+        "TG_PROXY_TYPE",
+        "TG_WAIT_SECONDS",
+        "TG_POLL_SECONDS",
+        "TG_ONLYPDF_BOT",
+        "TG_PROTON_BOT",
+    ):
+        val = (os.environ.get(key) or "").strip()
+        if val:
+            cfg[key] = val
     if _gate_is_proton():
         try:
             wait = float(cfg.get("TG_WAIT_SECONDS") or 90)
@@ -453,13 +619,20 @@ async def generate_onlypdf_batch(
     reject_root.mkdir(parents=True, exist_ok=True)
 
     client, cfg = await open_onlypdf_client()
+    use_dual = _gate_is_dual()
     use_proton = _gate_is_proton()
-    gate_bot = (
-        _norm_bot(cfg.get("TG_PROTON_BOT", DEFAULT_PROTON), DEFAULT_PROTON)
-        if use_proton
-        else cfg.get("TG_ONLYPDF_BOT", DEFAULT_ONLYPDF)
-    )
-    gate_name = "Proton" if use_proton else "OnlyPDF"
+    if use_dual:
+        gate_bot = (
+            f"{_norm_bot(cfg.get('TG_PROTON_BOT', DEFAULT_PROTON), DEFAULT_PROTON)}"
+            f" + {cfg.get('TG_ONLYPDF_BOT', DEFAULT_ONLYPDF)}"
+        )
+        gate_name = "Dual(Proton+OnlyPDF)"
+    elif use_proton:
+        gate_bot = _norm_bot(cfg.get("TG_PROTON_BOT", DEFAULT_PROTON), DEFAULT_PROTON)
+        gate_name = "Proton"
+    else:
+        gate_bot = cfg.get("TG_ONLYPDF_BOT", DEFAULT_ONLYPDF)
+        gate_name = "OnlyPDF"
     mode = "STRICT_STREAK_WIPE" if strict_streak else "soft-fill"
     print(
         f"{gate_name} gate → {gate_bot} | {mode} target {n} (from {start_at}) → {out_dir}",
@@ -492,23 +665,41 @@ async def generate_onlypdf_batch(
                 if validate_fn:
                     good, reason = validate_fn(pdf)
                     if not good:
-                        print(
-                            f"{i:02d} a{attempt}+{bias} reject-local {reason}",
-                            flush=True,
-                        )
-                        continue
+                        if _gate_local_advisory():
+                            if str(reason).startswith("hard-local:"):
+                                print(
+                                    f"{i:02d} a{attempt}+{bias} hard-local {reason} "
+                                    f"→ Telegram (live probe)",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"{i:02d} a{attempt}+{bias} local-skip {reason} → Telegram",
+                                    flush=True,
+                                )
+                        else:
+                            print(
+                                f"{i:02d} a{attempt}+{bias} reject-local {reason}",
+                                flush=True,
+                            )
+                            continue
                 path = out_dir / f"{prefix}_{i:02d}.pdf"
                 path.write_bytes(pdf)
                 print(
-                    f"{i:02d} a{attempt}+{bias} check… "
+                    f"{i:02d} a{attempt}+{bias} check… → {gate_bot} "
                     f"{data.get('sender') or data.get('sender_name') or data.get('receiver') or data.get('receiver_name')} "
                     f"{data.get('amount')} "
                     f"{data.get('recipient_bank') or data.get('bank_name') or data.get('bank') or ''}",
                     flush=True,
                 )
-                verdict = await dual_accept_verdict(
-                    client, path, cfg, reject_dir=reject_root
-                )
+                if use_dual:
+                    verdict = await dual_accept_both_verdict(
+                        client, path, cfg, reject_dir=reject_root, pdf_bytes=pdf,
+                    )
+                else:
+                    verdict = await dual_accept_verdict(
+                        client, path, cfg, reject_dir=reject_root
+                    )
                 if verdict == "PASS":
                     dt = time.monotonic() - t_item
                     print(
@@ -558,7 +749,8 @@ async def generate_onlypdf_batch(
                     _wipe_accepted()
                     i = start_at
                     wiped = True
-                    await asyncio.sleep(2)
+                    # OnlyPDF chat reputation after ❌ — brief cooldown before next SHA.
+                    await asyncio.sleep(45)
                     break
 
                 if strict_streak and verdict in ("TIMEOUT", "SERVICE_ERROR", "?"):
@@ -574,7 +766,7 @@ async def generate_onlypdf_batch(
             i += 1
 
         if full_recheck:
-            print("=== FULL RECHECK (OnlyPDF) ===", flush=True)
+            print("=== FULL RECHECK (dual) ===" if use_dual else "=== FULL RECHECK (OnlyPDF) ===", flush=True)
             fails = []
             paths = [
                 out_dir / f"{prefix}_{j:02d}.pdf"
@@ -582,10 +774,16 @@ async def generate_onlypdf_batch(
                 if (out_dir / f"{prefix}_{j:02d}.pdf").is_file()
             ]
             for p in paths:
-                vo, _vp = await dual_verdict_parallel(client, p, cfg)
-                print(f"recheck {p.name} onlypdf={vo}", flush=True)
-                if vo != "PASS":
-                    fails.append(f"{p.name}:{vo}")
+                if use_dual:
+                    vo, vp = await dual_verdict_both(client, p, cfg)
+                    print(f"recheck {p.name} onlypdf={vo} proton={vp}", flush=True)
+                    if vo != "PASS" or vp != "PASS":
+                        fails.append(f"{p.name}:op={vo},pr={vp}")
+                else:
+                    vo, _vp = await dual_verdict_parallel(client, p, cfg)
+                    print(f"recheck {p.name} onlypdf={vo}", flush=True)
+                    if vo != "PASS":
+                        fails.append(f"{p.name}:{vo}")
             if fails:
                 print(f"RECHECK FAIL {fails}", flush=True)
                 return 3

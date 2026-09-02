@@ -933,6 +933,13 @@ _SBP_LIVE_ROUTE4 = "1013"
 # Route G1012 + core 00118 + bank5 30701 (same bank5 as WB, different channel).
 _OZON_ROUTE_SINCE = datetime(2026, 8, 15)
 _OZON_ROUTE_NEW = ("B", "G10120011830701")
+# Fresh 01–02.09 originals from `чеки/альфа/Документ (9..11).pdf`:
+# Сбербанк -> A+B10030011840301, Т-Банк -> A+B10200011840301,
+# Совкомбанк -> A+B10080011840301.
+_SEP_ROUTE_SINCE = datetime(2026, 9, 1)
+_SEP_ROUTE_SBER = ("A", "B10030011840301")
+_SEP_ROUTE_TBANK = ("A", "B10200011840301")
+_SEP_ROUTE_SOVKOM = ("A", "B10080011840301")
 # 10.08 T-Bank orig (`document10.08.26.pdf`). June T-Bank origs are A+G100x.
 _TBANK_ROUTE_SINCE = datetime(2026, 8, 10)
 _TBANK_ROUTE_OLD = ("A", "G10080011770901")  # pdf (3).pdf 15.06 afternoon
@@ -1007,6 +1014,20 @@ def _bank_route(bank: str, dt: Optional[datetime] = None) -> tuple:
     low = (bank or "").lower().replace("ё", "е")
     is_ozon = "озон" in low or "ozon" in low or (face or "").startswith("Озон")
     naive = dt.replace(tzinfo=None) if dt is not None else None
+    # September cluster from fresh originals (01.09 / 02.09).
+    if naive is not None and naive >= _SEP_ROUTE_SINCE:
+        is_tbank = (face or "") == "Т-Банк" or "т-банк" in low or "тинькофф" in low
+        is_sber = (face or "") == "Сбербанк" or "сбер" in low
+        is_sovkom = (face or "") == "Совкомбанк" or "совком" in low
+        is_gazprom = (face or "") == "Газпромбанк" or "газпром" in low
+        if is_tbank:
+            return _SEP_ROUTE_TBANK
+        if is_sber:
+            return _SEP_ROUTE_SBER
+        if is_sovkom:
+            return _SEP_ROUTE_SOVKOM
+        if is_gazprom:
+            return _SEP_ROUTE_TBANK
     if is_ozon and naive is not None and naive >= _OZON_ROUTE_SINCE:
         return _OZON_ROUTE_NEW
     is_sber = (face or "") == "Сбербанк" or "сбер" in low
@@ -1044,10 +1065,13 @@ def _bank_route(bank: str, dt: Optional[datetime] = None) -> tuple:
     if naive is not None:
         # Ак Барс / Открытие / … : nearest era among B1013 and Ozon G1012,
         # never WB G1014.
+        prefer_b1013_only = (face or "") in _ERA_FALLBACK_FACES
         era = None
         era_delta = None
         for orig_dt, _orig_bank, orig_lead, orig_tail in _bank_routes_from_origs():
             if orig_tail not in _ERA_OK_TAILS:
+                continue
+            if prefer_b1013_only and orig_tail != "B10130011821301":
                 continue
             delta = abs((orig_dt - naive).total_seconds())
             if era is None or delta < era_delta:
@@ -1769,6 +1793,31 @@ def _pred_sbp_cs(
     return _SBP_CS_SKELETON + 4 * sum(len(p) for p in parts)
 
 
+def _deacon_cs_penalty(bank: str, cs: int) -> int:
+    """Empirical Deacon stability penalty for Sep 01/02 Alfa SBP."""
+    low = (bank or "").lower().replace("ё", "е")
+    if "сбер" in low:
+        if cs in (5115, 5123):
+            return 800
+        if cs in (5091, 5095, 5099, 5103, 5107, 5127):
+            return 0
+    if "т-банк" in low or "тинькофф" in low:
+        if cs == 5087:
+            return 250
+        if cs == 5115:
+            return 450
+        if cs == 5139:
+            return 220
+        if cs in (5099, 5103, 5107, 5139):
+            return 0
+    if "совком" in low:
+        if cs in (5115, 5123):
+            return 900
+        if cs in (5127, 5143):
+            return 0
+    return 0
+
+
 def _fit_prepared_cs(prep: Dict[str, str]) -> Dict[str, str]:
     """Walk phone/amount CID count so decoded CS is not a Deacon clone length.
 
@@ -1783,7 +1832,8 @@ def _fit_prepared_cs(prep: Dict[str, str]) -> Dict[str, str]:
             _pred_sbp_cs(p, extra_op=extra, phone=phone, amount=amount)
         )
 
-    if ok(prep):
+    pred_base = _pred_sbp_cs(prep)
+    if ok(prep) and _deacon_cs_penalty(prep.get("recipient_bank") or "", pred_base) == 0:
         return prep
     raw_phone = prep.get("phone") or ""
     raw_amt = (
@@ -1801,30 +1851,54 @@ def _fit_prepared_cs(prep: Dict[str, str]) -> Dict[str, str]:
         for compact in (0, 1, 2, 3):
             phone = _fmt_phone(raw_phone, compact=compact)
             amt = _fmt_amount(raw_amt, grouped=grouped)
-            for form_gap in (True, False):
-                formed = _fmt_datetime(dt, with_seconds=False, msk_gap=form_gap)
-                trial = dict(prep)
-                trial["phone"] = phone
-                trial["amount"] = amt
-                trial["date_formed"] = formed
+            # Orig date_formed is always «HH:MM\xa0мск». Stripping the gap
+            # walks CS by 4 (5111→5107) but is a visual tell — do not use it.
+            formed = _fmt_datetime(dt, with_seconds=False, msk_gap=True)
+            trial = dict(prep)
+            trial["phone"] = phone
+            trial["amount"] = amt
+            trial["date_formed"] = formed
+            extra_need = 0
+            if ok(trial):
                 extra_need = 0
-                if ok(trial):
-                    extra_need = 0
-                elif ok(trial, 1):
-                    extra_need = 1
-                elif ok(trial, 2):
-                    extra_need = 2
-                else:
-                    continue
-                score = (
-                    compact * 40
-                    + (0 if grouped else 10)
-                    + (0 if form_gap else 4)
-                    + extra_need * 80
-                )
-                if score < best_score:
-                    best, best_score = trial, score
+            elif ok(trial, 1):
+                extra_need = 1
+            elif ok(trial, 2):
+                extra_need = 2
+            else:
+                continue
+            if extra_need:
+                trial["operation_num"] = (trial.get("operation_num") or "") + (_NBSP * extra_need)
+            # Prefer orig grouped amount + extra op CID over ungrouped
+            # «8140» (typography-bare) when leaving clone CS 5111.
+            score = (
+                compact * 40
+                + (0 if grouped else 50)
+                + extra_need * 8
+            )
+            pred = _pred_sbp_cs(trial)
+            score += _deacon_cs_penalty(trial.get("recipient_bank") or "", pred)
+            if score < best_score:
+                best, best_score = trial, score
     if best is not None:
+        bank_face = best.get("recipient_bank") or ""
+        pred0 = _pred_sbp_cs(best)
+        if _deacon_cs_penalty(bank_face, pred0):
+            # Last CS nudge axis: trailing NBSP in message (face-safe).
+            # This shifts decoded CS by +4 per NBSP without touching user fields.
+            for bump in (1, 2, 3, 4):
+                trial = dict(best)
+                trial["message"] = (trial.get("message") or "") + (_NBSP * bump)
+                pred = _pred_sbp_cs(trial)
+                if _deacon_cs_penalty(bank_face, pred):
+                    continue
+                # Prefer moving to lower-risk CS even when old clone-len heuristic
+                # marks it borderline; Deacon bank-specific risk is primary here.
+                if _sbp_cs_need_bump(pred) and _deacon_cs_penalty(bank_face, pred) >= _deacon_cs_penalty(bank_face, pred0):
+                    continue
+                best = trial
+                best_score += bump
+                break
         if best_score:
             logger.info(
                 "Alfa SBP cs-fit score=%d pred=%d phone=%r amt=%r formed=%r",
@@ -1892,11 +1966,11 @@ def _op_trailing_nbsp_ok(ctx: AlfaOrigContext) -> bool:
 
 
 def _date_formed_ok(ctx: AlfaOrigContext) -> bool:
-    """Orig formed line is «DD.MM.YYYY HH:MM мск» with no trailing NBSP."""
+    """Orig formed line is «DD.MM.YYYY HH:MM\xa0мск» with no trailing NBSP."""
     got = ctx.extract_at(*SBP_COORDS["date_formed"]) or ""
     if not got or got.endswith(_NBSP):
         return False
-    return "мск" in got.replace(_NBSP, " ")
+    return "\xa0мск" in got
 
 
 def _date_time_trailing_ok(ctx: AlfaOrigContext) -> bool:
@@ -2242,6 +2316,23 @@ def create_alfa_sbp_stealth(
         chk = AlfaOrigContext()
         if not chk.load_bytes(pdf):
             last_why = "xref/Length mismatch verify"
+            continue
+        # Prefer a fresh internal identity before shipping:
+        # repeated FF2/CID clusters are accepted by local invariants but
+        # empirically unstable on live Deacon checks for Sep 01/02 Alfa SBP.
+        quality_risks = []
+        stream_cs = len(chk.stream or b"")
+        if _deacon_cs_penalty(prepared.get("recipient_bank") or "", stream_cs) >= 450:
+            quality_risks.append(f"cs-risk:{stream_cs}")
+        ff2_now = _ff2_sha16(pdf)
+        if ff2_now in _sent_ff2_shas() and ff2_now not in _corpus_ff2_shas():
+            quality_risks.append(f"ff2-repeat:{ff2_now}")
+        cid_now = _cid_map_signature(chk)
+        if cid_now in _sent_cid_signatures():
+            quality_risks.append("cid-repeat")
+        if quality_risks and trial < 18:
+            last_why = "quality/" + ",".join(quality_risks)
+            logger.info("Alfa SBP rebuild %s trial=%d shell=%s", last_why, trial, os.path.basename(path))
             continue
         if not _verify_committed(pdf, prepared):
             last_why = "text overflow"

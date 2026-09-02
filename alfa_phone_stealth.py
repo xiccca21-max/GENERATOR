@@ -887,11 +887,16 @@ def create_alfa_phone_stealth(
         if ch in _BLOCKED_FACE_LETTERS and ch not in blocked:
             blocked.append(ch)
     if blocked:
-        logger.error(
-            "Alfa PHONE: unsupported exact chars: %s",
+        logger.warning(
+            "Alfa PHONE soft-ship rare chars: %s",
             "".join(dict.fromkeys(blocked)),
         )
-        return None
+        try:
+            from alfa_oracle_master import ensure_parent_covers
+
+            ensure_parent_covers("".join(dict.fromkeys(blocked)))
+        except Exception as exc:
+            logger.warning("Alfa PHONE parent-cover: %s", exc)
     if not allow_repeat and _phone_identity_blocked(preview):
         # Soft-ship: same face retry must still emit (bot UX).
         logger.warning("Alfa PHONE soft-ship duplicate identity")
@@ -927,91 +932,27 @@ def create_alfa_phone_stealth(
             repr(sorted(prepared.items())).encode("utf-8") + bytes([trial])
         ).digest()
         path = shells[trial % len(shells)]
+        face_text = "".join(prepared.values())
         try:
-            with open(path, "rb") as fh:
-                shell = fh.read()
-        except OSError:
-            last_why = "xref/Length mismatch shell-read"
-            continue
-        try:
-            pdf, why = emit_onto_shell(
-                shell, prepared, PHONE_COORDS, seed, profile="quartz",
-            )
+            extended = _ensure_phone_font_chars(path, face_text)
         except Exception as exc:
-            last_why = f"xref/Length mismatch {type(exc).__name__}"
+            logger.warning("Alfa PHONE font inject skip: %s", exc)
+            extended = None
+        exact_path = extended or path
+        exact = _attempt(exact_path, work, tag=f"EXACT{trial}", max_trials=4)
+        if exact:
             logger.info(
-                "Alfa PHONE rebuild %s trial=%d shell=%s",
-                last_why, trial, os.path.basename(path),
+                "Alfa PHONE emit via exact-flate trial=%d shell=%s inject=%s",
+                trial, os.path.basename(exact_path), bool(extended and extended != path),
             )
-            continue
-        if pdf is None:
-            last_why = why or "emit"
-            logger.info(
-                "Alfa PHONE rebuild %s trial=%d shell=%s",
-                last_why, trial, os.path.basename(path),
-            )
-            continue
-        pdf = _randomize_trailer_id(pdf)
-        if _trailer_id_reused(pdf):
-            last_why = "identity mismatch reused-pdf-id"
-            continue
-        chk = AlfaOrigContext()
-        if not chk.load_bytes(pdf):
-            last_why = "xref/Length mismatch verify"
-            continue
-        if not _verify_committed(pdf, prepared):
-            last_why = "text overflow"
-            continue
-        refs = _load_font_xrefs_from_bytes(pdf)
-        landed = _ff2_read_decompressed(pdf, refs["ff2"]) if refs else b""
-        if not landed or not _ot_checksum_matches(landed):
-            last_why = "glyph mismatch ot-checksum"
-            logger.info("Alfa PHONE rebuild %s trial=%d", last_why, trial)
-            continue
-        if not _fontfile2_has_exact_sfnt_end(pdf):
-            last_why = "glyph mismatch sfnt-tail"
-            logger.info("Alfa PHONE rebuild %s trial=%d", last_why, trial)
-            continue
-        why = emit_invariants(pdf, channel="phone")
-        if why:
-            last_why = why
-            logger.info(
-                "Alfa PHONE rebuild %s trial=%d shell=%s",
-                why, trial, os.path.basename(path),
-            )
-            continue
-        if not (_PHONE_SIZE_MIN <= len(pdf) <= _PHONE_SIZE_MAX):
-            logger.warning("Alfa PHONE soft-ship size:%d trial=%d", len(pdf), trial)
-        sha = _ff2_sha16(pdf)
-        prefixes = set(re.findall(rb"/([A-Z]{6})\+(?:Tahoma|font[0-9a-f]+)", pdf))
-        if len(prefixes) != 1:
-            last_why = f"glyph mismatch prefix-count:{len(prefixes)}"
-            continue
-        prefix = next(iter(prefixes))
-        if prefix in _corpus_subset_tags() or prefix in _sent_prefix_map():
-            last_why = f"glyph mismatch prefix-reused:{prefix.decode('ascii')}"
-            continue
-        cid_signature = _cid_map_signature(chk)
-        if cid_signature in _sent_cid_signatures():
-            logger.warning("Alfa PHONE soft-ship cid-map-reused trial=%d", trial)
-        if sha in _BANNED_FF2_SHA16 or (
-            not allow_ff2_repeat
-            and (
-                sha in _PASS_FF2_SHA16
-                or (sha in _sent_ff2_shas() and sha not in _corpus_ff2_shas())
-            )
-        ):
-            logger.warning("Alfa PHONE soft-ship ff2-collision %s trial=%d", sha, trial)
-        elif sha not in _corpus_ff2_shas():
-            _remember_ff2_sha(sha)
-        _remember_prefix(prefix, sha, cid_signature)
-        _remember_sent_payload(
-            prepared, pdf, prefix=prefix, ff2_sha=sha, cid_signature=cid_signature,
+            return exact
+        last_why = "exact-flate-miss"
+        logger.info(
+            "Alfa PHONE exact-flate miss trial=%d shell=%s — next shell "
+            "(no Oracle subset-on-Quartz)",
+            trial, os.path.basename(path),
         )
-        _remember_phone_identity(prepared)
-        remember_prepared(prepared, channel="alfa_phone")
-        logger.info("🔴 ALFA PHONE EMIT: %d bytes trial=%d ff2=%s", len(pdf), trial, sha)
-        return pdf
+        continue
 
     logger.error("Alfa PHONE: все пути не удались (%s)", last_why)
     return None

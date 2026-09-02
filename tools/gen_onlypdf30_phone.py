@@ -21,16 +21,29 @@ sys.path.insert(0, str(_DIR))
 logging.basicConfig(level=logging.ERROR)
 
 from onlypdf_gate import generate_onlypdf_batch  # noqa: E402
+from orig_match_gate import wrap_validate  # noqa: E402
 from onlypdf_safe_names import (  # noqa: E402
     CYR_NO_YO_TVERD,
     coverage_report,
-    pick_hard_tbank_pair,
-    pick_hard_tbank_recv,
+    diverse_amount,
+    diverse_mobile_phone,
+    pick_diverse_tbank_face,
+    strip_yo,
 )
 from tbank_phone_stealth import create_tbank_phone_stealth  # noqa: E402
 import fitz  # noqa: E402
 
 _USED_RECEIPTS: set[str] = set()
+
+
+def _strip_yo_tverd_for_tests(text: str) -> str:
+    return (
+        str(text or "")
+        .replace("Ё", "Е")
+        .replace("ё", "е")
+        .replace("Ъ", "Ь")
+        .replace("ъ", "ь")
+    )
 
 
 def _payload(i: int, attempt: int = 0) -> dict:
@@ -40,18 +53,11 @@ def _payload(i: int, attempt: int = 0) -> dict:
     hh = rng.randint(8, 22)
     mm = rng.randint(0, 59)
     ss = (rng.randint(0, 59) + attempt + i) % 60
-    amounts = (
-        3500, 5200, 7800, 9100, 12000, 14500, 16800, 18200, 21000, 24500,
-        5600, 13400, 15700, 19900, 22000,
-    )
-    amount = amounts[(i * 3 + attempt) % len(amounts)]
-    first, last = pick_hard_tbank_pair(i, attempt)
-    sender = f"{first} {last}"
-    receiver = pick_hard_tbank_recv(i, attempt)
-    phone = (
-        f"+7 ({rng.randint(900, 999)}) {rng.randint(100, 999)}-"
-        f"{rng.randint(10, 99)}-{rng.randint(10, 99)}"
-    )
+    amount = int(diverse_amount(i, attempt))
+    sender, receiver = pick_diverse_tbank_face(i, attempt)
+    sender = strip_yo(sender)
+    receiver = strip_yo(receiver)
+    phone = diverse_mobile_phone(i, attempt)
     return {
         "date_time": f"21.04.2026  {hh:02d}:{mm:02d}:{ss:02d}",
         "amount": str(amount),
@@ -84,8 +90,8 @@ def _local_ok(pdf: bytes) -> tuple[bool, str]:
     m = re.search(r"Квитанция\s+№\s+([\d-]+)", text)
     if m:
         rec = m.group(1).strip()
-        if not rec.startswith("1-104-397-813-"):
-            return False, f"bad-stem:{rec}"
+        if not re.match(r"^1-\d{3}-\d{3}-\d{3}-\d{3}$", rec):
+            return False, f"bad-receipt:{rec}"
         if rec in _USED_RECEIPTS:
             return False, f"receipt-used:{rec}"
     return True, "ok"
@@ -121,7 +127,7 @@ async def main() -> int:
         n=n,
         payload_fn=_payload,
         gen_fn=_gen,
-        validate_fn=_local_ok,
+        validate_fn=wrap_validate("tbank_phone", _local_ok),
         prefix="phone",
         max_attempts=25,
         fresh=not args.keep,

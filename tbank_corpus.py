@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import statistics
+from datetime import datetime as _dt
 from typing import Dict, List, Optional, Tuple
 
 CORPUS_DIR_CANDIDATES = [
@@ -33,9 +34,11 @@ _RECEIPT_NUM_RE = re.compile(r"1-\d{3}-\d{3}-\d{3}-\d{3}")
 _RECEIPT_STRICT_RE = re.compile(r"^1-\d{3}-\d{3}-\d{3}-\d{3}$")
 _SBP_ID_RE = re.compile(r"\b[AB][0-9A-Z]{26}\b")
 
-# Все авто-номера Т-Банка: фиксированный блок 1-132-, дальше три группы рандом.
+# Все авто-номера Т-Банка: 1-A-B-C-D (A эпоха по дате лица, B/C/D рандом).
 TBANK_RECEIPT_A = "132"
-TBANK_RECEIPT_FALLBACK = "1-132-107-043-958"
+TBANK_RECEIPT_FALLBACK = "1-130-107-043-958"
+# Proton A-TBANK-RECEIPT-BLOCK-EPOCH-001 — Aug+ 2026: A ∈ {105,112,113,115,130}.
+_RECEIPT_A_AUG_2026 = ("105", "112", "113", "115", "130")
 
 _KIND_LABELS = {
     "nocomm": "На карту (без к-и / другой банк)",
@@ -172,6 +175,64 @@ def pick_donor(kind: str, op_date: Optional[str] = None) -> Optional[str]:
     return min(paths, key=lambda p: abs(os.path.getsize(p) - target))
 
 
+def pick_h471_card_sber_exact_donor(
+    painted_n: int = 59,
+    op_date: Optional[str] = None,
+) -> Optional[str]:
+    """card_sber h=471: corpus shell on OnlyPDF exact (cmap,glyf) atlas."""
+    from tbank_sbp_stealth import _F1_GLYF_EXACT_BY_HEIGHT, _glyf_table_length
+    import tbank_unlock_template as tut
+
+    exacts = (_F1_GLYF_EXACT_BY_HEIGHT or {}).get(471) or {}
+    if not exacts:
+        return None
+    paths = corpus_paths("card_sber") or []
+    if op_date:
+        norm = lambda s: re.sub(r"\s+", " ", s.strip())
+        want = norm(op_date)
+        for p in paths:
+            try:
+                import fitz
+                doc = fitz.open(p)
+                head = doc[0].get_text().split("\n", 1)[0].strip()
+                doc.close()
+                if norm(head) == want:
+                    return p
+            except Exception:
+                pass
+    painted_n = max(59, min(63, int(painted_n or 59)))
+    cand: List[Tuple[int, int, int, str]] = []
+    for path in paths:
+        try:
+            import fitz
+            doc = fitz.open(path)
+            if int(round(float(doc[0].mediabox.y1))) != 471:
+                doc.close()
+                continue
+            fr = tut._find_font_objects(doc).get("TinkoffSans-Regular")
+            if not fr:
+                doc.close()
+                continue
+            ff = doc.xref_stream(fr["fontfile_xref"])
+            tu = doc.xref_stream(fr["tounicode_xref"])
+            sub = tut._parse_subset_tounicode(tu.decode("latin1", "replace"))
+            cn = len(sub)
+            gl = int(_glyf_table_length(ff))
+            doc.close()
+            xs = exacts.get(int(cn))
+            if not xs or int(gl) not in xs:
+                continue
+            if int(cn) < painted_n:
+                continue
+            cand.append((int(cn) - painted_n, int(gl), os.path.getsize(path), path))
+        except Exception:
+            continue
+    if not cand:
+        return None
+    cand.sort()
+    return cand[0][3]
+
+
 def corpus_stats() -> Dict[str, Dict]:
     stats: Dict[str, Dict] = {}
     if not os.path.isdir(CORPUS_DIR):
@@ -269,6 +330,32 @@ def normalize_receipt_num(raw: str, *, fallback: str = TBANK_RECEIPT_FALLBACK) -
     return fallback
 
 
+def _parse_op_date(op_date: Optional[str]) -> Optional[_dt]:
+    if not op_date:
+        return None
+    clean = re.sub(r"\s+", " ", str(op_date).strip())
+    for fmt, n in (
+        ("%d.%m.%Y %H:%M:%S", 19),
+        ("%d.%m.%Y %H:%M", 16),
+        ("%d.%m.%Y", 10),
+    ):
+        try:
+            return _dt.strptime(clean[:n], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _receipt_a_pool(op_date: Optional[str] = None) -> Optional[tuple[str, ...]]:
+    """Return fixed A-block pool for face date era, or None = legacy A=132."""
+    dt = _parse_op_date(op_date)
+    if dt is None:
+        return None
+    if dt.date() >= _dt(2026, 8, 1).date():
+        return _RECEIPT_A_AUG_2026
+    return None
+
+
 def _known_receipt_stems() -> set[str]:
     """Stem'ы 1-XXX-XXX-XXX из atlas — их нельзя переиспользовать с новой датой/opid."""
     try:
@@ -286,20 +373,29 @@ def _known_receipt_stems() -> set[str]:
         return set()
 
 
-def _rand_receipt_bcd(*, forbid: str = "", avoid_stem: str = "") -> str:
-    """1-132-B-C-D: фиксированный A=132, B/C/D — случайные тройки."""
+def _rand_receipt_bcd(
+    *,
+    forbid: str = "",
+    avoid_stem: str = "",
+    op_date: Optional[str] = None,
+) -> str:
+    """1-A-B-C-D: A по эпохе даты, B/C/D — случайные тройки."""
     bad = set(forbid)
     known = _known_receipt_stems()
     seed = int.from_bytes(secrets.token_bytes(8), "big")
     import random as _rnd
 
     rng = _rnd.Random(seed)
-    a = TBANK_RECEIPT_A
+    a_pool = _receipt_a_pool(op_date)
     for _ in range(1024):
+        if a_pool:
+            a = rng.choice(a_pool)
+        else:
+            a = TBANK_RECEIPT_A
         b = f"{rng.randint(0, 999):03d}"
         c = f"{rng.randint(0, 999):03d}"
         d = f"{rng.randint(0, 999):03d}"
-        if b in bad or c in bad or d in bad:
+        if a in bad or b in bad or c in bad or d in bad:
             continue
         stem = f"1-{a}-{b}-{c}"
         if stem in known:
@@ -307,22 +403,27 @@ def _rand_receipt_bcd(*, forbid: str = "", avoid_stem: str = "") -> str:
         if avoid_stem and stem == avoid_stem:
             continue
         return f"{stem}-{d}"
+    a = rng.choice(a_pool) if a_pool else TBANK_RECEIPT_A
     return (
-        f"1-{a}-{rng.randint(0, 999):03d}-"
+        f"1-{a}-"
         f"{rng.randint(0, 999):03d}-{rng.randint(0, 999):03d}"
     )
 
 
-def remix_receipt_d_only(base: str, *, forbid: str = "") -> str:
+def remix_receipt_d_only(
+    base: str, *, forbid: str = "", op_date: Optional[str] = None,
+) -> str:
     """Авто-квитанция: всегда 1-132- + новый B-C-D (base игнорируется)."""
     _ = base
-    return _rand_receipt_bcd(forbid=forbid)
+    return _rand_receipt_bcd(forbid=forbid, op_date=op_date)
 
 
-def remix_receipt_tail(base: str, *, forbid: str = "") -> str:
+def remix_receipt_tail(
+    base: str, *, forbid: str = "", op_date: Optional[str] = None,
+) -> str:
     """Авто-квитанция: всегда 1-132- + новый B-C-D (base игнорируется)."""
     _ = base
-    return _rand_receipt_bcd(forbid=forbid)
+    return _rand_receipt_bcd(forbid=forbid, op_date=op_date)
 
 
 def gen_receipt_number(
@@ -332,10 +433,10 @@ def gen_receipt_number(
     forbid: str = "",
     fallback: str = TBANK_RECEIPT_FALLBACK,
 ) -> str:
-    """Квитанция Т-Банка: всегда 1-132-XXX-XXX-XXX (B/C/D рандом)."""
-    _ = kind, op_date  # kind/date больше не выбирают чужой префикс корпуса
+    """Квитанция Т-Банка: 1-A-B-C-D; A привязан к эпохе даты лица."""
+    _ = kind
     return normalize_receipt_num(
-        _rand_receipt_bcd(forbid=forbid),
+        _rand_receipt_bcd(forbid=forbid, op_date=op_date),
         fallback=fallback,
     )
 
@@ -402,7 +503,7 @@ def gen_sbp_operation_id(
         _gen_sbp_suffix,
     )
     ref3 = f"{(int(dec['ref4'][:3]) + hm[0]) % 1000:03d}"
-    suffix = _gen_sbp_suffix(bank, amount)
+    suffix = _gen_sbp_suffix(bank, amount, date_str=clean)
     # Guess class from template channel/bank for alphabet; finalize will harden.
     ch = dec.get("channel") or "1014"
     bsuf = dec.get("bank_code") or "00117"
@@ -433,4 +534,6 @@ def gen_sbp_operation_id(
     if len(sbp_id) != 27:
         return _gen_sbp_id(date_str, bank=bank, amount=amount, phone=phone,
                            account=account, receiver=receiver)
-    return _finalize_sbp_identity(sbp_id, suffix, bank=bank, amount=amount)
+    return _finalize_sbp_identity(
+        sbp_id, suffix, bank=bank, amount=amount, date_str=clean,
+    )

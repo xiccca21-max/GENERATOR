@@ -186,7 +186,7 @@ def _fmt_date(dt: str) -> str:
     """'DD.MM.YYYY[, ]HH:MM[:SS]' → 'DD.MM.YYYY  HH:MM:SS' (двойной пробел)."""
     try:
         s = (dt or "").strip()
-        if s.lower() in ("сейчас", "now", "-", ""):
+        if s.lower() in ("сейчас", "now", "-", "", "авто", "auto"):
                         s = now_msk().strftime("%d.%m.%Y  %H:%M:%S")
         s = s.replace(",", " ")
         m = re.search(r"(\d{1,2}:\d{2}(?::\d{2})?)", s)
@@ -243,6 +243,8 @@ def _find_streams(pdf: bytes):
 
 
 def _replace_once(blob: bytes, old: bytes, new: bytes) -> Tuple[bytes, bool]:
+    if not old:
+        return blob, False
     idx = blob.find(old)
     if idx < 0:
         return blob, False
@@ -522,7 +524,7 @@ def _ensure_card_sber_bank_template() -> None:
         logger.info("card_sber shell: %s", ORIG_TEMPLATE_CARD_BANK)
 
 
-def _card_generation_base_path() -> str:
+def _card_generation_base_path(prepared: Optional[Dict] = None) -> str:
     _ensure_card_sber_bank_template()
     if os.path.isfile(ORIG_TEMPLATE_CARD_BANK):
         return ORIG_TEMPLATE_CARD_BANK
@@ -655,22 +657,30 @@ def _prepare_card_data(data: Dict) -> Dict:
         receipt_raw = normalize_receipt_num(receipt_raw)
 
     sender_raw = str(data.get("sender", _ORIG_SENDER_CARD))
-    sender = _normalize_tbank_sender(sender_raw) or sender_raw
-    receiver = _normalize_tbank_receiver(str(data.get("receiver", _ORIG_RECEIVER_CARD)))
-    bank = str(data.get("recipient_bank", _ORIG_BANK_CARD))
+    sender = _strip_yo_tverd(_normalize_tbank_sender(sender_raw) or sender_raw)
+    receiver = _strip_yo_tverd(
+        _normalize_tbank_receiver(str(data.get("receiver", _ORIG_RECEIVER_CARD)))
+    )
+    bank = _strip_yo_tverd(str(data.get("recipient_bank", _ORIG_BANK_CARD)))
 
     return {
         "new_date":         new_date,
         "new_amount":       new_amount,
         "new_amount_total": new_amount_total,
-        "sender":           _strip_yo_tverd(sender),
-        "receiver":         _strip_yo_tverd(receiver),
-        "bank":             _strip_yo_tverd(bank),
+        "sender":           sender,
+        "receiver":         receiver,
+        "bank":             bank,
         "card":             _format_card_num(str(data.get("card", _ORIG_CARD_NUM))),
         "new_commission":   new_commission,
         "has_nonzero_commission": has_nonzero_commission,
         "receipt_raw":      receipt_raw,
         "_receipt_auto":    receipt_auto,
+        "_user_sender": sender,
+        "_user_receiver": receiver,
+        "_user_bank": bank,
+        "_shell_sender": _ORIG_SENDER_CARD,
+        "_shell_receiver": _ORIG_RECEIVER_CARD,
+        "_shell_bank": _ORIG_BANK_CARD,
     }
 
 
@@ -746,14 +756,29 @@ def _default_card_orig() -> Dict[str, str]:
 
 
 def _find_best_card_donor(prepared: Dict) -> Optional[Tuple[str, Dict, List[str], List[str]]]:
-    from tbank_corpus import corpus_paths, pick_donor
+    from tbank_corpus import (
+        corpus_paths, pick_donor, pick_h471_card_sber_exact_donor,
+    )
     from tbank_donor_fit import adapt_card_prepared, pick_tbank_donor, amount_slot_fits
     from tbank_sbp_stealth import _amount_slot_ok
 
     reg_texts = _card_reg_texts(prepared, include_receipt=False)
     paths = list(corpus_paths("card_sber") or [])
+    face = " ".join(
+        str(prepared.get(k) or "")
+        for k in (
+            "new_sender", "new_receiver", "new_bank",
+            "new_card", "new_amount", "new_date",
+        )
+    )
+    painted_n = max(59, min(63, len({c for c in face if c.isalnum() or ord(c) > 127})))
+    exact_pref = pick_h471_card_sber_exact_donor(
+        painted_n=painted_n, op_date=prepared.get("new_date"),
+    )
+    if exact_pref and exact_pref in paths:
+        paths = [exact_pref] + [p for p in paths if p != exact_pref]
     preferred = pick_donor("card_sber", prepared.get("new_date"))
-    if preferred and preferred in paths:
+    if preferred and preferred in paths and preferred != exact_pref:
         paths = [preferred] + [p for p in paths if p != preferred]
 
     def _score(ctx, orig, adapted):
@@ -1070,9 +1095,15 @@ def _try_orig_mode_card_on(
         from tbank_channel_common import compress_orig_stream
 
         new_compressed = compress_orig_stream(stream, orig_comp_len)
-        if new_compressed is None or len(new_compressed) != orig_comp_len:
+        if new_compressed is None:
             return None
-        pdf[cs:ce] = new_compressed
+        if len(new_compressed) != orig_comp_len:
+            rebuilt = _patch_length_and_rebuild(pdf, cs, ce, new_compressed)
+            if rebuilt is None:
+                return None
+            pdf = bytearray(rebuilt)
+        else:
+            pdf[cs:ce] = new_compressed
 
     if preserve_donor or preserve_metadata:
         result = bytes(pdf)
@@ -1099,10 +1130,28 @@ def _try_orig_mode_card_on(
 
 def _try_orig_mode_card(prepared: Dict) -> Optional[bytes]:
     try:
-        from tbank_corpus import template_paths, pick_donor
+        from tbank_corpus import (
+            pick_donor, pick_h471_card_sber_exact_donor, template_paths,
+        )
         paths = template_paths("card_sber", ORIG_TEMPLATE_CARD)
+        face = " ".join(
+            str(prepared.get(k) or "")
+            for k in (
+                "new_sender", "new_receiver", "new_bank",
+                "new_card", "new_amount", "new_date",
+            )
+        )
+        painted_n = max(
+            59,
+            min(63, len({c for c in face if c.isalnum() or ord(c) > 127})),
+        )
+        exact_pref = pick_h471_card_sber_exact_donor(
+            painted_n=painted_n, op_date=prepared.get("new_date"),
+        )
+        if exact_pref and exact_pref in paths:
+            paths = [exact_pref] + [p for p in paths if p != exact_pref]
         preferred = pick_donor("card_sber", prepared.get("new_date"))
-        if preferred and preferred in paths:
+        if preferred and preferred in paths and preferred != exact_pref:
             paths = [preferred] + [p for p in paths if p != preferred]
     except Exception:
         paths = [ORIG_TEMPLATE_CARD]
@@ -1134,7 +1183,7 @@ def _build_dynamic_card(prepared: Dict) -> Optional[bytes]:
     from tbank_corpus import normalize_receipt_num
 
     p = prepared
-    base_path = _card_generation_base_path()
+    base_path = _card_generation_base_path(p)
     orig_f = _extract_card_fields(base_path) or _default_card_orig()
     if not os.path.isfile(base_path):
         logger.error("Card template missing: %s", base_path)
@@ -1222,6 +1271,12 @@ def create_tbank_stealth(data: Dict) -> Optional[bytes]:
         dynamic_builder=_build_dynamic_card,
     )
     if pdf is None:
+        try:
+            pdf = _build_dynamic_card(dict(prepared))
+        except Exception as exc:
+            logger.error("CARD_SBER LAW1 dynamic retry: %s", exc)
+            pdf = None
+    if pdf is None:
         return None
     ok, why = pdf_face_matches_user(
         pdf,
@@ -1230,8 +1285,11 @@ def create_tbank_stealth(data: Dict) -> Optional[bytes]:
         donor_banks=(_ORIG_BANK_CARD,),
     )
     if not ok:
-        logger.error("CARD_SBER: %s — ship anyway", why)
-    return pdf
+        logger.error("CARD_SBER: %s — finish anyway", why)
+    from tbank_dynamic import _tbank_finish_non_sbp_ship
+    return _tbank_finish_non_sbp_ship(
+        pdf, height=471, prepared=prepared, channel="card_sber",
+    )
 
 
 if __name__ == "__main__":

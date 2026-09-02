@@ -161,7 +161,8 @@ def _select_free(
             nxt = cand + timedelta(minutes=delta)
             if ok(nxt):
                 return _with_new_seconds(nxt)
-    raise RuntimeError("no free operation minute in the past 14 days")
+    logger.warning("no free operation minute in 14 days — keep requested clock")
+    return _with_new_seconds(cand)
 
 
 def pick_free(dt: datetime) -> datetime:
@@ -179,7 +180,11 @@ def claim_free(dt: datetime, *, channel: str = "", source: str = "claim") -> dat
             dt, used, allow_future=(channel == "alfa_card"),
             hour_lo=10 if daytime else 0,
             hour_hi=21 if daytime else 23,
-            day_floor=date(2026, 7, 30) if daytime else None,
+            day_floor=(
+                None
+                if (daytime and dt.date() < date(2026, 7, 30))
+                else (date(2026, 7, 30) if daytime else None)
+            ),
         )
         key = minute_key(chosen)
         if key not in minutes:

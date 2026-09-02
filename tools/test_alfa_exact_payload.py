@@ -25,7 +25,7 @@ from alfa_orig_mode import AlfaOrigContext
 
 
 FULL_RU = "АБВГДЕЖЗИКЛМНОПРСТУФХЦЧШЩЫЬЭЮЯ"
-BLOCKED_RU = "ъЪёЁйЙ"
+RARE_RU = "ъЪёЁйЙ"
 
 
 class AlfaExactPayloadTests(unittest.TestCase):
@@ -52,8 +52,13 @@ class AlfaExactPayloadTests(unittest.TestCase):
     def test_fixed_right_column_anchors(self) -> None:
         for key in ("phone", "recipient_bank", "account", "sbp_id", "message"):
             self.assertEqual(sbp.SBP_COORDS[key][1], 304.75)
+        # V2 (default): cards LEFT; date/auth/terminal/op RIGHT.
+        for key in ("date_time", "auth_code", "terminal_code", "operation_num"):
+            self.assertEqual(card.CARD_COORDS_V2[key][1], 304.75)
+        self.assertEqual(card.CARD_COORDS_V2["receiver_card"][1], 35.45)
+        # V1 legacy: receiver on RIGHT with date/op.
         for key in ("receiver_card", "date_time", "operation_num"):
-            self.assertEqual(card.CARD_COORDS[key][1], 304.75)
+            self.assertEqual(card.CARD_COORDS_V1[key][1], 304.75)
         for key in ("receiver", "phone", "account", "message"):
             self.assertEqual(phone.PHONE_COORDS[key][1], 304.75)
 
@@ -82,9 +87,14 @@ class AlfaExactPayloadTests(unittest.TestCase):
         blank = card._prepare_card({"amount": "1000", "date_time": "сейчас"})
         for key in ("sender_card", "receiver_card"):
             compact = re.sub(r"[\s\u00a0]", "", blank[key])
-            self.assertRegex(compact, r"^220\d{3}\*{6}\d{4}$", key)
+            self.assertRegex(compact, r"^\d{6}\*{6}\d{4}$", key)
+        self.assertTrue(blank["sender_card"].startswith("220015"))
+        self.assertIn("auth_code", blank)
+        self.assertIn("terminal_code", blank)
         kept = card._fmt_card("2200151234568946")
         self.assertEqual(kept, "220015******8946")
+        foreign = card._fmt_card("437772******5821")
+        self.assertEqual(foreign, "437772******5821")
 
     def test_sbp_manual_text_and_ids_are_exact(self) -> None:
         data = {
@@ -134,20 +144,27 @@ class AlfaExactPayloadTests(unittest.TestCase):
         required = set(FULL_RU + FULL_RU.lower() + "0123456789")
         self.assertEqual(required - available, set())
         sample = FULL_RU + FULL_RU.lower() + " 0123456789"
+        from alfa_oracle_master import ensure_parent_covers
+        ensure_parent_covers(sample)
         self.assertEqual(sbp.check_text(sample), [])
         self.assertEqual(card.check_text(sample), [])
         self.assertEqual(phone.check_text(sample), [])
-        for check in (sbp.check_text, card.check_text, phone.check_text):
-            self.assertEqual(check(BLOCKED_RU), list(BLOCKED_RU))
+        self.assertEqual(sbp._BLOCKED_FACE_LETTERS, frozenset())
 
-    def test_live_generators_fail_closed_on_excluded_letters(self) -> None:
-        for label, create in (
-            ("sbp", sbp.create_alfa_sbp_stealth),
-            ("card", card.create_alfa_card_stealth),
-            ("phone", phone.create_alfa_phone_stealth),
-        ):
-            with self.subTest(label=label):
-                self.assertIsNone(create({"receiver": "Тест йЁъ"}))
+    def test_live_generators_do_not_quarantine_rare_letters(self) -> None:
+        self.assertEqual(sbp._BLOCKED_FACE_LETTERS, frozenset())
+        data = {
+            "amount": "1500",
+            "receiver": "Йолка Ъёшкина",
+            "recipient_bank": "Сбербанк",
+            "phone": "+79001234567",
+            "date_time": "сейчас",
+            "account": "авто",
+            "operation_num": "авто",
+            "sbp_id": "авто",
+            "message": "перевод",
+        }
+        self.assertIsNone(sbp.alfa_sbp_reject_reason(data))
 
     def test_oracle_font_extension_keeps_rare_letters_and_digits(self) -> None:
         sample = "ЫыЭэЩщЦцЮю0123456789"
@@ -293,6 +310,53 @@ class AlfaExactPayloadTests(unittest.TestCase):
             )
         )
         self.assertEqual(sbp._bank_route("Т-Банк"), ("B", "B10130011821301"))
+
+    def test_card_five_digit_amount_never_none(self) -> None:
+        """87 900 (user live miss) must emit — donor amount slot is 4 875."""
+        pdf = card.create_alfa_card_stealth(
+            {
+                "amount": "87900",
+                "sender_card": "2200151234563238",
+                "receiver_card": "2202201234569875",
+                "date_time": "сейчас",
+                "operation_num": "авто",
+            },
+            allow_repeat=True,
+            claim_minute=False,
+        )
+        self.assertIsNotNone(pdf)
+        self.assertTrue(bytes(pdf).startswith(b"%PDF-"))
+        ctx = AlfaOrigContext()
+        self.assertTrue(ctx.load_bytes(pdf))
+        amt = (ctx.extract_at(*card.CARD_COORDS["amount"]) or "").replace("\u00a0", " ")
+        self.assertIn("87 900", amt)
+        self.assertIn("RUR", amt)
+        snd = re.sub(r"[\s\u00a0]", "", ctx.extract_at(*card.CARD_COORDS["sender_card"]) or "")
+        self.assertTrue(snd.startswith("220015"))
+        self.assertTrue(snd.endswith("3238"))
+
+    def test_phone_masked_letter_keeps_quartz_prefix(self) -> None:
+        """Rare initial (М) must stay on Quartz AAAAAB+font…, not Oracle rebuild."""
+        pdf = phone.create_alfa_phone_stealth(
+            {
+                "amount": "18740",
+                "receiver": "Никита Павлович М",
+                "phone": "+7 (908) 512-47-19",
+                "date_time": "сейчас",
+                "account": "авто",
+                "operation_num": "авто",
+                "message": "авто",
+            },
+            allow_repeat=True,
+            claim_minute=False,
+        )
+        self.assertIsNotNone(pdf)
+        self.assertGreaterEqual(len(pdf), 69_000)
+        self.assertLessEqual(len(pdf), 72_000)
+        self.assertIn(b"/AAAAAB+font000000002ff81462", pdf)
+        self.assertTrue(bytes(pdf).startswith(b"%PDF-"))
+        why = alfa_emit.emit_invariants(pdf, channel="phone")
+        self.assertEqual(why, "")
 
 
 if __name__ == "__main__":

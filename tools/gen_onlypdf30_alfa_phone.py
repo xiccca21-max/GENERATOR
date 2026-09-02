@@ -21,6 +21,7 @@ sys.path.insert(0, str(_DIR))
 logging.basicConfig(level=logging.ERROR)
 
 from onlypdf_gate import generate_onlypdf_batch  # noqa: E402
+from orig_match_gate import wrap_validate  # noqa: E402
 from onlypdf_safe_names import (  # noqa: E402
     CYR_NO_YO_TVERD,
     coverage_report,
@@ -236,7 +237,7 @@ async def main() -> int:
         n=n,
         payload_fn=_payload,
         gen_fn=_gen,
-        validate_fn=_local_ok,
+        validate_fn=wrap_validate("alfa_phone", _local_ok),
         prefix="alfa_phone",
         max_attempts=28,
         fresh=not args.keep,

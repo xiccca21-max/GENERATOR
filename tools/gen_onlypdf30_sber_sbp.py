@@ -21,10 +21,14 @@ sys.path.insert(0, str(_DIR))
 logging.basicConfig(level=logging.ERROR)
 
 from onlypdf_gate import generate_onlypdf_batch  # noqa: E402
+from orig_match_gate import wrap_validate  # noqa: E402
 from onlypdf_safe_names import (  # noqa: E402
     CYR_NO_YO_TVERD,
     coverage_report,
-    pick_sber_fio,
+    diverse_amount,
+    diverse_mobile_phone,
+    pick_diverse_sber_face,
+    strip_yo,
 )
 from sber_sbp_stealth import create_sber_sbp_stealth  # noqa: E402
 import fitz  # noqa: E402
@@ -77,25 +81,18 @@ def _payload(i: int, attempt: int = 0) -> dict:
     d = pool[(i + attempt) % len(pool)]
     ss = (d["ss"] + 1 + attempt + i) % 60
     # Keep donor phone when present (slot/glyph clone); else unique.
-    phone = d.get("phone") or (
-        f"+7 ({rng.randint(900, 999)}) {rng.randint(100, 999)}-"
-        f"{rng.randint(10, 99)}-{rng.randint(10, 99)}"
-    )
-    sender = d["sender"] if len(d["sender"]) >= 6 else pick_sber_fio(i, attempt, role="sender")
-    receiver = d["receiver"] if len(d["receiver"]) >= 6 else pick_sber_fio(i, attempt, role="recv")
-    excluded = set("ъЪёЁйЙ")
-    if set(sender) & excluded:
-        sender = "Мария Александровна Ющенко"
-    if set(receiver) & excluded:
-        receiver = "Екатерина Владимировна Щукина"
-    if i % 30 == 0:
-        sender = "Мария Александровна Ющенко"
-        receiver = "Екатерина Владимировна Щукина"
-    bank = d["bank"] or "Т-Банк"
-    if "Сбер" in bank:
-        bank = "Т-Банк"
+    phone = diverse_mobile_phone(i, attempt)
+    sender = strip_yo(pick_diverse_sber_face(i, attempt, role="sender"))
+    receiver = strip_yo(pick_diverse_sber_face(i, attempt, role="recv"))
+    banks = ("Т-Банк", "Альфа-Банк", "ВТБ", "Газпромбанк", "ПСБ", "Озон Банк")
+    bank = banks[(i + attempt) % len(banks)]
+    amt = int(diverse_amount(i, attempt))
+    while len(str(amt)) > 5:
+        amt //= 10
+    if len(str(amt)) < 3:
+        amt = 1000 + (i * 137 + attempt * 41) % 8000
     return {
-        "amount": str(int(d["digs"])),
+        "amount": str(amt),
         "sender_name": sender,
         "receiver_name": receiver,
         "phone": phone,
@@ -158,7 +155,7 @@ async def main() -> int:
         n=n,
         payload_fn=_payload,
         gen_fn=_gen,
-        validate_fn=_local_ok,
+        validate_fn=wrap_validate("sber_sbp", _local_ok),
         prefix="sber_sbp",
         max_attempts=12,
         fresh=not args.keep,

@@ -15,11 +15,12 @@ import sber_sbp_stealth as sbp
 
 
 class SberExactPayloadTests(unittest.TestCase):
-    def test_required_charset_excludes_narrowed_letters_and_keeps_digits(self) -> None:
+    def test_required_charset_includes_full_cyrillic_and_digits(self) -> None:
         required = set(sgl._FULL_REQUIRED)
-        self.assertTrue(set("ъЪёЁйЙ").isdisjoint(required))
+        self.assertTrue(set("ъЪёЁйЙщЩ").issubset(required))
         self.assertTrue(set("0123456789").issubset(required))
-        self.assertEqual(sgl.excluded_name_chars("Алена Ёлкина"), {"Ё"})
+        self.assertEqual(sgl.excluded_name_chars("Алена Ёлкина"), set())
+        self.assertEqual(sgl.EXCLUDED_NAME_CHARS, frozenset())
 
     def test_cmap_miss_never_substitutes_payload(self) -> None:
         payload = {

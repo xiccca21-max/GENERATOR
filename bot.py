@@ -335,13 +335,24 @@ except ImportError:
 
 # Т-Банк СБП
 try:
-    from tbank_sbp_stealth import create_tbank_sbp_stealth, decode_sbp_operation_id
+    from tbank_sbp_stealth import (
+        create_tbank_sbp_stealth,
+        decode_sbp_operation_id,
+        _parse_tbank_sbp_rest,
+        _is_date_now_token,
+    )
     TBANK_SBP_AVAILABLE = True
 except ImportError:
     TBANK_SBP_AVAILABLE = False
     def create_tbank_sbp_stealth(*_a, **_k):
         return None
     def decode_sbp_operation_id(_): return None
+    def _parse_tbank_sbp_rest(rest):
+        return "Сбербанк", "сейчас", list(rest or [])
+    def _is_date_now_token(text):
+        return (text or "").strip().lower() in (
+            "сейчас", "now", "-", "", "авто", "auto",
+        )
 
 # Т-Банк По номеру телефона
 try:
@@ -619,9 +630,9 @@ ALFA_SBP_EXAMPLE = """10755
 авто
 Перевод"""
 
-ALFA_CARD_EXAMPLE = """4875
-2200151234567890
-2202201234568275
+ALFA_CARD_EXAMPLE = """100
+2200158946123456
+4377721666123456
 сейчас
 авто"""
 
@@ -702,7 +713,7 @@ BTN_SBER_CARD_OTHER = "💳 По карте в другой банк"
 
 # Подтипы перевода Альфа-Банка
 BTN_ALFA_SBP = "📲 СБП"
-BTN_ALFA_CARD = "💳 Карта на карту"
+BTN_ALFA_CARD = "💳 По номеру карты в другой банк"
 BTN_ALFA_PHONE = "📱 По телефону (Альфа→Альфа)"
 BTN_ALFA_STATEMENT = "📄 Выписка"
 
@@ -3089,7 +3100,7 @@ async def sber_submenu_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def alfa_submenu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Подменю Альфа-Банка: СБП / карта на карту"""
+    """Подменю Альфа-Банка: СБП / по номеру карты в другой банк"""
     await ack_press(update)
     text = pressed_text(update)
     user_id = update.effective_user.id
@@ -3140,7 +3151,7 @@ async def alfa_submenu_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if text == BTN_ALFA_CARD:
         if not ALFA_CARD_AVAILABLE:
             await update.effective_message.reply_text(
-                "⚠️ Модуль Альфа «карта на карту» не загружен.",
+                "⚠️ Модуль Альфа «по номеру карты в другой банк» не загружен.",
                 reply_markup=alfa_submethod_keyboard(),
             )
             return ALFA_SUBMENU
@@ -3155,7 +3166,7 @@ async def alfa_submenu_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         await send_data_entry_prompt(
             update,
-            "🔴 Альфа-Банк - Карта на карту", fields_text, ALFA_CARD_EXAMPLE,
+            "🔴 Альфа-Банк — по номеру карты в другой банк", fields_text, ALFA_CARD_EXAMPLE,
             reply_markup=back_keyboard(),
         )
         return ENTERING_DATA
@@ -3224,6 +3235,36 @@ async def alfa_submenu_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 PDF_GEN_TIMEOUT_SEC = 360
+
+_COPY_HEADER_TOKENS = frozenset({"copy", "скопировать", "вставить", "paste"})
+
+
+def _min_payload_lines(bank: str, context) -> int:
+    """Minimum non-empty lines before we try to emit (optional date/ids default)."""
+    if bank == "tbank":
+        sm = context.user_data.get("tbank_submethod")
+        if sm == "sbp":
+            return 4
+        if sm == "phone":
+            return 4
+        if sm == "card_tbank":
+            return 4
+        if sm == "card_nocomm":
+            return 3
+        if sm == "card_other":
+            return 5
+    if bank == "sber":
+        return 5
+    if bank == "alfa":
+        sm = context.user_data.get("alfa_submethod")
+        if sm == "sbp":
+            return 9
+        if sm == "phone":
+            return 7
+        if sm == "statement":
+            return 10
+        return 5
+    return 5
 
 
 def _expect_from_payload(data: dict | None) -> dict:
@@ -3327,27 +3368,45 @@ async def _generate_gated_pdf(
     canonical = copy.deepcopy(data)
     extra_kwargs = dict(generator_kwargs or {})
 
-    payload = copy.deepcopy(canonical)
-    call = (
-        partial(gen_fn, data=payload, **extra_kwargs)
-        if data_as_keyword
-        else partial(gen_fn, payload, **extra_kwargs)
-    )
-    try:
-        candidate = await asyncio.wait_for(
-            loop.run_in_executor(None, call),
-            timeout=PDF_GEN_TIMEOUT_SEC,
+    # LAW #1: retry emit — never «не собралось» on a first None/timeout.
+    candidate = None
+    last_exc: BaseException | None = None
+    for _emit_try in range(1, 4):
+        payload = copy.deepcopy(canonical)
+        call = (
+            partial(gen_fn, data=payload, **extra_kwargs)
+            if data_as_keyword
+            else partial(gen_fn, payload, **extra_kwargs)
         )
-    except asyncio.TimeoutError:
-        logger.error("PDF generation timed out for %s", method_hint)
-        return None
-    except Exception as exc:
-        logger.exception(
-            "PDF generation crashed for %s: %s",
-            method_hint, exc,
-        )
-        return None
+        try:
+            candidate = await asyncio.wait_for(
+                loop.run_in_executor(None, call),
+                timeout=PDF_GEN_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            last_exc = TimeoutError(f"{method_hint} timeout")
+            logger.error(
+                "PDF generation timed out for %s (try %d/3)",
+                method_hint, _emit_try,
+            )
+            candidate = None
+        except Exception as exc:
+            last_exc = exc
+            logger.exception(
+                "PDF generation crashed for %s (try %d/3): %s",
+                method_hint, _emit_try, exc,
+            )
+            candidate = None
+        if candidate:
+            break
+        if _emit_try < 3:
+            logger.warning(
+                "PDF emit empty for %s — retry %d/3 (LAW1 always-ship)",
+                method_hint, _emit_try + 1,
+            )
     if not candidate:
+        if last_exc is not None:
+            logger.error("PDF generation failed for %s after 3 tries", method_hint)
         return None
     if not isinstance(candidate, (bytes, bytearray)) or not bytes(candidate).startswith(b"%PDF-"):
         logger.error("Generator returned non-PDF output for %s", method_hint)
@@ -3546,21 +3605,16 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     # Проверяем возможность использования
     lines = [l.strip() for l in text.split('\n') if l.strip()]
     # Telegram / клиенты иногда вставляют «copy» первой строкой - сдвигает все поля.
-    while lines and (
-        not re.search(r"\d", lines[0])
-        or lines[0].lower() in ("copy", "скопировать", "вставить", "paste")
-    ):
-        if (
-            context.user_data.get("alfa_submethod") == "statement"
-            and lines[0].lower() in ("авто", "auto", "-", "сейчас", "now")
-        ):
-            break
+    while lines and lines[0].lower() in _COPY_HEADER_TOKENS:
         lines = lines[1:]
-    
-    if len(lines) < 5:
+    while lines and not re.search(r"\d", lines[0]) and not _is_date_now_token(lines[0]):
+        lines = lines[1:]
+
+    need = _min_payload_lines(bank, context)
+    if len(lines) < need:
         await update.effective_message.reply_text(
             "❌ *Недостаточно данных!*\n\n"
-            "Нужно минимум 5 строк.\n"
+            f"Нужно минимум {need} строк.\n"
             "Не вставляйте строку `copy` - только данные чека.",
             reply_markup=back_keyboard(),
             parse_mode='Markdown'
@@ -3569,15 +3623,15 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     
     # Парсим данные
     amount_raw = lines[0]
-    sender = lines[1]
-    receiver = lines[2]
-    phone = lines[3]
-    recipient_bank = lines[4]
+    sender = lines[1] if len(lines) > 1 else ""
+    receiver = lines[2] if len(lines) > 2 else ""
+    phone = lines[3] if len(lines) > 3 else ""
+    recipient_bank = lines[4] if len(lines) > 4 else "Сбербанк"
     
     # Дата
     if len(lines) >= 6:
         date_input = lines[5].strip().lower()
-        if date_input in ['сейчас', 'now', '-']:
+        if date_input in ['сейчас', 'now', '-', 'авто', 'auto']:
             date_time = now_msk().strftime("%d.%m.%Y, %H:%M")
         else:
             date_time = lines[5]
@@ -3603,7 +3657,7 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     try:
         if bank == 'sber' and context.user_data.get('sber_submethod') == 'sbp':
             date_input = lines[5].strip() if len(lines) > 5 else "сейчас"
-            if date_input.lower() in ('сейчас', 'now', '-', ''):
+            if date_input.lower() in ('сейчас', 'now', '-', '', 'авто', 'auto'):
                 now = now_msk()
                 sber_date = now.strftime("%d.%m.%Y")
                 sber_time = now.strftime("%H:%M:%S")
@@ -3642,7 +3696,7 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
         elif bank == 'sber' and context.user_data.get('sber_submethod') == 'phone':
             date_input = lines[5].strip() if len(lines) > 5 else "сейчас"
-            if date_input.lower() in ('сейчас', 'now', '-', ''):
+            if date_input.lower() in ('сейчас', 'now', '-', '', 'авто', 'auto'):
                 now = now_msk()
                 sber_date = now.strftime("%d.%m.%Y")
                 sber_time = now.strftime("%H:%M:%S")
@@ -3689,7 +3743,7 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 )
                 return SBER_SUBMENU
             date_input = lines[5].strip() if len(lines) > 5 else "сейчас"
-            if date_input.lower() in ('сейчас', 'now', '-', ''):
+            if date_input.lower() in ('сейчас', 'now', '-', '', 'авто', 'auto'):
                 now = now_msk()
                 sber_date = now.strftime("%d.%m.%Y")
                 sber_time = now.strftime("%H:%M:%S")
@@ -3906,7 +3960,7 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         elif bank == 'alfa' and context.user_data.get('alfa_submethod') == 'card':
             if len(lines) < 5:
                 await update.effective_message.reply_text(
-                    "❌ *Недостаточно данных для Альфа «карта на карту»!*\n\n"
+                    "❌ *Недостаточно данных для Альфа «по номеру карты в другой банк»!*\n\n"
                     "Нужно 5 строк:\n"
                     "1. Сумма\n2. Карта отправителя\n3. Карта получателя\n"
                     "4. Дата (или 'сейчас')\n5. Номер операции (или 'авто')",
@@ -3932,7 +3986,7 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                     reply_markup=back_keyboard(),
                 )
                 return ENTERING_DATA
-            bank_name = "Альфа-Банк (карта)"
+            bank_name = "Альфа-Банк (карта → другой банк)"
             now = now_msk()
             filename = f"alfa_card_{now.strftime('%H%M%S')}.pdf"
             amount = lines[0]
@@ -4011,17 +4065,6 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 'operation_num': lines[8],
                 'message': lines[9],
             }
-            miss = alfa_statement_check_text(
-                "".join(str(data.get(k) or "") for k in (
-                    "client", "address", "message", "account",
-                ))
-            )
-            if miss:
-                await update.effective_message.reply_text(
-                    f"❌ Нет глифа для: {''.join(miss[:12])}",
-                    reply_markup=back_keyboard(),
-                )
-                return ENTERING_DATA
             pdf_bytes = await _run_pdf_sync(
                 update, create_alfa_statement_stealth, data=data,
                 method_hint="alfa_statement",
@@ -4057,7 +4100,7 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             ph_date_raw = lines[4].strip() if len(lines) > 4 else "сейчас"
             ph_receipt  = lines[5].strip() if len(lines) > 5 else "авто"
 
-            if ph_date_raw.lower() in ('сейчас', 'now', '-', ''):
+            if ph_date_raw.lower() in ('сейчас', 'now', '-', '', 'авто', 'auto'):
                 ph_date = now_msk().strftime("%d.%m.%Y, %H:%M")
             else:
                 ph_date = ph_date_raw
@@ -4083,6 +4126,16 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 data,
                 method_hint="tbank_phone",
             )
+            if not pdf_bytes:
+                logger.error(
+                    "T-Bank phone emit None data=%s",
+                    {k: (str(v)[:40] if v else v) for k, v in data.items()},
+                )
+                await update.effective_message.reply_text(
+                    "❌ Сейчас не собралось — отправьте те же данные ещё раз.",
+                    reply_markup=back_keyboard(),
+                )
+                return ENTERING_DATA
             bank_name = "Т-Банк (По тел.)"
             _receipt_date = re.match(r'(\d{2}\.\d{2}\.\d{4})', ph_date)
             filename = f"receipt_{_receipt_date.group(1) if _receipt_date else now_msk().strftime('%d.%m.%Y')}.pdf"
@@ -4098,21 +4151,8 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             sbp_phone    = lines[2] if len(lines) > 2 else "+7 (965) 585-66-55"
             sbp_receiver = lines[3] if len(lines) > 3 else "Получатель"
 
-            def _looks_like_date(s: str) -> bool:
-                return bool(re.match(
-                    r"^\d{1,2}[./]\d{1,2}[./]\d{2,4}",
-                    (s or "").strip(),
-                ))
-
             rest = lines[4:]
-            if rest and _looks_like_date(rest[0]):
-                sbp_bank = "Сбербанк"
-                sbp_date_raw = rest[0].strip()
-                tail = rest[1:]
-            else:
-                sbp_bank = rest[0] if rest else "Сбербанк"
-                sbp_date_raw = rest[1].strip() if len(rest) > 1 else "сейчас"
-                tail = rest[2:]
+            sbp_bank, sbp_date_raw, tail = _parse_tbank_sbp_rest(rest)
 
             def _tbank_sbp_auto(val: str) -> bool:
                 v = val.strip().lower()
@@ -4154,7 +4194,7 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                     )
                     return ENTERING_DATA
 
-            if sbp_date_raw.lower() in ('сейчас', 'now', '-', ''):
+            if sbp_date_raw.lower() in ('сейчас', 'now', '-', '', 'авто', 'auto'):
                 # Pass through «сейчас» so prepare randomizes seconds 1–59
                 # (expanding to HH:MM here made date_manual + :00 → ZERO_SECONDS).
                 sbp_date = "сейчас"
@@ -4206,7 +4246,7 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             ct_card     = lines[3].strip() if len(lines) > 3 else "*3269"
             ct_date_raw = lines[4].strip() if len(lines) > 4 else "сейчас"
             ct_receipt  = lines[5].strip() if len(lines) > 5 else "авто"
-            if ct_date_raw.lower() in ('сейчас', 'now', '-', ''):
+            if ct_date_raw.lower() in ('сейчас', 'now', '-', '', 'авто', 'auto'):
                 ct_date = now_msk().strftime("%d.%m.%Y, %H:%M")
             else:
                 ct_date = ct_date_raw
@@ -4224,6 +4264,16 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 ct_data,
                 method_hint="tbank_card_tbank",
             )
+            if not pdf_bytes:
+                logger.error(
+                    "T-Bank card_tbank emit None data=%s",
+                    {k: (str(v)[:40] if v else v) for k, v in ct_data.items()},
+                )
+                await update.effective_message.reply_text(
+                    "❌ Сейчас не собралось — отправьте те же данные ещё раз.",
+                    reply_markup=back_keyboard(),
+                )
+                return ENTERING_DATA
             bank_name = "Т-Банк (Клиенту Т-Банка)"
             _receipt_date = re.match(r'(\d{2}\.\d{2}\.\d{4})', ct_date)
             filename = f"receipt_{_receipt_date.group(1) if _receipt_date else now_msk().strftime('%d.%m.%Y')}.pdf"
@@ -4237,7 +4287,7 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             nc_card     = lines[2].strip() if len(lines) > 2 else "220220******3269"
             nc_date_raw = lines[3].strip() if len(lines) > 3 else "сейчас"
             nc_receipt  = lines[4].strip() if len(lines) > 4 else "авто"
-            if nc_date_raw.lower() in ('сейчас', 'now', '-', ''):
+            if nc_date_raw.lower() in ('сейчас', 'now', '-', '', 'авто', 'auto'):
                 nc_date = now_msk().strftime("%d.%m.%Y, %H:%M")
             else:
                 nc_date = nc_date_raw
@@ -4255,6 +4305,16 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 nc_data,
                 method_hint="tbank_nocomm",
             )
+            if not pdf_bytes:
+                logger.error(
+                    "T-Bank nocomm emit None data=%s",
+                    {k: (str(v)[:40] if v else v) for k, v in nc_data.items()},
+                )
+                await update.effective_message.reply_text(
+                    "❌ Сейчас не собралось — отправьте те же данные ещё раз.",
+                    reply_markup=back_keyboard(),
+                )
+                return ENTERING_DATA
             bank_name = "Т-Банк (без к-и)"
             _receipt_date = re.match(r'(\d{2}\.\d{2}\.\d{4})', nc_date)
             filename = f"receipt_{_receipt_date.group(1) if _receipt_date else now_msk().strftime('%d.%m.%Y')}.pdf"
@@ -4360,6 +4420,13 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 data,
                 method_hint="tbank_card_sber",
             )
+            if not pdf_bytes:
+                logger.error("T-Bank card_sber emit None data=%s", data)
+                await update.effective_message.reply_text(
+                    "❌ Сейчас не собралось — отправьте те же данные ещё раз.",
+                    reply_markup=back_keyboard(),
+                )
+                return ENTERING_DATA
             bank_name = "Т-Банк"
             _receipt_date = re.match(r'(\d{2}\.\d{2}\.\d{4})', date_time)
             filename = f"receipt_{_receipt_date.group(1) if _receipt_date else now_msk().strftime('%d.%m.%Y')}.pdf"

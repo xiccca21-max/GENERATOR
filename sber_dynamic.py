@@ -2090,8 +2090,83 @@ def _pick_sbp_shell(prepared: Dict[str, str]) -> Tuple[str, Dict[int, int]]:
 
 
 def _fmt_coord(v: float) -> str:
+    """iText 2.1.7 / Jasper Tm: integer or ≤2 fractional digits, never 3+."""
     s = f"{v:.2f}".rstrip("0").rstrip(".")
     return s if s else "0"
+
+
+# Proton SBER_CONTENT_TM_TEMPLATE_Y_TRUNCATED: these Jasper rows are always *.74.
+_JASPER_TEMPLATE_Y_CANON = frozenset({
+    "204.74", "238.74", "296.74", "304.74", "330.74", "345.74",
+    "364.74", "385.74", "398.74", "434.74", "456.74", "475.74",
+    "490.74", "524.74", "558.74", "565.74", "601.74", "604.74",
+    "615.74", "632.74", "643.74", "697.74", "711.74", "728.74",
+})
+_JASPER_TEMPLATE_Y_RESTORE = {canon[:-1]: canon for canon in _JASPER_TEMPLATE_Y_CANON}
+
+
+def _sber_restore_template_y_token(y_tok: str) -> str:
+    return _JASPER_TEMPLATE_Y_RESTORE.get(y_tok, y_tok)
+
+
+def _sber_tm_frac_digits(token: bytes) -> int:
+    if b"." not in token:
+        return 0
+    return len(token.split(b".", 1)[1])
+
+
+def _sber_sanitize_jasper_tm(stream: bytes) -> bytes:
+    """Fix Proton HARD Tm spelling without touching TJ strings.
+
+    iText writes 0 or 2 decimals — never 65.390. Template Y stays 615.74 / 711.74,
+    never truncated 615.7 / 711.7 (old equal-length pack stole a digit from Y).
+    """
+    out = bytearray()
+    last = 0
+    changed = False
+    for m in re.finditer(
+        rb"((?:1|[0-9.]+)\s+0\s+0\s+(?:1|[0-9.]+)\s+)([\d.]+)(\s+)([\d.]+)(\s+Tm)",
+        stream,
+    ):
+        x_tok, y_tok = m.group(2), m.group(4)
+        nx, ny = x_tok, y_tok
+        if _sber_tm_frac_digits(x_tok) >= 3:
+            try:
+                nx = _fmt_coord(float(x_tok)).encode("ascii")
+            except ValueError:
+                nx = x_tok
+        if _sber_tm_frac_digits(y_tok) >= 3:
+            try:
+                ny = _fmt_coord(float(y_tok)).encode("ascii")
+            except ValueError:
+                ny = y_tok
+        y_s = ny.decode("ascii")
+        if y_s in _JASPER_TEMPLATE_Y_RESTORE:
+            ny = _JASPER_TEMPLATE_Y_RESTORE[y_s].encode("ascii")
+        if nx != x_tok or ny != y_tok:
+            changed = True
+        out.extend(stream[last:m.start()])
+        out.extend(m.group(1) + nx + m.group(3) + ny + m.group(5))
+        last = m.end()
+    if last == 0:
+        return stream
+    out.extend(stream[last:])
+    if changed:
+        logger.info("Sber Jasper Tm spelling sanitized (iText ≤2dp, Y *.74)")
+    return bytes(out)
+
+
+def _sber_jasper_tm_hard_ok(stream: bytes) -> bool:
+    """False if Proton would HARD on Tm decimals or truncated *.74 Y."""
+    for m in re.finditer(
+        rb"1 0 0 1 ([+\-]?\d+(?:\.\d+)?) ([+\-]?\d+(?:\.\d+)?) Tm",
+        stream,
+    ):
+        if _sber_tm_frac_digits(m.group(1)) >= 3 or _sber_tm_frac_digits(m.group(2)) >= 3:
+            return False
+        if m.group(2).decode("ascii", "replace") in _JASPER_TEMPLATE_Y_RESTORE:
+            return False
+    return True
 
 
 def _date_left_x(date_time: str) -> Optional[float]:
@@ -2539,37 +2614,43 @@ def _recenter_phone_date_stream(
 
 
 def _fmt_coord_exact_len(v: float, n: int) -> Optional[bytes]:
-    """Encode float into exactly ``n`` ASCII bytes (prefer digits over spaces)."""
+    """Encode float into exactly ``n`` ASCII bytes (prefer digits over spaces).
+
+    Never emit 3+ fractional digits — Proton SBER_CONTENT_TM_DECIMAL_OVERFLOW.
+    """
     if n <= 0:
         return None
-    for prec in range(min(6, max(0, n - 2)), -1, -1):
+    for prec in range(min(2, max(0, n - 2)), -1, -1):
         s = f"{v:.{prec}f}"
         if len(s) == n:
             return s.encode("ascii")
         if len(s) < n and "." in s:
-            pad = s + ("0" * (n - len(s)))
-            if len(pad) == n:
-                try:
-                    if abs(float(pad) - v) <= 0.0005 + 10 ** (-max(prec, 1)):
-                        return pad.encode("ascii")
-                except ValueError:
-                    pass
+            frac = len(s.split(".", 1)[1])
+            extra = n - len(s)
+            if frac + extra <= 2:
+                pad = s + ("0" * extra)
+                if len(pad) == n:
+                    try:
+                        if abs(float(pad) - v) <= 0.0005 + 10 ** (-max(prec, 1)):
+                            return pad.encode("ascii")
+                    except ValueError:
+                        pass
         if len(s) < n:
             pad = (" " * (n - len(s))) + s
             if len(pad) == n:
                 return pad.encode("ascii")
-    # Last resort: truncate "%.Nf" / strip.
-    raw = f"{v:.6f}".encode("ascii")
-    if len(raw) >= n:
-        return raw[:n]
+    raw = f"{v:.2f}".encode("ascii")
+    if len(raw) == n:
+        return raw
     return None
 
 
 def _set_tm_x_at_y(stream: bytes, target_y: float, new_x: float) -> bytes:
-    """Переписать X у Tm с данной Y; длина всего Tm-оператора неизменна.
+    """Rewrite Tm.x on the date row. Keep Jasper Y token (*.74).
 
-    Короткий X-токен (``71.9``) даёт шаг 0.1 → center drift ~0.04 и Proton
-    HARD ±0.01. Тогда одалживаем символы у Y (``711.74``→``711.7``).
+    Length of the operator may change — CS is re-flated after this.
+    Old equal-length pack stole a digit from Y (711.74→711.7) and padded X
+    to 65.390 → Proton HARD.
     """
     out = bytearray()
     last = 0
@@ -2583,41 +2664,11 @@ def _set_tm_x_at_y(stream: bytes, target_y: float, new_x: float) -> bytes:
             continue
         if abs(y - target_y) > 1.0:
             continue
-        old_x_tok = m.group(2)
-        old_y_tok = m.group(4)
-        budget = len(old_x_tok) + len(old_y_tok)
-        new_x_tok: Optional[bytes] = None
-        new_y_tok: Optional[bytes] = None
-        # Prefer longer X (more precision); Y keeps value within 0.05.
-        for x_len in range(min(8, budget - 3), 3, -1):
-            y_len = budget - x_len
-            if y_len < 3:
-                continue
-            xt = _fmt_coord_exact_len(new_x, x_len)
-            yt = _fmt_coord_exact_len(y, y_len)
-            if xt is None or yt is None:
-                continue
-            try:
-                if abs(float(yt) - y) > 0.05:
-                    continue
-                if abs(float(xt) - new_x) > 0.005:
-                    continue
-            except ValueError:
-                continue
-            new_x_tok, new_y_tok = xt, yt
-            break
-        if new_x_tok is None:
-            new_x_tok = _fmt_coord_exact_len(new_x, len(old_x_tok))
-            new_y_tok = old_y_tok
-        if new_x_tok is None or len(new_x_tok) + len(new_y_tok) != budget:
-            logger.warning(
-                "Sber date Tm X/Y pack fail x=%r y=%r → skip recenter",
-                old_x_tok, old_y_tok,
-            )
-            return stream
+        new_x_tok = _fmt_coord(new_x).encode("ascii")
+        new_y_tok = _sber_restore_template_y_token(
+            m.group(4).decode("ascii")
+        ).encode("ascii")
         new_tm = m.group(1) + new_x_tok + m.group(3) + new_y_tok + m.group(5)
-        if len(new_tm) != (m.end() - m.start()):
-            return stream
         out.extend(stream[last:m.start()])
         out.extend(new_tm)
         last = m.end()
@@ -2780,6 +2831,7 @@ def _compress_cs_preserve(
     Если задан max_clen (SBP ≤733) — не отдаём oversized fallback
     (Proton SBER_CONTENT_RAW_LENGTH_OUTLIER); лучше abort shell.
     """
+    stream = _sber_sanitize_jasper_tm(stream)
     preferred = orig_clen
     if max_clen is not None:
         preferred = min(orig_clen, max_clen, _corpus_cs_comp_target(len(stream), orig_clen))
@@ -3314,7 +3366,7 @@ def _replace_tj(
 
     last = tms[-1]
     old_x = float(last.group(1))
-    old_y = last.group(2).decode()
+    old_y = _sber_restore_template_y_token(last.group(2).decode())
     old_w = _width_pt(old_t, sz, font_obj, uni_to_gid)
     new_w = _width_pt(new_t, sz, font_obj, uni_to_gid)
     if left_x is not None:
@@ -9488,14 +9540,12 @@ def _build_from_base(
                 font_obj=font,
                 uni_to_gid=uni_gid,
             )
-            if len(stream2) == len(stream):
-                if stream2 != stream:
-                    logger.info(
-                        "Sber date Tm recentered post-font for center 153",
-                    )
+            if stream2 != stream:
+                logger.info(
+                    "Sber date Tm recentered post-font for center 153 (len %d→%d)",
+                    len(stream), len(stream2),
+                )
                 stream = stream2
-            else:
-                logger.warning("Sber date recenter skipped (stream len would change)")
 
         # Fail fast: lean shells often grow FontFile2 past donor after grafts.
         if (
@@ -9877,7 +9927,7 @@ def _build_from_base(
                         # Nudge Tm after ink_gap AW changes; re-flate CS below.
                         need_tm = tm_chk + (SBER_DATE_CENTER_X - cx_chk)
                         stream2 = _set_tm_x_at_y(stream, date_y_for_tune, need_tm)
-                        if len(stream2) == len(stream) and stream2 != stream:
+                        if stream2 != stream:
                             stream = stream2
                             tm2, cids2, _ = _date_run_cids(
                                 stream, date_y_for_tune, uni_gid,
