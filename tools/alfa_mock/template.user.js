@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Alfa-Bank Mock (local test)
 // @namespace    alfa-mock-local
-// @version      1.3.50
+// @version      1.3.58
 // @description  Подмена ФИО, баланса, операций и чеков PDF в кабинете Альфа
 // @match        *://web.alfabank.ru/*
 // @match        *://www.web.alfabank.ru/*
@@ -23,7 +23,13 @@
   function alfaMockRun(CFG, win) {
     win = win || window;
     if (win.__alfaMockRun) return;
-    win.__alfaMockRun = '1.3.50';
+    win.__alfaMockRun = '1.3.58';
+    try {
+      if (sessionStorage.getItem('__ALFA_MOCK_VER') !== '1.3.58') {
+        sessionStorage.removeItem('__ALFA_MOCK_OPS');
+        sessionStorage.setItem('__ALFA_MOCK_VER', '1.3.58');
+      }
+    } catch (_) { /* ignore */ }
 
     const CONFIG = CFG;
     const nativeParse = JSON.parse;
@@ -668,6 +674,7 @@
       if (/т-банк|t-bank|тинькоф/i.test(n)) return 'Т-Банк';
       if (/райф/i.test(n)) return 'Райффайзен';
       if (/втб/i.test(n)) return 'ВТБ';
+      if (/бспб|bspb|санкт.?петербург|банк\s*спб/i.test(n)) return 'Банк Санкт-Петербург';
       return n.split('(')[0].trim();
     }
 
@@ -677,13 +684,10 @@
       const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="${bg}"/>${inner}</svg>`;
       const cacheKey = bg + '|' + inner;
       if (logoBlobs[cacheKey]) return logoBlobs[cacheKey];
-      try {
-        const blob = new Blob([svg], { type: 'image/svg+xml' });
-        logoBlobs[cacheKey] = URL.createObjectURL(blob);
-        return logoBlobs[cacheKey];
-      } catch (_) {
-        return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
-      }
+      // data: URI — blob: часто режется CSP в Alfa Online / Safari
+      const uri = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+      logoBlobs[cacheKey] = uri;
+      return uri;
     }
 
     const BANK_LOGOS = {
@@ -693,6 +697,7 @@
       'Т-Банк': svgLogo('#FFDD2D', '<text x="32" y="45" text-anchor="middle" font-size="32" font-family="Arial,sans-serif" font-weight="700" fill="#333">T</text>'),
       'Райффайзен': svgLogo('#FFE600', '<text x="32" y="43" text-anchor="middle" font-size="26" font-family="Arial,sans-serif" font-weight="700" fill="#000">R</text>'),
       'ВТБ': svgLogo('#0A2896', '<text x="32" y="42" text-anchor="middle" font-size="18" font-family="Arial,sans-serif" font-weight="700" fill="#fff">ВТБ</text>'),
+      'БСПБ': svgLogo('#FFFFFF', '<circle cx="32" cy="18" r="10" fill="#E51837"/><ellipse cx="32" cy="36" rx="14" ry="5" fill="#E51837"/><ellipse cx="32" cy="46" rx="8" ry="2" fill="#C4102E"/>'),
     };
 
     function bankLogoKey(bank) {
@@ -707,6 +712,7 @@
       if (/т-?банк|t-?bank|тинькоф/i.test(n)) return 'Т-Банк';
       if (/райф/i.test(n)) return 'Райффайзен';
       if (/втб|vtb/i.test(n)) return 'ВТБ';
+      if (/бспб|bspb|санкт.?петербург|банк\s*спб/i.test(n)) return 'БСПБ';
       if (/псб|promsvyaz|промсвяз/i.test(n)) return 'ПСБ';
       return '';
     }
@@ -740,8 +746,27 @@
       return k === 'card' || k === 'карта';
     }
 
+    /** Live dump: phone Alfa→Alfa = «Переводы · Альфа-Банк», no СБП, Alfa logo, no badge. */
+    function isAlfaInternalKind(item) {
+      if (!item || isCardKind(item)) return false;
+      return bankLogoKey(item.bank) === 'Альфа';
+    }
+
+    function looksLikeAlfaInternalTransfer(op) {
+      if (!op || looksLikeSbpTransfer(op)) return false;
+      const cat = String((op.category && (op.category.name || op.category)) || '');
+      if (/сбп/i.test(cat)) return false;
+      if (/^Переводы\s*·\s*Альфа/i.test(cat)) return true;
+      const logo = String(op.logoUrl || op.iconUrl || '');
+      if (/alfabank/i.test(logo) && /^Переводы\s*·/i.test(cat) && looksLikePersonTitle(op.title || op.name)) {
+        return true;
+      }
+      return false;
+    }
+
     function looksLikeCardTransfer(op) {
       if (!op || looksLikeSbpTransfer(op)) return false;
+      if (looksLikeAlfaInternalTransfer(op)) return false;
       const cat = String((op.category && (op.category.name || op.category)) || '');
       const name = String(op.name || op.title || '');
       if (/альфа-?карта/i.test(name)) return true;
@@ -960,9 +985,11 @@
     function setCategoryLine(op, item) {
       const cat = item.category || 'Переводы';
       const bankName = (item.bank && (item.bank.categoryName || item.bank.short)) || shortBank(item.bank);
-      // Live dump: card→other = «Переводы · Т-Банк»; SBP = «Переводы · СБП · Банк».
+      // Live dump: card→other = «Переводы · Т-Банк»;
+      // Alfa→Alfa phone = «Переводы · Альфа-Банк» (no СБП);
+      // SBP other bank = «Переводы · СБП · Банк».
       let line;
-      if (isCardKind(item)) {
+      if (isCardKind(item) || isAlfaInternalKind(item)) {
         line = bankName ? `${cat} · ${bankName}` : cat;
       } else {
         line = bankName ? `${cat} · СБП · ${bankName}` : `${cat} · СБП`;
@@ -1138,13 +1165,45 @@
       patchOperationAmount(op, donor, item);
       if (item.phone && typeof op.phone === 'string') op.phone = item.phone;
       setCategoryLine(op, item);
+      // Donor transfers keep personal comment/badge («Долг») — force short face text.
       if (isCardKind(item)) {
-        // Live card→other history has no SBP bottomBadge; has status/mcc.
+        op.comment = null;
+        delete op.bottomBadge;
+      } else if (isAlfaInternalKind(item)) {
+        op.comment = 'Перевод денежных средств';
+        delete op.bottomBadge;
+      } else {
+        op.comment = 'Перевод денежных средств';
+        forceSbpBottomBadge(op, 'Перевод денежных средств');
+      }
+      if (typeof op.purpose === 'string' && !looksLikePersonTitle(op.purpose)) {
+        op.purpose = isCardKind(item) ? '' : 'Перевод денежных средств';
+      }
+      if (isCardKind(item) || isAlfaInternalKind(item)) {
+        // Live card→other / Alfa→Alfa: no SBP bottomBadge.
         delete op.bottomBadge;
         if (op.status == null) op.status = 'SUCCESS';
         if (op.subtitle == null) op.subtitle = '';
       }
       return op;
+    }
+
+    function forceSbpBottomBadge(op, text) {
+      if (!op || typeof op !== 'object') return;
+      const t = String(text || 'Перевод денежных средств');
+      const b = op.bottomBadge;
+      if (b && typeof b === 'object' && !Array.isArray(b)) {
+        if (typeof b.text === 'string' || 'text' in b) b.text = t;
+        else if (typeof b.title === 'string') b.title = t;
+        else if (b.title && typeof b.title === 'object' && 'value' in b.title) b.title.value = t;
+        else if (typeof b.name === 'string' || 'name' in b) b.name = t;
+        else if (typeof b.value === 'string' || 'value' in b) b.value = t;
+        else b.text = t;
+      } else if (typeof b === 'string') {
+        op.bottomBadge = t;
+      } else {
+        op.bottomBadge = { text: t };
+      }
     }
 
     function slimNode(node, depth) {
@@ -1306,7 +1365,7 @@
     }
 
     function mockFingerprint() {
-      return 'v22||' + (CONFIG.operations || []).map((item) => String(item.description || '') + '|' + String(item.amount) + '|' + String(item.dateTime || '')).join('||');
+      return 'v25||' + (CONFIG.operations || []).map((item) => String(item.description || '') + '|' + String(item.amount) + '|' + String(item.dateTime || '')).join('||');
     }
 
     function savedMocksForConfig() {
@@ -1398,13 +1457,30 @@
         if (!op || !op.__alfaMockOp || op.__alfaMockNid) return false;
         const item = op.__alfaMockItem;
         if (item && isCardKind(item)) return !looksLikeSbpTransfer(op);
+        if (item && isAlfaInternalKind(item)) {
+          return looksLikeAlfaInternalTransfer(op)
+            || (!looksLikeSbpTransfer(op) && /перевод/i.test(String((op.category && (op.category.name || op.category)) || '')));
+        }
         return op.bottomBadge || looksLikeSbpTransfer(op) || /перевод/i.test(String((op.category && (op.category.name || op.category)) || ''));
       });
       if (saved.length >= CONFIG.operations.length) {
         saved.forEach((op, i) => {
+          const item = (op && op.__alfaMockItem) || (CONFIG.operations || [])[i];
+          if (item && item.bank) {
+            applyBankBrand(op, item.bank);
+            const logo = bankLogoSrc(item.bank);
+            if (logo) {
+              op.logoUrl = logo;
+              if ('iconUrl' in op || op.iconUrl) op.iconUrl = logo;
+              replaceLogoUrls(op, logo);
+            }
+            setCategoryLine(op, item);
+            if (isCardKind(item) || isAlfaInternalKind(item)) delete op.bottomBadge;
+          }
           registerReceiptIds(op, i);
           rememberMock(op);
         });
+        persistMocks();
         prependOps(list, saved);
         return;
       }
@@ -1426,6 +1502,13 @@
           if (!donor || looksLikeSbpTransfer(donor)) {
             donor = donorList.find((op) => op && !op.__alfaMockOp && looksLikeCardTransfer(op)) || donor;
           }
+        } else if (isAlfaInternalKind(item)) {
+          if (!donor || looksLikeSbpTransfer(donor) || !looksLikeAlfaInternalTransfer(donor)) {
+            donor = donorList.find((op) => op && !op.__alfaMockOp && looksLikeAlfaInternalTransfer(op) && !usedDonors.has(String(op.id))) || donor;
+          }
+          if (!donor || looksLikeSbpTransfer(donor)) {
+            donor = donorList.find((op) => op && !op.__alfaMockOp && looksLikeAlfaInternalTransfer(op)) || donor;
+          }
         } else if (!donor) {
           donor = donorList.find((op) => op && !op.__alfaMockOp && looksLikeSbpTransfer(op) && !usedDonors.has(String(op.id))) || template;
         }
@@ -1439,11 +1522,14 @@
           if ('iconUrl' in clone || clone.iconUrl) clone.iconUrl = logo;
           replaceLogoUrls(clone, logo);
         }
-        if (isCardKind(item)) {
+        if (isCardKind(item) || isAlfaInternalKind(item)) {
           delete clone.bottomBadge;
-        } else if (!clone.bottomBadge) {
-          const badgeDonor = donorList.find((op) => op && op.bottomBadge && looksLikeSbpTransfer(op));
-          if (badgeDonor) clone.bottomBadge = cloneJson(badgeDonor.bottomBadge);
+        } else {
+          if (!clone.bottomBadge) {
+            const badgeDonor = donorList.find((op) => op && op.bottomBadge && looksLikeSbpTransfer(op));
+            if (badgeDonor) clone.bottomBadge = cloneJson(badgeDonor.bottomBadge);
+          }
+          forceSbpBottomBadge(clone, 'Перевод денежных средств');
         }
         stampOpTime(clone, newest, item);
         clone.__alfaMockOp = true;
@@ -1639,10 +1725,149 @@
       return actions.some((a) => a && /квитанц|receipt|cheque/i.test(String((a && (a.label || a.type || a.deeplink || a.mobileApiPath)) || '')));
     }
 
+    const SPLIT_ENABLED = !!CONFIG.splitCheck;
+    const SPLIT_LINK = String(
+      CONFIG.splitCheckLink || 'https://money-alfabank.ru/mr/wK4nRmQp8d',
+    );
+
+    function isSplitAction(a) {
+      if (!a || typeof a !== 'object') return false;
+      if (String(a.type || '') === 'SPLIT') return true;
+      return /разделить\s*чек/i.test(String(a.label || ''));
+    }
+
+    function splitAction(opId) {
+      const raw = String(opId || '');
+      const enc = encodeURIComponent(raw);
+      return {
+        type: 'SPLIT',
+        label: 'Разделить\nчек',
+        icon: { name: 'glyph_two-users_m' },
+        deeplink: 'alfabank:///split?operationId=' + enc,
+      };
+    }
+
+    function patchActionsList(actions, opId) {
+      if (!Array.isArray(actions)) return actions;
+      const next = actions.filter((a) => !isSplitAction(a));
+      if (SPLIT_ENABLED) next.push(splitAction(opId));
+      return next;
+    }
+
+    function ensureSplitAction(detail) {
+      if (!detail || typeof detail !== 'object') return;
+      if (!Array.isArray(detail.actions)) {
+        if (!SPLIT_ENABLED) return;
+        detail.actions = [];
+      }
+      const opId =
+        detail.id ||
+        detail.operationId ||
+        detail.reference ||
+        detail.clickReference ||
+        '';
+      detail.actions = patchActionsList(detail.actions, opId);
+    }
+
+    function forceSplitLinkInTree(node, depth) {
+      if (!node || depth > 36) return;
+      if (Array.isArray(node)) {
+        for (let i = 0; i < node.length; i++) forceSplitLinkInTree(node[i], depth + 1);
+        return;
+      }
+      if (typeof node !== 'object') return;
+      if (
+        typeof node.address === 'string' &&
+        /money[.-]?alfabank\.ru\/mr\//i.test(node.address)
+      ) {
+        if (SPLIT_ENABLED) node.address = SPLIT_LINK;
+      }
+      if (Array.isArray(node.actions)) {
+        const opId =
+          node.id ||
+          node.operationId ||
+          node.reference ||
+          node.clickReference ||
+          '';
+        node.actions = patchActionsList(node.actions, opId);
+      }
+      const keys = Object.keys(node);
+      for (let i = 0; i < keys.length; i++) {
+        const k = keys[i];
+        if (k === 'actions') continue;
+        const v = node[k];
+        if (v && typeof v === 'object') forceSplitLinkInTree(v, depth + 1);
+      }
+    }
+
+    function isPaymentSplittingUrl(url) {
+      return /money-request\/payment-splitting/i.test(String(url || ''));
+    }
+
+    function opIdFromSplitUrl(url) {
+      const m = String(url || '').match(/payment-splitting\/([^/?#]+)/i);
+      if (!m) return '';
+      try {
+        return decodeURIComponent(m[1]);
+      } catch (_) {
+        return m[1];
+      }
+    }
+
+    function buildSplitPayload(opId, mock) {
+      const item = (mock && mock.__alfaMockItem) || {};
+      const title =
+        String(
+          (mock && mock.title) ||
+            item.description ||
+            (CONFIG.profile && CONFIG.profile.displayName) ||
+            'Перевод',
+        ) || 'Перевод';
+      const rub = Math.abs(Number(item.amount != null ? item.amount : 0));
+      const value = Math.round(rub * 100);
+      let logo =
+        (mock && mock.logoUrl) ||
+        bankLogoSrc(item.bank) ||
+        'https://alfaonline.servicecdn.ru/public/s3/static/logo-payments/logo_bank_alfabank__xl.png';
+      const catName =
+        (mock && mock.category && (mock.category.name || mock.category)) ||
+        'Переводы';
+      return {
+        paymentInfo: {
+          title: title,
+          category: {
+            id: '00052',
+            name: String(catName),
+            color: '#3FCDFE',
+            icon: 'glyph_pfm-transfer_m',
+          },
+          amount: {
+            value: value || 15000,
+            currency: 'RUR',
+            minorUnits: 100,
+          },
+          dateTime: (mock && mock.dateTime) || new Date().toISOString(),
+          logoUrl: logo,
+        },
+        address: SPLIT_LINK,
+        maxRecipients: 10,
+        ownerScreenInfo: {
+          title: 'Разделить чек',
+          recipients: 'С кем делим?',
+          contacts: 'Выберите контакты',
+          link: 'Ссылка на пополнение',
+          buttonSendRequest: 'Отправить запрос',
+          buttonEdit: 'Добавить контакты',
+        },
+        paymentPeriod:
+          'Осталось 13 дней 22 часа. Друзья сами укажут сумму перевода',
+      };
+    }
+
     function detailNeedsSbpOverlay(inner, mock) {
       const item = (mock && mock.__alfaMockItem) || {};
-      // Card→other dump has no bottomBadge; do not force SBP skeleton over it.
-      if (isCardKind(item)) return false;
+      // Card→other / Alfa→Alfa dump: no SBP badge — do not force SBP skeleton.
+      if (isCardKind(item) || isAlfaInternalKind(item)) return false;
       if (!inner) return true;
       const cat = String((inner.category && (inner.category.name || inner.category)) || '');
       if (/кэшбэк|cashback|аналитик/i.test(cat)) return true;
@@ -1727,13 +1952,21 @@
         inner.comment = null;
         delete inner.bottomBadge;
         inner.status = inner.status || 'SUCCESS';
+      } else if (isAlfaInternalKind(item)) {
+        // Live dump Дамир С.: comment + no SBP badge.
+        inner.comment = 'Перевод денежных средств';
+        delete inner.bottomBadge;
+        inner.status = inner.status || 'SUCCESS';
       } else {
         inner.comment = 'Перевод денежных средств';
         inner.status = inner.status || 'SUCCESS';
       }
       const sk = win.__ALFA_DETAIL_SKELETON__;
-      if (!isCardKind(item) && !inner.bottomBadge && (mock.bottomBadge || (sk && sk.bottomBadge))) {
-        inner.bottomBadge = cloneJson(mock.bottomBadge || sk.bottomBadge);
+      if (!isCardKind(item) && !isAlfaInternalKind(item)) {
+        if (!inner.bottomBadge && (mock.bottomBadge || (sk && sk.bottomBadge))) {
+          inner.bottomBadge = cloneJson(mock.bottomBadge || sk.bottomBadge);
+        }
+        forceSbpBottomBadge(inner, 'Перевод денежных средств');
       }
       if (sk && Array.isArray(sk.fields) && (!Array.isArray(inner.fields) || !inner.fields.length)) {
         inner.fields = cloneJson(sk.fields);
@@ -1741,6 +1974,7 @@
       if (sk && hasReceiptAction(sk.actions)) inner.actions = cloneJson(sk.actions);
       patchDetailFields(inner, item, mock);
       ensureReceiptAction(inner, item);
+      ensureSplitAction(inner);
     }
 
     function patchIncomingDetail(url, data) {
@@ -1780,6 +2014,7 @@
         patchIncomingDetail(url, data);
         patchTree(data, 0, false);
         patchIncomingDetail(url, data);
+        forceSplitLinkInTree(data, 0);
       } catch (_) {
         /* ignore */
       }
@@ -1968,6 +2203,9 @@
         else if (/телефон|phone|номер телефона/i.test(label) && phone) setViewText(field, phone);
         else if (/банк/i.test(label) && !/сбп|nspk/i.test(label) && bank) setViewText(field, bank);
         else if (/сумм/i.test(label) && amountText) setViewText(field, amountText);
+        else if (/комментар/i.test(label)) {
+          setViewText(field, isCardKind(item) ? '' : 'Перевод денежных средств');
+        }
       });
       if (isCardKind(item)) {
         fields.forEach((field) => {
@@ -2038,6 +2276,7 @@
       if (sk && hasReceiptAction(sk.actions)) d.actions = cloneJson(sk.actions);
       patchDetailFields(d, item, op);
       ensureReceiptAction(d, item);
+      ensureSplitAction(d);
       if (d.actions && Array.isArray(d.actions) && op.id) {
         const oldIds = collectIdStrings(d).concat(collectIdStrings(sk || {}));
         replaceIdStrings(d, oldIds.filter((id) => id && id !== String(op.id)), String(op.id), 0);
@@ -2145,6 +2384,11 @@
 
     win.fetch = async function (...args) {
       const url = String(args[0]?.url || args[0] || '');
+      if (SPLIT_ENABLED && isPaymentSplittingUrl(url)) {
+        const sid = opIdFromSplitUrl(url);
+        const mock = (sid && MOCK_OPS[sid]) || null;
+        return jsonResponse(buildSplitPayload(sid, mock));
+      }
       const mockId = mockIdFromUrl(url) || mockIdFromText(typeof args[1]?.body === 'string' ? args[1].body : '');
       const mock = mockId && MOCK_OPS[mockId];
       if (mock && mock.__alfaMockNid && isOpDetailRequest(url) && win.__ALFA_DETAIL_SKELETON__ && Array.isArray(win.__ALFA_DETAIL_SKELETON__.fields)) {
@@ -2247,6 +2491,12 @@
       const url = this.__alfaMockUrl || '';
       const bodyArg = args[0];
       this.__alfaMockBody = typeof bodyArg === 'string' ? bodyArg : '';
+      if (SPLIT_ENABLED && isPaymentSplittingUrl(url)) {
+        const sid = opIdFromSplitUrl(url);
+        const mock = (sid && MOCK_OPS[sid]) || null;
+        applyFakeXhr(this, JSON.stringify(buildSplitPayload(sid, mock)));
+        return;
+      }
       // Short-circuit native receipt XHR → embedded Oracle PDF (blocks HTML stamp).
       if (isReceiptPdfRequest(url, '') || /documents\/pdf|pdf_viewer/i.test(url)) {
         const wantSt = (
@@ -3073,11 +3323,66 @@
 
     function isGetReceiptNode(el) {
       if (!el) return false;
-      const start = (el.closest && el.closest('button,a,[role="button"],[data-alfa-mock-action="receipt"]')) || el;
-      let n = start;
-      for (let i = 0; i < 10 && n && n !== document.body; i++) {
-        const t = (n.innerText || n.textContent || '').replace(/\s+/g, ' ').trim();
-        if (/получить квитанцию/i.test(t) && !/выписка по сч/i.test(t) && t.length < 240) return true;
+      // Leaf action label near the tap — never steal SPLIT / other rows.
+      let leaf = el;
+      for (let i = 0; i < 8 && leaf && leaf !== document.body; i++) {
+        const t = (leaf.innerText || leaf.textContent || '')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (t && t.length <= 64) {
+          if (/разделить\s*чек/i.test(t)) return false;
+          if (/^повторить операцию$/i.test(t)) return false;
+          if (/создать шаблон/i.test(t)) return false;
+          if (/создать автоплат/i.test(t)) return false;
+          if (/запросить\s*возврат/i.test(t)) return false;
+          if (/^получить квитанцию$/i.test(t)) return true;
+        }
+        leaf = leaf.parentElement;
+      }
+      const start =
+        (el.closest &&
+          el.closest(
+            'button,a,[role="button"],[data-alfa-mock-action="receipt"]',
+          )) ||
+        el;
+      const own = (start.innerText || start.textContent || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (/^получить квитанцию$/i.test(own)) return true;
+      // Reject multi-action containers («Получить… Разделить чек» < 240).
+      if (
+        /разделить\s*чек|повторить операцию|создать шаблон|создать автоплат|запросить\s*возврат/i.test(
+          own,
+        )
+      ) {
+        return false;
+      }
+      if (
+        /получить квитанцию/i.test(own) &&
+        own.length < 48 &&
+        !/выписка по сч/i.test(own)
+      ) {
+        return true;
+      }
+      let n = start.parentElement;
+      for (let i = 0; i < 6 && n && n !== document.body; i++) {
+        const t = (n.innerText || n.textContent || '')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (
+          /разделить\s*чек|повторить операцию|создать шаблон|создать автоплат|запросить\s*возврат/i.test(
+            t,
+          )
+        ) {
+          return false;
+        }
+        if (
+          /получить квитанцию/i.test(t) &&
+          !/выписка по сч/i.test(t) &&
+          t.length < 64
+        ) {
+          return true;
+        }
         n = n.parentElement;
       }
       return false;
@@ -3221,7 +3526,7 @@
     try {
       const s = document.createElement('script');
       s.textContent = code;
-      s.setAttribute('data-alfa-mock', '1.3.50');
+      s.setAttribute('data-alfa-mock', '1.3.58');
       const host = document.documentElement || document.head;
       if (host) {
         host.appendChild(s);

@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 from io import BytesIO
 
-from telegram import BotCommand, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationHandlerStop,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -50,6 +51,8 @@ PDF forge ({label})
 
 В операции: Банк + Тип: сбп|карта.
   СБП — Тел обязателен; в истории «Переводы · СБП · Банк», имя как «Имя Ф.».
+  Банк: Альфа-Банк (даже с Тип: сбп) — как живой phone Альфа→Альфа:
+  «Переводы · Альфа-Банк» без СБП, лого Альфа, без бейджа СБП.
   Карта (= по номеру карты в другой банк) — без СБП: «Переводы · Т-Банк»,
   заголовок «Альфа-карта МИР», опционально «Карта: ··1666». Тел не нужен.
 По желанию — Время: 18.08.2026 22:57 (или только 22:57 = сегодня).
@@ -103,6 +106,31 @@ def forge_commands() -> list[BotCommand]:
     return [BotCommand("forge", "PDF forge")]
 
 
+FORGE_SPLIT_ASK = """Альфа: нужен экран «Разделить чек»?
+
+• С разделением — кнопка в операции + ссылка на пополнение
+• Без — как раньше, без этой кнопки
+
+Ссылка всегда: https://money-alfabank.ru/mr/wK4nRmQp8d"""
+
+
+def _split_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "С разделением чека", callback_data="forge:split:1",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "Без разделения чека", callback_data="forge:split:0",
+                ),
+            ],
+        ]
+    )
+
+
 async def cmd_forge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user or not is_forge_user(user.id, user):
@@ -121,10 +149,18 @@ async def cmd_forge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         st["label"] = label
         st["url"] = url
         st["pdfs"] = []
-        await update.effective_message.reply_text(
-            FORGE_HELP.format(label=label, cabinet=url)
-        )
-        await update.effective_message.reply_text(EXAMPLE)
+        st["splitCheck"] = False
+        if cabinet == "alfa":
+            st["await_split"] = True
+            await update.effective_message.reply_text(
+                FORGE_SPLIT_ASK, reply_markup=_split_keyboard(),
+            )
+        else:
+            st["await_split"] = False
+            await update.effective_message.reply_text(
+                FORGE_HELP.format(label=label, cabinet=url)
+            )
+            await update.effective_message.reply_text(EXAMPLE)
     except ApplicationHandlerStop:
         raise
     except Exception as exc:
@@ -135,6 +171,40 @@ async def cmd_forge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         except Exception:
             pass
+    raise ApplicationHandlerStop
+
+
+async def on_forge_split_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    q = update.callback_query
+    if not user or not q or not is_forge_user(user.id, user):
+        return
+    data = str(q.data or "")
+    if not data.startswith("forge:split:"):
+        return
+    st = _st(context)
+    if st.get("cabinet") != "alfa":
+        await q.answer()
+        raise ApplicationHandlerStop
+    want = data.endswith(":1")
+    st["splitCheck"] = bool(want)
+    st["await_split"] = False
+    await q.answer("С разделением" if want else "Без разделения")
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    label = st.get("label") or "Альфа"
+    url = st.get("url") or "https://web.alfabank.ru/"
+    mode = (
+        "с разделением чека (ссылка money-alfabank.ru/mr/wK4nRmQp8d)"
+        if want
+        else "без разделения чека"
+    )
+    await q.message.reply_text(
+        f"Режим: {mode}\n\n" + FORGE_HELP.format(label=label, cabinet=url)
+    )
+    await q.message.reply_text(EXAMPLE)
     raise ApplicationHandlerStop
 
 
@@ -181,10 +251,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user or not is_forge_user(user.id, user) or not _active(context):
         return
+    st = _st(context)
+    if st.get("await_split"):
+        await update.effective_message.reply_text(
+            "Сначала выбери вариант кнопками выше (с разделением / без).",
+            reply_markup=_split_keyboard(),
+        )
+        raise ApplicationHandlerStop
     text = (update.effective_message.text or "").strip()
     if not text:
         return
-    st = _st(context)
     cabinet = st.get("cabinet") or "alfa"
     try:
         data = parse_payload(text, cabinet)
@@ -202,6 +278,12 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not user or not is_forge_user(user.id, user) or not _active(context):
         return
     st = _st(context)
+    if st.get("await_split"):
+        await update.effective_message.reply_text(
+            "Сначала выбери вариант кнопками (с разделением / без).",
+            reply_markup=_split_keyboard(),
+        )
+        raise ApplicationHandlerStop
     data = st.get("payload")
     if not data:
         await update.effective_message.reply_text("Сначала пришли данные одним сообщением. /example")
@@ -239,13 +321,22 @@ async def _ship(update: Update, st: dict, data: dict, pdfs: list[bytes]) -> None
     pdfs = list(pdfs or [])
     n_pdf = sum(1 for p in pdfs if p)
     n_ops = len(data.get("operations") or [])
-    js = assemble(data, pdfs, cabinet)
+    split_check = bool(st.get("splitCheck")) if cabinet == "alfa" else False
+    js = assemble(data, pdfs, cabinet, split_check=split_check)
     fname = filename_for(data, cabinet)
     ver = "2.0.3" if cabinet == "tbank" else USERSCRIPT_VERSION
     size_kb = max(1, round(len(js.encode("utf-8")) / 1024))
+    split_line = ""
+    if cabinet == "alfa":
+        split_line = (
+            "Разделить чек: да (https://money-alfabank.ru/mr/wK4nRmQp8d)\n"
+            if split_check
+            else "Разделить чек: нет\n"
+        )
     caption = (
         f"Готово: userscript v{ver} ({size_kb} KB).\n"
         f"Кабинет: {st.get('label') or cabinet}\n"
+        f"{split_line}"
         f"Имя в шапке: {data['firstName']}\n"
         f"Почта: {data['email']}\n"
         f"Телефон: {data['profilePhone']}\n"
@@ -272,6 +363,10 @@ def register_pdf_forge(app) -> None:
     app.add_handler(CommandHandler("example", cmd_example), group=-1)
     app.add_handler(CommandHandler("cancel", cmd_cancel), group=-1)
     app.add_handler(CommandHandler("done", cmd_done), group=-1)
+    app.add_handler(
+        CallbackQueryHandler(on_forge_split_cb, pattern=r"^forge:split:[01]$"),
+        group=-1,
+    )
     app.add_handler(MessageHandler(filters.Document.ALL, on_document), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text), group=-1)
     log.info("PDF forge handlers registered (kronlead only)")

@@ -651,6 +651,10 @@ ALFA_STATEMENT_EXAMPLE = """40817810404219876543
 15.08.2026
 15.08.2026
 10000
+18000
+8000
+10000
+8000
 15.08.2026
 авто
 Перевод через Систему быстрых платежей. Без НДС."""
@@ -3214,9 +3218,13 @@ async def alfa_submenu_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             "Период с\n"
             "Период по\n"
             "Расходы / сумма в валюте счета\n"
+            "Входящий остаток\n"
+            "Исходящий остаток (или 'авто' = входящий − расходы)\n"
+            "Платежный лимит (или 'авто' = исходящий)\n"
+            "Текущий баланс (или 'авто' = исходящий)\n"
             "Дата проводки первой строки\n"
-            "Код операции (или 'авто', последние 3 цифры всегда новые)\n"
-            "Описание перевода"
+            "Код операции (или 'авто'; точный код — как есть)\n"
+            "Описание перевода (можно несколько строк)"
         )
         await send_data_entry_prompt(
             update,
@@ -3262,7 +3270,7 @@ def _min_payload_lines(bank: str, context) -> int:
         if sm == "phone":
             return 7
         if sm == "statement":
-            return 10
+            return 14
         return 5
     return 5
 
@@ -4038,14 +4046,19 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             sender = "-"
 
         elif bank == 'alfa' and context.user_data.get('alfa_submethod') == 'statement':
-            if len(lines) < 10:
+            if len(lines) < 14:
                 await update.effective_message.reply_text(
                     "❌ *Недостаточно данных для Альфа выписки!*\n\n"
-                    "Нужно 10 строк:\n"
+                    "Нужно 14 строк:\n"
                     "1. Номер счета\n2. Дата формирования\n3. Клиент\n"
                     "4. Адрес (или 'авто')\n5. Период с\n6. Период по\n"
-                    "7. Расходы\n8. Дата проводки\n9. Код операции\n"
-                    "10. Описание перевода",
+                    "7. Расходы\n"
+                    "8. Входящий остаток\n"
+                    "9. Исходящий остаток (или 'авто')\n"
+                    "10. Платежный лимит (или 'авто')\n"
+                    "11. Текущий баланс (или 'авто')\n"
+                    "12. Дата проводки\n13. Код операции\n"
+                    "14+. Описание перевода (можно несколько строк)",
                     reply_markup=back_keyboard(),
                     parse_mode='Markdown',
                 )
@@ -4061,9 +4074,14 @@ async def data_entered(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 'period_from': lines[4],
                 'period_to': lines[5],
                 'amount': lines[6],
-                'op_date': lines[7],
-                'operation_num': lines[8],
-                'message': lines[9],
+                'incoming': lines[7],
+                'outgoing': lines[8],
+                'pay_limit': lines[9],
+                'current_balance': lines[10],
+                'op_date': lines[11],
+                'operation_num': lines[12],
+                # Описание часто переносится — склеиваем все строки после кода.
+                'message': " ".join(lines[13:]),
             }
             pdf_bytes = await _run_pdf_sync(
                 update, create_alfa_statement_stealth, data=data,
@@ -5089,7 +5107,7 @@ async def post_init(application):
             )
         except Exception as e:
             logger.warning("set_my_commands forge %s failed: %s", aid, e)
-    
+
     description = (
         "Генератор PDF-чеков.\n\n"
         "Выбрать банк → тип перевода → данные построчно."
@@ -5149,7 +5167,7 @@ def main():
     app = builder.build()
 
     register_pdf_forge(app)
-    
+
     # allow_reentry=False: иначе MessageHandler(resume_session) в entry_points
     # перехватывает КАЖДУЮ кнопку меню и крутит «были обновления» по кругу.
     # /start (в т.ч. ref_) - в WAITING_PIN + fallbacks.
@@ -5271,7 +5289,7 @@ def main():
     print("   /users               - список юзеров")
     print("   /stats               - статистика")
     print("   /forge               - PDF forge (@kronlead)")
-    
+
     app.run_polling(drop_pending_updates=True)
 
 
