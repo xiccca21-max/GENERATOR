@@ -18,6 +18,8 @@ import threading
 from datetime import date, datetime, timedelta
 from typing import Dict, Optional
 
+from time_msk import now_msk
+
 logger = logging.getLogger(__name__)
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -165,34 +167,59 @@ def _select_free(
     return _with_new_seconds(cand)
 
 
+def _select_near_now(dt: datetime, used: set) -> datetime:
+    """«сейчас»: keep wall-clock. Do not walk hours back into a burned evening."""
+    cand = dt.replace(microsecond=0)
+    if minute_key(cand) not in used:
+        return cand
+    for delta in range(1, 31):
+        nxt = cand + timedelta(minutes=delta)
+        if minute_key(nxt) not in used:
+            return _with_new_seconds(nxt)
+        prv = cand - timedelta(minutes=delta)
+        if minute_key(prv) not in used:
+            return _with_new_seconds(prv)
+    logger.warning("no free minute within ±30 of now — keep requested clock")
+    return _with_new_seconds(cand)
+
+
 def pick_free(dt: datetime) -> datetime:
     """Return a free minute without persisting. Prefer claim_free() before emit."""
     return _select_free(dt, used_minutes())
 
 
-def claim_free(dt: datetime, *, channel: str = "", source: str = "claim") -> datetime:
+def claim_free(
+    dt: datetime,
+    *,
+    channel: str = "",
+    source: str = "claim",
+    near_now: bool = False,
+) -> datetime:
     """Pick a free minute and persist it before generation (no race)."""
     with _LOCK:
         minutes = _load_json()
         used = set(_SEED_MINUTES) | set(minutes.keys())
-        daytime = channel in ("alfa_sbp", "alfa_card")
-        chosen = _select_free(
-            dt, used, allow_future=(channel == "alfa_card"),
-            hour_lo=10 if daytime else 0,
-            hour_hi=21 if daytime else 23,
-            day_floor=(
-                None
-                if (daytime and dt.date() < date(2026, 7, 30))
-                else (date(2026, 7, 30) if daytime else None)
-            ),
-        )
+        if near_now:
+            chosen = _select_near_now(dt, used)
+        else:
+            daytime = channel in ("alfa_sbp", "alfa_card")
+            chosen = _select_free(
+                dt, used, allow_future=(channel == "alfa_card"),
+                hour_lo=10 if daytime else 0,
+                hour_hi=21 if daytime else 23,
+                day_floor=(
+                    None
+                    if (daytime and dt.date() < date(2026, 7, 30))
+                    else (date(2026, 7, 30) if daytime else None)
+                ),
+            )
         key = minute_key(chosen)
         if key not in minutes:
             minutes[key] = {
                 "datetime": chosen.strftime("%d.%m.%Y %H:%M:%S"),
                 "channel": channel,
                 "source": source,
-                "recorded_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                "recorded_at": now_msk().strftime("%Y-%m-%dT%H:%M:%S"),
             }
             _save_json(minutes)
             if minute_key(dt) != key:
@@ -209,7 +236,7 @@ def remember(dt: datetime, *, channel: str = "", source: str = "emit") -> None:
         "datetime": dt.strftime("%d.%m.%Y %H:%M:%S"),
         "channel": channel,
         "source": source,
-        "recorded_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "recorded_at": now_msk().strftime("%Y-%m-%dT%H:%M:%S"),
     }
     with _LOCK:
         minutes = _load_json()
@@ -237,7 +264,10 @@ def stamp_unique_minute(
     """Rewrite data['date_time'] to a claimed unique minute. Regen op/SBP if bumped."""
     raw = str(data.get("date_time") or data.get("date") or "сейчас")
     requested = parse_dt(raw)
-    op_dt = claim_free(requested, channel=channel, source="claim")
+    auto = str(raw or "").replace("\xa0", " ").strip().lower() in (
+        "сейчас", "now", "авто", "auto", "-", "",
+    )
+    op_dt = claim_free(requested, channel=channel, source="claim", near_now=auto)
     data["date_time"] = op_dt.strftime("%d.%m.%Y %H:%M:%S")
     if minute_key(op_dt) != minute_key(requested) and force_auto_ids:
         data["operation_num"] = "авто"
@@ -284,7 +314,7 @@ def bootstrap_seed_file() -> None:
                 "datetime": f"{day[8:10]}.{day[5:7]}.{day[:4]} {hm}:00",
                 "channel": "seed",
                 "source": "burned",
-                "recorded_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                "recorded_at": now_msk().strftime("%Y-%m-%dT%H:%M:%S"),
             }
             changed = True
         if changed or not os.path.isfile(_JSON_PATH):

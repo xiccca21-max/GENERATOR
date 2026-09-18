@@ -1355,6 +1355,7 @@ def _lean_sbp_f2_to_hard(pdf: bytes, amount: str) -> Optional[bytes]:
     import fitz
     import tbank_unlock_template as tut
     from tbank_sbp_stealth import (
+        _F2_GLYF_LO,
         _F2_SBP_DEC_HI,
         _F2_SBP_DEC_LO,
         _blank_ff2_unused_glyfs,
@@ -1366,44 +1367,46 @@ def _lean_sbp_f2_to_hard(pdf: bytes, amount: str) -> Optional[bytes]:
         _glyf_table_length,
         _head_bbox_from_ff2,
         _patch_fontfile2_xref,
-        _pick_safecheck_band_medium_ff2,
         _restore_head_bbox,
-        _restore_medium_spares_from_base,
     )
 
     def _clear_v3_thin(ff: bytes, keep: set, *, glyf_hi: int) -> bytes:
-        """F2.glyf≤1549 arms V3 only with F2.bfrange≥10 — spare top-up, never pad.
+        """Do not spare-inflate thin F2; peel only when over digit-card hi.
 
-        Proton TBANK_F2_GLYF_LOCA_PADDING FAKE on trailing glyf bytes past loca.
+        Corpus SBP Medium spans ~822–1636 by amount digits. Never pad glyf
+        past loca. Never push a thin font into 1550+ «safecheck» band.
         """
+        from tbank_sbp_stealth import _land_f2_under_digit_ceil
+
         g = _glyf_table_length(ff)
-        if g > 1549:
-            if g > glyf_hi:
-                lean = _blank_ff2_unused_glyfs(ff, keep)
-                lean = _ff2_restore_shell_tables(ff, lean)
-                lg = _glyf_table_length(lean)
-                if lg <= glyf_hi:
-                    return lean
-                from tbank_sbp_stealth import _land_f2_under_digit_ceil
-                landed = _land_f2_under_digit_ceil(
-                    ff, keep, glyf_ceil=glyf_hi, base_ff=ff,
-                )
-                if _glyf_table_length(landed) <= glyf_hi:
-                    return landed
-            return ff
-        if glyf_hi <= 1549:
-            return ff
-        spare = _pick_safecheck_band_medium_ff2()
-        out = ff
-        if spare is not None:
-            out = _restore_medium_spares_from_base(
-                out, spare, keep, glyf_hi=glyf_hi,
+        if g > glyf_hi:
+            landed = _land_f2_under_digit_ceil(
+                ff, keep, glyf_ceil=glyf_hi, base_ff=ff,
             )
-        return out
+            if _glyf_table_length(landed) <= glyf_hi:
+                return landed
+            return ff
+        # In-band (incl. bank-thin) — leave alone, no spare inflate.
+        return ff
 
     digits = {ord(ch) for ch in (amount or "") if ch.isdigit()}
     keep_cps = {ord(ch) for ch in "Итого"} | {0x20} | digits
     _ceil = _f2_digit_card_glyf_ceiling(_f2_amount_unique_digits(amount))
+    # Expensive digit grafts (6/9) may need card+1 — don't peel under that.
+    _ceil = max(
+        _ceil,
+        _f2_digit_card_glyf_ceiling(min(_f2_amount_unique_digits(amount) + 1, 10)),
+    )
+    try:
+        from tbank_sbp_stealth import (
+            BANK_MED_GHOST,
+            TBANK_CHAR_TO_GID_MED,
+            _f2_digit_mosaic_mismatch,
+        )
+    except Exception:
+        BANK_MED_GHOST = set()
+        TBANK_CHAR_TO_GID_MED = {}
+        _f2_digit_mosaic_mismatch = lambda *_a, **_k: []
     try:
         doc = fitz.open(stream=pdf, filetype="pdf")
         fm = tut._find_font_objects(doc)
@@ -1426,11 +1429,21 @@ def _lean_sbp_f2_to_hard(pdf: bytes, amount: str) -> Optional[bytes]:
                 _gids_per_font_in_stream,
             )
             _reg_ib, _med_ib = _gids_per_font_in_stream(cs_ib)
-            keep_ib = set(_med_ib) | {0, 3}
+            keep_ib = set(_med_ib) | {0, 3} | set(BANK_MED_GHOST)
             for _c in sub_ib:
                 keep_ib.add(int(_c))
+            # Full charset: always protect master GIDs for amount digits + Итого.
+            for _ch in list(amount or "") + list("Итого"):
+                _gid = TBANK_CHAR_TO_GID_MED.get(_ch)
+                if _gid is not None:
+                    keep_ib.add(int(_gid))
             capped = _cap_f2_orphan_spares(ff2, keep_ib, max_spares=1)
             capped = _clear_v3_thin(capped, keep_ib, glyf_hi=_ceil)
+            if _f2_digit_mosaic_mismatch(capped, amount):
+                logger.warning(
+                    "sbp F2 lean in-band mosaic break — keep prior Medium"
+                )
+                return pdf
             fixed = _force_tbank_f2_head_epoch(capped)
             if fixed == ff2:
                 return pdf
@@ -1441,11 +1454,20 @@ def _lean_sbp_f2_to_hard(pdf: bytes, amount: str) -> Optional[bytes]:
         )
         doc.close()
         uni = {u: c for c, u in sub.items()}
-        keep = {0, 3}
+        keep = {0, 3} | set(BANK_MED_GHOST)
         for cp in keep_cps:
             cid = uni.get(cp)
             if cid is not None:
                 keep.add(int(cid))
+            # Master Medium GID — ToUnicode may omit a digit while glyf lives here.
+            ch = chr(cp) if isinstance(cp, int) and cp < 0x110000 else ""
+            gid = TBANK_CHAR_TO_GID_MED.get(ch)
+            if gid is not None:
+                keep.add(int(gid))
+        for _ch in list(amount or "") + list("Итого"):
+            _gid = TBANK_CHAR_TO_GID_MED.get(_ch)
+            if _gid is not None:
+                keep.add(int(_gid))
         try:
             keep = _ff2_composite_closure(ff2, keep)
         except Exception:
@@ -1457,6 +1479,9 @@ def _lean_sbp_f2_to_hard(pdf: bytes, amount: str) -> Optional[bytes]:
             lean = _restore_head_bbox(lean, bb)
         lean = _clear_v3_thin(lean, keep, glyf_hi=_ceil)
         lean = _force_tbank_f2_head_epoch(lean)
+        if _f2_digit_mosaic_mismatch(lean, amount):
+            logger.warning("sbp F2 lean mosaic break — reject lean")
+            return None
         if not (_F2_SBP_DEC_LO <= len(lean) <= _F2_SBP_DEC_HI):
             # Blank didn't shrink. NEVER wholesale-swap a corpus Medium FontFile2:
             # donor glyfs at THIS PDF's digit CIDs are often empty → «Итого» shows
@@ -1475,19 +1500,23 @@ def _lean_sbp_f2_to_hard(pdf: bytes, amount: str) -> Optional[bytes]:
             _glyf = _ft["glyf"]
             _go = _ft.getGlyphOrder()
             for cp in digits:
-                cid = uni.get(cp)
-                if cid is None:
-                    continue
-                cid = int(cid)
-                if cid >= len(_go):
-                    continue
-                g = _glyf[_go[cid]]
-                if int(getattr(g, "numberOfContours", 0) or 0) == 0:
-                    logger.error(
-                        "sbp F2 lean blanked Medium digit U+%04X cid=%d — reject lean",
-                        cp, cid,
-                    )
-                    return None
+                ch = chr(cp)
+                cids = set()
+                if uni.get(cp) is not None:
+                    cids.add(int(uni.get(cp)))
+                _mg = TBANK_CHAR_TO_GID_MED.get(ch)
+                if _mg is not None:
+                    cids.add(int(_mg))
+                for cid in cids:
+                    if cid >= len(_go):
+                        continue
+                    g = _glyf[_go[cid]]
+                    if int(getattr(g, "numberOfContours", 0) or 0) == 0:
+                        logger.error(
+                            "sbp F2 lean blanked Medium digit U+%04X cid=%d — reject lean",
+                            cp, cid,
+                        )
+                        return None
         except Exception as exc:
             logger.warning("sbp F2 digit contour check failed: %s — ship lean", exc)
         if not (_F2_SBP_DEC_LO <= len(lean) <= _F2_SBP_DEC_HI):

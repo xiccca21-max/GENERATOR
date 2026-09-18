@@ -22,6 +22,16 @@ _*.py
 _*.txt
 _*.pdf
 _*.png
+tools/_*.py
+tools/_*.txt
+tools/_*.log
+tools/deacon_*.py
+tools/debug_*.py
+tools/diff_*.py
+tools/probe_*.py
+tools/run_deacon*.py
+чеки_30_из_30/
+чеки_30_из_30_rejects/
 test_otp_valid/
 test_otp/
 test_v2/
@@ -67,10 +77,19 @@ _pre_inline_test/
 _retest4/
 _test15/
 
-# бэкапы и логи разработки
+hs_err_pid*.log
+payments.json.vps*.json
+tools/_deacon_*.log
+validator_proton_10x.zip
+чеки_30_из_30_rejects/
 *.broken_backup
 *.umbral_backup
 *.bak
+templates/*.bak*
+templates/*.FAT_BAK*
+templates/*before_A_bake*
+templates/*baked_A.pdf
+templates/*_175700_baked.pdf
 bot.log
 bot_stderr.log
 openpdf-1.3.30.jar

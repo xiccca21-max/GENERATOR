@@ -1,0 +1,27 @@
+---
+description: Alfa Oracle trailer /ID rules (номер документа)
+alwaysApply: true
+---
+
+# Alfa Oracle trailer /ID (K-ALFA-TRAILER-ID-001)
+
+«Номер документа» у валидатора = PDF trailer `/ID`, не номер операции на лице.
+
+## Oracle SBP / phone / card
+
+- Pair **equal**: `/ID [<A><A>]` (same 32-hex twice), like corpus Oracle origs.
+- After any content/FF2 mutation: **fresh** `/ID` not in corpus and not previously sent.
+- Unmodified byte-identical shell may keep donor `/ID` (whole file = orig).
+- Forbidden: unequal `<A><B>` on Oracle receipts (that is iText / statement).
+- Forbidden: same body + only `/ID` changed (SHA-only clone) → «номер документа не соответствует оригиналу».
+- Forbidden: silent keep of donor `/ID` when regex replace fails.
+
+Code: `alfa_sbp_stealth._ensure_fresh_oracle_trailer_id` / `_randomize_trailer_id` / `_trailer_id_reused` / `_oracle_trailer_invariant` (wired in phone/card + `emit_invariants`).
+
+## Statement
+
+- **Unequal** `/ID [<A><B>]` via `_itext_stamp_ids` — do not “fix” to equal.
+
+## T-Bank
+
+- Jasper may use unequal `/ID` — do **not** copy that onto Alfa Oracle.

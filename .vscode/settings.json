@@ -1,4 +1,4 @@
-{
+﻿{
   "git.enabled": false,
   "git.autoRepositoryDetection": false,
   "git.autorefresh": false,
@@ -28,7 +28,6 @@
     "**/_tmp*/**",
     "**/tbank-jasper/**",
     "**/tools/apache-maven-3.9.9/**",
-    "**/tools/pdf_forge/**",
     "**/__pycache__/**",
     "**/glyph_library/**",
     "**/alfa_glyph_library/**",
@@ -49,8 +48,7 @@
     "**/docs/specimen_*.pdf": true,
     "**/templates/**/*.pdf": true,
     "**/tbank-jasper/**": true,
-    "**/tools/apache-maven-3.9.9/**": true,
-    "**/tools/pdf_forge/**": true,
+    "**/tools/apache-maven-3.9.9/**": true,: true,
     "**/glyph_library/**": true,
     "**/alfa_glyph_library/**": true,
     "**/fonts/**": true,
@@ -72,7 +70,6 @@
     "**/_bak*": true,
     "**/validator_proton_10x": true,
     "**/tools/apache-maven-3.9.9": true,
-    "**/tools/pdf_forge": true,
     "**/tbank-jasper": true,
     "**/glyph_library": true,
     "**/alfa_glyph_library": true,
@@ -93,10 +90,10 @@
     "**/validator_proton_10x": true,
     "**/validator_proton_10x.zip": true,
     "**/tools/apache-maven-3.9.9": true,
-    "**/tools/pdf_forge": true,
     "**/tbank-jasper": true,
     "**/*.pdf": true,
     "**/*.pkl": true,
     "**/*.jar": true
   }
 }
+

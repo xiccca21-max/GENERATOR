@@ -20,7 +20,8 @@ _VALUE_RIGHT = 250.0
 # Proton TBANK_VALUE_RIGHT_EDGE_OVERSHOOT is HARD above +0.01 pt
 # (Jasper originals stay ≤0.005). 0.25 used to let +0.148 ship as FAKE.
 _OVERSHOOT_HARD = 0.009
-_RIGHT_EDGE_INSET_PT = 0.25
+# Unused on SBP polish (pins to _VALUE_RIGHT); keep 0 so any future align stays flush.
+_RIGHT_EDGE_INSET_PT = 0.0
 _AMOUNT_SM_RIGHT_MAX = 243.68
 _AMOUNT_BG_RIGHT_MAX = 237.77
 _SBP_AMOUNT_Y_SM = 336.78
@@ -467,9 +468,15 @@ def pin_f1_value_column_spread_pdf(pdf: bytes, *, x0_slop: float = 0.08) -> byte
                 if best is not None:
                     x0, x1 = best
                     new_x = tx + (right - x1)
+                    # Keep donor integer Tm shape (``121`` not ``121.16``).
+                    try:
+                        from tbank_sbp_stealth import _fmt_coord_match
+                        xs = _fmt_coord_match(new_x, m.group(1))
+                    except Exception:
+                        xs = jasper_fmt_token(new_x)
                     out.extend(
                         b"1 0 0 1 "
-                        + jasper_fmt_token(new_x).encode("ascii")
+                        + xs.encode("ascii")
                         + b" "
                         + m.group(2)
                         + b" Tm"
@@ -658,7 +665,9 @@ def _commit_contents_inplace(pdf: bytes, xref: int, new_stream: bytes) -> Option
 
 
 def jasper_fmt_token(v: float) -> str:
-    """OpenPDF: 187.1 not 187.10; 216.54 not 216.545; 172 not 172.00."""
+    """OpenPDF: 187.1 not 187.10; 216.54 not 216.545; 172 not 172.00 / 121.16."""
+    if abs(float(v) - round(float(v))) < 0.005:
+        return str(int(round(float(v))))
     s = f"{float(v):.2f}".rstrip("0").rstrip(".")
     return s if s else "0"
 
@@ -879,6 +888,12 @@ def polish_layout_pdf(pdf: bytes, *, channel: str = "sbp") -> bytes:
         out = repin_sbp_amount_y_pdf(out)
         out = nudge_value_column_pdf(out)
         out = pin_f1_value_column_spread_pdf(out)
+        # Hydrate / unequal-Tj can leave +1pt after one pass — hammer R=250.
+        for _ in range(4):
+            if value_column_overshoot(out) <= _OVERSHOOT_HARD:
+                break
+            out = nudge_value_column_pdf(out)
+            out = pin_f1_value_column_spread_pdf(out)
     elif channel == "phone":
         # Generic lattice snap breaks phone: commission Tm flies off-page,
         # «Телефон получателя» drifts left, stamp « ET» corrupts.

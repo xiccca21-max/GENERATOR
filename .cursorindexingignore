@@ -1,4 +1,4 @@
-# Keep in sync with .cursorignore — Cursor indexes these and OOMs.
+﻿# Keep in sync with .cursorignore вЂ” Cursor indexes these and OOMs.
 output/
 __pycache__/
 *.pyc
@@ -17,7 +17,6 @@ alfa_glyph_library/
 fonts/
 tbank-jasper/
 tools/apache-maven-3.9.9/
-tools/pdf_forge/
 *.jar
 *.pdf
 *.pkl

@@ -830,6 +830,13 @@ def ensure_parent_covers(text: str) -> None:
                 alias_from = 0x42C if 0x42C in uni_to_gid else 0x44C  # Ь or ь
             elif cp == 0x44D and 0x42D in uni_to_gid:  # э → Э
                 alias_from = 0x42D
+            else:
+                # Latin brand letters (ЮMoney) → Cyrillic lookalike GIDs in parent.
+                from alfa_font_extend import _LATIN_ORACLE_LOOKALIKE
+
+                alt = _LATIN_ORACLE_LOOKALIKE.get(ch)
+                if alt and ord(alt) in uni_to_gid:
+                    alias_from = ord(alt)
         if alias_from is None or alias_from not in uni_to_gid:
             logger.warning("Alfa parent cover: no alias for %r", ch)
             continue

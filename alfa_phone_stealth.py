@@ -284,7 +284,13 @@ def _attempt(path: str, data: Dict, *, tag: str, max_trials: int = 6) -> Optiona
         if result is None:
             continue
         # Proton: donor /ID + mutated content → ALFA_TRAILER_ID_REUSED.
-        result = _randomize_trailer_id(result)
+        # Oracle rule: equal `/ID [<A><A>]`, never corpus/sent ID on new body.
+        from alfa_sbp_stealth import _ensure_fresh_oracle_trailer_id
+
+        result = _ensure_fresh_oracle_trailer_id(result)
+        if result is None:
+            logger.info("[%s %s] trailer /ID fresh-equal failed — skip", tag, os.path.basename(path))
+            continue
         if not _verify_committed(result, prepared):
             logger.info("[%s %s] post-commit verify failed", tag, os.path.basename(path))
             continue
@@ -463,18 +469,6 @@ def _gen_phone_op_num(dt: datetime) -> str:
         if tail7[:6] != forbidden:
             return f"C07{date_part}{tail7}"
     return f"C07{date_part}{(int(forbidden) + 17) % 1_000_000:06d}{secrets.randbelow(10)}"
-
-
-def _randomize_trailer_id(pdf: bytes) -> bytes:
-    import random
-
-    rid = f"{random.getrandbits(128):032x}".encode("ascii")
-    return re.sub(
-        rb"/ID\s*\[\s*<[0-9A-Fa-f]{32}>\s*<[0-9A-Fa-f]{32}>\s*\]",
-        b"/ID [<" + rid + b"><" + rid + b">]",
-        pdf,
-        count=1,
-    )
 
 
 def _fmt_receiver_masked(receiver: str, available: Optional[set] = None) -> str:
@@ -875,7 +869,6 @@ def create_alfa_phone_stealth(
         _sent_cid_signatures,
         _sent_ff2_shas,
         _sent_prefix_map,
-        _trailer_id_reused,
         _parse_dt as _sbp_parse_dt,
     )
 

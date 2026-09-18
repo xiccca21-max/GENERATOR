@@ -2322,6 +2322,12 @@ def emit_invariants(pdf: bytes, *, channel: str = "sbp") -> str:
     why_face = _face_spec_invariants(pdf, ctx, chan)
     if why_face:
         return why_face
+    if chan in ("sbp", "card", "phone"):
+        from alfa_sbp_stealth import _oracle_trailer_invariant
+
+        why_id = _oracle_trailer_invariant(pdf)
+        if why_id:
+            return f"trailer-id:{why_id}"
     refs = _load_font_xrefs_from_bytes(pdf)
     if not refs:
         return "xref/Length mismatch font-xrefs"

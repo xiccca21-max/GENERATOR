@@ -27,6 +27,44 @@ from alfa_orig_mode import (
 
 logger = logging.getLogger(__name__)
 
+# Latin letters that Oracle never harvests — borrow live Cyrillic outlines so
+# faces like «ЮMoney» still ship exact Latin Unicode (LAW #1 / anti-GEN_NONE).
+_LATIN_ORACLE_LOOKALIKE = {
+    "A": "А",
+    "a": "а",
+    "B": "В",
+    "E": "Е",
+    "e": "е",
+    "K": "К",
+    "M": "М",
+    "H": "Н",
+    "O": "О",
+    "o": "о",
+    "P": "Р",
+    "C": "С",
+    "c": "с",
+    "T": "Т",
+    "X": "Х",
+    "y": "у",
+    "Y": "У",
+}
+
+
+def _oracle_outline_source_char(ch: str) -> str:
+    """Char whose corpus outline to paint; may differ from face Unicode."""
+    if not ch:
+        return ch
+    import alfa_glyph_library as agl
+
+    agl.ensure_library()
+    if agl.has_corpus_outline(ch) or ch in "Жж":
+        return ch
+    alt = _LATIN_ORACLE_LOOKALIKE.get(ch)
+    if alt and agl.has_corpus_outline(alt):
+        return alt
+    return ch
+
+
 # Value slots rewritten per receipt (same y/x as alfa_sbp_stealth.SBP_COORDS).
 _ALFA_SBP_VALUE_YX = (
     (779.15, 452.788),
@@ -1640,11 +1678,13 @@ def inject_alfa_char(
         import alfa_glyph_library as agl
 
         agl.ensure_library()
+        outline_ch = _oracle_outline_source_char(ch)
+        outline_cp = _char_codepoint(outline_ch)
         # Do not paint Windows Tahoma into a used CID — bankpdf atlases it.
-        if not agl.has_corpus_outline(ch) and ch not in "Жж":
+        if not agl.has_corpus_outline(outline_ch) and outline_ch not in "Жж":
             logger.warning("Alfa inject %r refused: not a live Oracle outline", ch)
             return None
-        got = agl.get_glyph(cp)
+        got = agl.get_glyph(outline_cp)
         if got:
             simple, aw_font, lsb_font = got
             aw_font = int(aw_font)
@@ -1657,7 +1697,11 @@ def inject_alfa_char(
                 aw_font = int(round(aw_font * scale))
                 lsb_font = int(round(lsb_font * scale))
             pdf_w = _pdf_width_from_font_aw(aw_font, upem)
-            src_label = "library"
+            src_label = (
+                "library"
+                if outline_ch == ch
+                else f"library~{outline_ch}"
+            )
 
     if simple is None or getattr(simple, "numberOfContours", 0) <= 0:
         return None
@@ -1941,11 +1985,21 @@ def ensure_alfa_font_chars(
                         )
                         pending.append(ch)
                         continue
-            if donor is None and not agl.has_corpus_outline(ch) and ch not in "Жж":
+            outline_ch = _oracle_outline_source_char(ch)
+            if (
+                donor is None
+                and not agl.has_corpus_outline(outline_ch)
+                and outline_ch not in "Жж"
+            ):
                 logger.warning("Alfa: no live Oracle outline for %r — skip Windows Tahoma", ch)
                 pending.append(ch)
                 continue
-            if donor is None and not agl.has_char(ch) and ch not in "Жж":
+            if (
+                donor is None
+                and not agl.has_char(outline_ch)
+                and not agl.has_char(ch)
+                and outline_ch not in "Жж"
+            ):
                 logger.warning("Alfa: no source for %r", ch)
                 pending.append(ch)
                 continue

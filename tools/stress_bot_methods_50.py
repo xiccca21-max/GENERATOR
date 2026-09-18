@@ -146,7 +146,7 @@ def _bank(rng: random.Random) -> str:
             "Совкомбанк",
             "Росбанк",
             "Банк СПБ",
-            "ЮMoney",
+            "ЮМани",
             "QIWI",
         ]
     )

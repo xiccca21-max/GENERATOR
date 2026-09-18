@@ -602,10 +602,8 @@ def replace_amount_preserve_tm(
     new_w = ctx.text_width(fitted, font_size, medium=medium)
     new_x = old_x + (old_w - new_w)
     try:
-        from tbank_sbp_stealth import _fmt_coord_match, _fmt_coord
+        from tbank_sbp_stealth import _fmt_coord_match
         x_new = _fmt_coord_match(new_x, x_tok).encode("ascii")
-        if len(x_new) != len(x_tok):
-            x_new = _fmt_coord(new_x).encode("ascii")
     except Exception:
         x_new = f"{new_x:.2f}".rstrip("0").rstrip(".").encode("ascii")
     abs_x = look_from + last.start(1)

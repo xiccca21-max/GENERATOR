@@ -715,7 +715,10 @@ def _attempt(path: str, data: Dict, *, tag: str) -> Optional[bytes]:
         if not ctx_chk.load_bytes(result):
             continue
 
-        result = _randomize_trailer_id(result)
+        result = _ensure_fresh_oracle_trailer_id(result)
+        if result is None:
+            logger.info("[%s %s] trailer /ID fresh-equal failed — skip", tag, os.path.basename(path))
+            continue
         if not _verify_committed(result, prepared):
             continue
         try:
@@ -856,11 +859,10 @@ def _fmt_datetime(date_in, *, with_seconds: bool = True, msk_gap: bool = True) -
     if isinstance(date_in, datetime):
         dt = date_in
     else:
-        raw = (date_in or "").strip()
+        raw = (date_in or "").replace("\xa0", " ").replace(",", " ").strip()
         if _is_auto_datetime(raw):
             dt = now_msk()
         else:
-            raw = raw.replace(",", " ")
             dt = None
             for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y"):
                 try:
@@ -909,6 +911,8 @@ _BANK_ROUTES = (
     (("ренессанс",), "Ренессанс Банк", "B", "B10130011821301"),
     (("модуль",), "Модульбанк", "B", "B10130011821301"),
     (("бкс",), "БКС Банк", "B", "B10130011821301"),
+    # Brand face is mixed Cyrillic+Latin «ЮMoney»; Latin M/e/y borrow Cyr outlines.
+    (("юmoney", "yoomoney", "юмани", "yumoney"), "ЮМани", "B", "B10130011821301"),
 )
 # Unknown recipient bank: keep the typed face, use live 10.08 T-Bank channel
 # (not Ozon G10120011830701 / WB G10140011830701). Known banks keep their own tails.
@@ -918,7 +922,7 @@ _ERA_FALLBACK_FACES = frozenset({
     "Газпромбанк", "Райффайзенбанк", "Яндекс Банк", "Совкомбанк",
     "Ак Барс Банк", "Банк Открытие", "МТС Банк", "Почта Банк",
     "Уралсиб", "Хоум Банк", "ОТП Банк", "Ренессанс Банк",
-    "Модульбанк", "БКС Банк",
+    "Модульбанк", "БКС Банк", "ЮМани",
 })
 _ERA_OK_TAILS = frozenset({
     "B10130011821301",
@@ -1291,17 +1295,90 @@ def _pdf_trailer_ids(pdf: bytes) -> tuple:
     return tuple(part.decode("ascii").lower() for part in hit.groups())
 
 
-def _trailer_id_reused(pdf: bytes) -> bool:
-    ids = set(_pdf_trailer_ids(pdf))
-    if not ids:
-        return True
-    old_ids = {
+def _corpus_pdf_ids() -> set:
+    """Trailer /ID hexes from Alfa corpus + template originals (Oracle equal-pair).
+
+    Mutated ships must never reuse these — same body + new /ID is the
+    «номер документа не соответствует оригиналу» / clone tell; donor /ID
+    on mutated content is ALFA_TRAILER_ID_REUSED.
+    """
+    cached = getattr(_corpus_pdf_ids, "_cache", None)
+    if cached is not None:
+        return cached
+    found: set = set()
+    paths: list = []
+    try:
+        from alfa_corpus import canonical_paths
+
+        for kind in ("sbp", "card", "phone"):
+            paths.extend(canonical_paths(kind) or [])
+    except Exception:
+        pass
+    for name in (
+        "Alfa_sbp_original.pdf",
+        "Alfa_card_original.pdf",
+        "Alfa_phone_original.pdf",
+        "Alfa_statement_original.pdf",
+    ):
+        p = os.path.join(_DIR, "templates", name)
+        if os.path.isfile(p):
+            paths.append(p)
+    if os.path.isfile(SBP_ORIG):
+        paths.append(SBP_ORIG)
+    seen_paths = set()
+    for path in paths:
+        if not path or not os.path.isfile(path):
+            continue
+        key = os.path.normcase(os.path.normpath(path))
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        try:
+            with open(path, "rb") as fh:
+                found.update(_pdf_trailer_ids(fh.read()))
+        except OSError:
+            continue
+    _corpus_pdf_ids._cache = found
+    return found
+
+
+def _sent_pdf_ids() -> set:
+    return {
         str(item.get(key) or "").lower()
         for item in _load_sent_payloads()
         for key in ("pdf_id1", "pdf_id2")
         if item.get(key)
     }
-    return bool(ids & old_ids)
+
+
+def _oracle_trailer_ids_equal(pdf: bytes) -> bool:
+    """Oracle SBP/phone/card originals: `/ID [<A><A>]` (equal pair)."""
+    ids = _pdf_trailer_ids(pdf)
+    return len(ids) == 2 and ids[0] == ids[1] and len(ids[0]) == 32
+
+
+def _trailer_id_reused(pdf: bytes) -> bool:
+    """True if /ID missing, unequal (non-Oracle), corpus, or already sent."""
+    ids = _pdf_trailer_ids(pdf)
+    if len(ids) != 2:
+        return True
+    if ids[0] != ids[1]:
+        # Oracle receipts are equal-pair; unequal is iText/statement / bad clone.
+        return True
+    banned = _corpus_pdf_ids() | _sent_pdf_ids()
+    return ids[0] in banned
+
+
+def _oracle_trailer_invariant(pdf: bytes) -> str:
+    """Empty if trailer /ID matches Oracle receipt rules (equal pair present)."""
+    ids = _pdf_trailer_ids(pdf)
+    if len(ids) != 2:
+        return "trailer-id-missing"
+    if ids[0] != ids[1]:
+        return "trailer-id-unequal"
+    if len(ids[0]) != 32:
+        return "trailer-id-len"
+    return ""
 
 
 def _remember_sent_payload(
@@ -1443,10 +1520,9 @@ def _gen_sbp_id_for_ctx(ctx: AlfaOrigContext, date_in: str) -> str:
 def _parse_dt(date_in: str) -> datetime:
     import secrets
 
-    raw = (date_in or "").strip()
+    raw = (date_in or "").replace("\xa0", " ").replace(",", " ").strip()
     if _is_auto_datetime(raw):
         return now_msk()
-    raw = raw.replace(",", " ")
     body = raw.split("мск")[0].strip()
     for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y"):
         try:
@@ -1530,16 +1606,44 @@ def _gen_sbp_op_num(dt: datetime) -> str:
 
 
 def _randomize_trailer_id(pdf: bytes) -> bytes:
-    """Новый /ID — иначе ALFA_TRAILER_ID_REUSED_WITH_DIFFERENT_CONTENT."""
-    import random
+    """Новый equal `/ID [<A><A>]` как у Oracle orig.
 
-    rid = f"{random.getrandbits(128):032x}".encode("ascii")
-    return re.sub(
-        rb"/ID\s*\[\s*<[0-9A-Fa-f]{32}>\s*<[0-9A-Fa-f]{32}>\s*\]",
-        b"/ID [<" + rid + b"><" + rid + b">]",
-        pdf,
-        count=1,
-    )
+    Never silent-keep donor /ID (regex miss). Never unequal pair.
+    Avoid corpus + already-sent IDs so validators do not see
+    «номер документа не соответствует оригиналу» on a body clone.
+    """
+    pat = rb"/ID\s*\[\s*<[0-9A-Fa-f]{32}>\s*<[0-9A-Fa-f]{32}>\s*\]"
+    if not re.search(pat, pdf):
+        logger.warning("Alfa trailer /ID: pattern missing — leave unchanged")
+        return pdf
+    banned = _corpus_pdf_ids() | _sent_pdf_ids()
+    for _ in range(48):
+        rid_s = f"{random.getrandbits(128):032x}"
+        if rid_s in banned:
+            continue
+        rid = rid_s.encode("ascii")
+        out, n = re.subn(
+            pat,
+            b"/ID [<" + rid + b"><" + rid + b">]",
+            pdf,
+            count=1,
+        )
+        if n != 1:
+            logger.warning("Alfa trailer /ID: replace failed n=%s", n)
+            return pdf
+        got = _pdf_trailer_ids(out)
+        if got == (rid_s, rid_s):
+            return out
+    logger.warning("Alfa trailer /ID: exhausted unique equal-pair draws")
+    return pdf
+
+
+def _ensure_fresh_oracle_trailer_id(pdf: bytes) -> Optional[bytes]:
+    """Randomize equal /ID; None if still corpus/sent/unequal/missing."""
+    out = _randomize_trailer_id(pdf)
+    if _trailer_id_reused(out):
+        return None
+    return out
 
 
 _ALFA_PAYER_BIK = "044525593"  # счёт списания — БИК Альфы, не банк получателя
@@ -2341,8 +2445,8 @@ def create_alfa_sbp_stealth(
             logger.info("Alfa SBP rebuild %s trial=%d shell=%s", last_why, trial, os.path.basename(path))
             continue
         if pdf != shell:
-            pdf = _randomize_trailer_id(pdf)
-            if _trailer_id_reused(pdf):
+            pdf = _ensure_fresh_oracle_trailer_id(pdf)
+            if pdf is None:
                 last_why = "identity mismatch reused-pdf-id"
                 continue
         chk = AlfaOrigContext()

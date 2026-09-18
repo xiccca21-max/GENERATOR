@@ -312,7 +312,12 @@ def _attempt(path: str, data: Dict, *, tag: str, max_trials: int = 16) -> Option
         if not AlfaOrigContext().load_bytes(result):
             continue
 
-        result = _randomize_trailer_id(result)
+        from alfa_sbp_stealth import _ensure_fresh_oracle_trailer_id
+
+        result = _ensure_fresh_oracle_trailer_id(result)
+        if result is None:
+            logger.info("[%s %s] trailer /ID fresh-equal failed — skip", tag, os.path.basename(path))
+            continue
         if not _verify_committed(result, prepared, coords):
             logger.info("[%s %s] post-commit verify failed", tag, os.path.basename(path))
             continue
@@ -488,19 +493,6 @@ def _gen_card_op_num(dt: datetime) -> str:
     return f"Z09{date_part}{(int(forbidden) + 17) % 1_000_000:06d}{int(last_digit)}"
 
 
-def _randomize_trailer_id(pdf: bytes) -> bytes:
-    """Новый /ID — иначе ALFA_TRAILER_ID_REUSED / CLONED_ORIGINAL_SHELL."""
-    import random
-
-    rid = f"{random.getrandbits(128):032x}".encode("ascii")
-    return re.sub(
-        rb"/ID\s*\[\s*<[0-9A-Fa-f]{32}>\s*<[0-9A-Fa-f]{32}>\s*\]",
-        b"/ID [<" + rid + b"><" + rid + b">]",
-        pdf,
-        count=1,
-    )
-
-
 def _prepare_card(data: Dict, *, ctx: Optional[AlfaOrigContext] = None) -> Dict[str, str]:
     import secrets
 
@@ -648,7 +640,6 @@ def create_alfa_card_stealth(
         _sent_ff2_shas,
         _sent_cid_signatures,
         _sent_prefix_map,
-        _trailer_id_reused,
     )
 
     ensure_master()
@@ -764,9 +755,16 @@ def create_alfa_card_stealth(
                     last_why, trial, os.path.basename(path),
                 )
                 continue
-        pdf = _randomize_trailer_id(pdf)
-        if _trailer_id_reused(pdf):
-            logger.warning("Alfa CARD soft-ship reused-pdf-id trial=%d", trial)
+        from alfa_sbp_stealth import _ensure_fresh_oracle_trailer_id
+
+        pdf = _ensure_fresh_oracle_trailer_id(pdf)
+        if pdf is None:
+            last_why = "identity mismatch reused-pdf-id"
+            logger.info(
+                "Alfa CARD rebuild %s trial=%d shell=%s",
+                last_why, trial, os.path.basename(path),
+            )
+            continue
         chk = AlfaOrigContext()
         if not chk.load_bytes(pdf):
             last_why = "xref/Length mismatch verify"

@@ -94,6 +94,8 @@ def _parse_op_datetime(raw: str) -> datetime | None:
     if not s:
         return None
     now = datetime.now(_MSK)
+    if s.lower() in ("сейчас", "now", "авто", "auto", "-"):
+        return now
     m = _DT_FULL_RE.search(s)
     if m:
         y = int(m.group(3))

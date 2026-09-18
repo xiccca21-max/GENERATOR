@@ -162,7 +162,10 @@ def _fmt_op_code(raw: str, op_date: str) -> str:
         mid = "".join(str(random.randint(0, 9)) for _ in range(4))
         return f"C16{dd}{mm}{yy}{mid}{last3}"
     token = re.sub(r"\s+", "", str(raw or ""))
-    if re.fullmatch(r"C\d{14,16}", token):
+    # Exact face codes (C… / Z… / full alphanumeric) — never rewrite last digits.
+    if re.fullmatch(r"[A-Za-z]\d{14,16}", token):
+        return token
+    if re.fullmatch(r"[A-Za-z0-9]{12,20}", token) and re.search(r"\d", token):
         return token
     if len(token) < 4:
         mid = "".join(str(random.randint(0, 9)) for _ in range(4))

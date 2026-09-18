@@ -20,11 +20,12 @@ from tools.alfa_mock.parse import parse_payload  # noqa: E402
 ALFA_TEMPLATE = Path(__file__).with_name("template.user.js")
 TBANK_TEMPLATE = Path(__file__).resolve().parents[1] / "pdf_forge" / "template_tbank.user.js"
 PLACEHOLDER = "__PDF_FORGE_CONFIG__"
-USERSCRIPT_VERSION = "1.3.58"
+USERSCRIPT_VERSION = "1.3.60"
 _OZON_PNG = Path(__file__).with_name("logo_bank_ozon_ecom.png")
 _TBANK_PNG = Path(__file__).with_name("logo_bank_tinkoff_v2.png")
 _ALFA_PNG = Path(__file__).with_name("logo_bank_alfabank.png")
 _BSPB_PNG = Path(__file__).with_name("logo_bank_bspb.png")
+_SBER_PNG = Path(__file__).with_name("logo_bank_sberbank.png")
 
 
 def _png_data_uri(path: Path) -> str:
@@ -49,6 +50,10 @@ def _bspb_logo_data_uri() -> str:
     return _png_data_uri(_BSPB_PNG)
 
 
+def _sber_logo_data_uri() -> str:
+    return _png_data_uri(_SBER_PNG)
+
+
 def _pack_op_bank_logos(ops: list) -> None:
     """CDN logos 5xx often; stamp packed data: URIs onto op.bank."""
     packed_by_key = {
@@ -56,6 +61,7 @@ def _pack_op_bank_logos(ops: list) -> None:
         "Т-Банк": _tbank_logo_data_uri(),
         "Альфа": _alfa_logo_data_uri(),
         "БСПБ": _bspb_logo_data_uri(),
+        "Сбер": _sber_logo_data_uri(),
     }
     for op in ops:
         bank = op.get("bank") if isinstance(op, dict) else None
@@ -73,10 +79,17 @@ def _pack_op_bank_logos(ops: list) -> None:
                 packed = packed_by_key["Ozon"]
             elif "бспб" in name or "bspb" in name or "санкт" in name:
                 packed = packed_by_key["БСПБ"]
+            elif "сбер" in name or "sber" in name:
+                packed = packed_by_key["Сбер"]
         if packed:
             bank["logoUrl"] = packed
             bank["iconUrl"] = packed
             bank["logo"] = packed
+        # SBP face: badge text under amount (live Alfa «Перевод денежных средств»).
+        kind = str(op.get("transferKind") or "").lower()
+        if kind == "sbp" or "сбп" in str(op.get("category") or "").lower():
+            if not op.get("bottomBadge"):
+                op["bottomBadge"] = {"text": "Перевод денежных средств"}
 
 
 def filename_for(data: dict[str, Any], cabinet: str = "alfa") -> str:
@@ -114,7 +127,12 @@ def build_config(
         _pdf_slot(pdfs[i] if i < n_ops and i < len(pdfs) else b"")
         for i in range(3)
     ]
-    statement = _pdf_slot(pdfs[n_ops] if len(pdfs) > n_ops else b"")
+    statement_raw = pdfs[n_ops] if len(pdfs) > n_ops else b""
+    # If forge attached the same bytes as a receipt, drop statement slot —
+    # duplicate made pdfBytesForIndex treat the receipt as missing.
+    if statement_raw and any(statement_raw == (pdfs[i] if i < len(pdfs) else b"") for i in range(n_ops)):
+        statement_raw = b""
+    statement = _pdf_slot(statement_raw)
     ops = list(data.get("operations") or [])
     bank_logos: dict[str, str] = {}
     ozon = _ozon_logo_data_uri()
@@ -129,6 +147,20 @@ def build_config(
     bspb = _bspb_logo_data_uri()
     if bspb:
         bank_logos["БСПБ"] = bspb
+    sber = _sber_logo_data_uri()
+    if sber:
+        bank_logos["Сбер"] = sber
+    # Corner SBP badge (detail + history) — same purple mark as template fallback.
+    bank_logos["СБП"] = (
+        "data:image/svg+xml;charset=utf-8,"
+        + __import__("urllib.parse").parse.quote(
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+            '<rect width="64" height="64" rx="14" fill="#6B2BD9"/>'
+            '<text x="32" y="40" text-anchor="middle" font-size="18" '
+            'font-family="Arial,sans-serif" font-weight="700" fill="#fff">СБП</text>'
+            "</svg>"
+        )
+    )
     _pack_op_bank_logos(ops)
     return {
         "enabled": True,

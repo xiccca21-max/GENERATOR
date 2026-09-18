@@ -23,7 +23,7 @@
   function alfaMockRun(CFG, win) {
     win = win || window;
     if (win.__alfaMockRun) return;
-    win.__alfaMockRun = '1.3.58';
+    win.__alfaMockRun = '1.3.60';
     try {
       if (sessionStorage.getItem('__ALFA_MOCK_VER') !== '1.3.58') {
         sessionStorage.removeItem('__ALFA_MOCK_OPS');
@@ -456,8 +456,8 @@
       if (typeof index === 'number' && nOps && index >= nOps) return null;
       const b64 = CONFIG.receipts?.[index]?.pdfBase64;
       if (!b64) return null;
-      const stB64 = CONFIG.statement && CONFIG.statement.pdfBase64;
-      if (stB64 && b64 === stB64) return null;
+      // Do NOT reject when statement accidentally equals receipt (forge dup PDF) —
+      // that made «Получить квитанцию» alert «нет вложенного PDF» with PDF present.
       try {
         const bin = atob(b64);
         const out = new Uint8Array(bin.length);
@@ -699,6 +699,21 @@
       'ВТБ': svgLogo('#0A2896', '<text x="32" y="42" text-anchor="middle" font-size="18" font-family="Arial,sans-serif" font-weight="700" fill="#fff">ВТБ</text>'),
       'БСПБ': svgLogo('#FFFFFF', '<circle cx="32" cy="18" r="10" fill="#E51837"/><ellipse cx="32" cy="36" rx="14" ry="5" fill="#E51837"/><ellipse cx="32" cy="46" rx="8" ry="2" fill="#C4102E"/>'),
     };
+
+    // Packed SBP corner badge — CDN often 404 / CSP; detail view must not stay broken.
+    const SBP_BADGE_SRC = svgLogo(
+      '#6B2BD9',
+      '<text x="32" y="40" text-anchor="middle" font-size="18" font-family="Arial,sans-serif" font-weight="700" fill="#fff">СБП</text>',
+    );
+
+    function isSbpBadgeUrl(url) {
+      return /sbp|nspk|faster.?pay|сбп|payment.?system|fps/i.test(String(url || ''));
+    }
+
+    function sbpBadgeSrc() {
+      const packed = CONFIG.bankLogos && CONFIG.bankLogos.СБП;
+      return packed || SBP_BADGE_SRC;
+    }
 
     function bankLogoKey(bank) {
       if (!bank) return '';
@@ -943,7 +958,7 @@
         if (Array.isArray(src)) return;
         Object.keys(src).forEach((key) => {
           const sv = src[key];
-          if (typeof sv === 'string' && /^https?:/i.test(sv) && /logo|icon|image|svg|png|webp|brand|pictogram/i.test(key + sv) && !/sbp|nspk|faster.?pay/i.test(key + sv)) {
+          if (typeof sv === 'string' && /^https?:/i.test(sv) && /logo|icon|image|svg|png|webp|brand|pictogram/i.test(key + sv) && !isSbpBadgeUrl(key + sv)) {
             dst[key] = sv;
           } else if (sv && typeof sv === 'object' && !Array.isArray(sv) && dst[key] && typeof dst[key] === 'object') {
             walk(sv, dst[key], depth + 1);
@@ -954,6 +969,7 @@
 
     function replaceLogoUrls(op, logoUrl) {
       if (!op || !logoUrl) return;
+      const badge = sbpBadgeSrc();
       (function walk(node, depth) {
         if (!node || typeof node !== 'object' || depth > 8) return;
         if (Array.isArray(node)) {
@@ -962,18 +978,36 @@
         }
         Object.keys(node).forEach((key) => {
           const val = node[key];
-          if (
-            typeof val === 'string' &&
-            /^https?:/i.test(val) &&
-            /logo|icon|image|svg|png|webp|brand|pictogram/i.test(key + val) &&
-            !/sbp|nspk|faster.?pay/i.test(key + val)
-          ) {
-            node[key] = logoUrl;
+          if (typeof val === 'string' && (/^https?:/i.test(val) || val.indexOf('data:image') === 0) && /logo|icon|image|svg|png|webp|brand|pictogram/i.test(key + val)) {
+            if (isSbpBadgeUrl(key + val)) {
+              // CDN SBP badge often broken inside detail — pin packed badge.
+              node[key] = badge;
+            } else {
+              node[key] = logoUrl;
+            }
           } else if (val && typeof val === 'object') {
             walk(val, depth + 1);
           }
         });
       })(op, 0);
+    }
+
+    function ensureSbpBadgeOnDetail(inner, item) {
+      if (!inner || isCardKind(item) || isAlfaInternalKind(item)) return;
+      const badge = sbpBadgeSrc();
+      const b = inner.bottomBadge;
+      if (b && typeof b === 'object' && !Array.isArray(b)) {
+        if (!b.iconUrl && !b.logoUrl && !b.imageUrl) b.iconUrl = badge;
+        else {
+          ['iconUrl', 'logoUrl', 'imageUrl', 'icon', 'logo'].forEach((k) => {
+            if (typeof b[k] === 'string' && (isSbpBadgeUrl(b[k]) || /^https?:/i.test(b[k]))) b[k] = badge;
+          });
+        }
+      }
+      // Some shells keep a second logo slot for the SBP corner mark.
+      ['badgeUrl', 'badgeIconUrl', 'rightLogoUrl', 'additionalLogoUrl', 'partnerLogoUrl'].forEach((k) => {
+        if (k in inner) inner[k] = badge;
+      });
     }
 
     function applyBankBrand(op, bank) {
@@ -1967,6 +2001,7 @@
           inner.bottomBadge = cloneJson(mock.bottomBadge || sk.bottomBadge);
         }
         forceSbpBottomBadge(inner, 'Перевод денежных средств');
+        ensureSbpBadgeOnDetail(inner, item);
       }
       if (sk && Array.isArray(sk.fields) && (!Array.isArray(inner.fields) || !inner.fields.length)) {
         inner.fields = cloneJson(sk.fields);
@@ -2730,6 +2765,88 @@
       return /операция выполнена/i.test(text) && /финансовая аналитика/i.test(text);
     }
 
+    function patchOpDetailIcons(root) {
+      if (!root || !isOpDetailView()) return;
+      const body = root.innerText || '';
+      let item = null;
+      (CONFIG.operations || []).some((op) => {
+        if (op && op.description && body.indexOf(op.description) >= 0) {
+          item = op;
+          return true;
+        }
+        return false;
+      });
+      if (!item && (CONFIG.operations || []).length === 1) item = CONFIG.operations[0];
+      if (!item) return;
+      if (isCardKind(item) || isAlfaInternalKind(item)) return;
+      const bankSrc = bankLogoSrc(item.bank);
+      const badgeSrc = sbpBadgeSrc();
+      let imgs = [];
+      try {
+        imgs = Array.from(root.querySelectorAll('img'));
+      } catch (_) { return; }
+      if (!imgs.length) return;
+      // Header logos sit above «Операция выполнена» / amount — prefer top of screen.
+      const scored = imgs.map((img) => {
+        let r;
+        try { r = img.getBoundingClientRect(); } catch (_) { r = { top: 9999, width: 0, height: 0 }; }
+        const area = (r.width || 0) * (r.height || 0);
+        const src = String(img.currentSrc || img.src || '');
+        return { img, top: r.top || 0, area, src };
+      }).filter((x) => x.area > 0 || x.src);
+      scored.sort((a, b) => a.top - b.top || b.area - a.area);
+      const header = scored.filter((x) => x.top < 420).slice(0, 6);
+      const pool = header.length ? header : scored.slice(0, 4);
+      let main = null;
+      let mainArea = 0;
+      pool.forEach((x) => {
+        if (x.area > mainArea && !isSbpBadgeUrl(x.src)) {
+          mainArea = x.area;
+          main = x;
+        }
+      });
+      if (main && bankSrc) {
+        main.img.src = bankSrc;
+        main.img.removeAttribute('srcset');
+      }
+      let badgeHit = false;
+      pool.forEach((x) => {
+        if (x === main) return;
+        const looksBadge = isSbpBadgeUrl(x.src) || (x.area > 0 && x.area < 2200) || (main && x.area > 0 && x.area < mainArea * 0.45);
+        if (!looksBadge && !imgLooksBroken(x.img)) return;
+        x.img.src = badgeSrc;
+        x.img.removeAttribute('srcset');
+        x.img.setAttribute('data-alfa-sbp-badge', '1');
+        badgeHit = true;
+      });
+      if (!badgeHit && main && main.img && main.img.parentElement) {
+        // Inject corner badge next to bank logo when native SBP img never appeared.
+        let badge = main.img.parentElement.querySelector('[data-alfa-sbp-badge="1"]');
+        if (!badge) {
+          badge = document.createElement('img');
+          badge.setAttribute('data-alfa-sbp-badge', '1');
+          badge.alt = 'СБП';
+          const size = Math.max(18, Math.round((main.img.getBoundingClientRect().width || 56) * 0.38));
+          badge.style.cssText = 'position:absolute;right:-2px;bottom:-2px;width:' + size + 'px;height:' + size + 'px;border-radius:50%;object-fit:cover;z-index:2;';
+          const host = main.img.parentElement;
+          try {
+            const cs = win.getComputedStyle(host);
+            if (cs && cs.position === 'static') host.style.position = 'relative';
+          } catch (_) { host.style.position = 'relative'; }
+          host.appendChild(badge);
+        }
+        badge.src = badgeSrc;
+      }
+    }
+
+    function imgLooksBroken(img) {
+      try {
+        if (!img) return true;
+        if (img.complete && img.naturalWidth === 0) return true;
+      } catch (_) { /* ignore */ }
+      return false;
+    }
+
     function patchOpDetailDom(root) {
       if (!root || !isOpDetailView()) return;
       const body = root.innerText || '';
@@ -3032,6 +3149,7 @@
         patchAccountDom(r);
         if (isOpDetailView()) {
           patchOpDetailDom(r);
+          patchOpDetailIcons(r);
           return;
         }
         const cards = Array.from(productRoots(r)).filter((el) => {
@@ -3077,16 +3195,27 @@
           });
           if (mainArea === 0) main = imgs[0];
           const mainCur = String(main.currentSrc || main.src || '');
-          const looksBadge = /sbp|nspk|faster.?pay|сбп/i.test(mainCur) || (mainArea > 0 && mainArea < 400);
+          const looksBadge = isSbpBadgeUrl(mainCur) || (mainArea > 0 && mainArea < 400);
           if (!looksBadge) {
             main.src = src;
             main.removeAttribute('srcset');
           }
+          imgs.forEach((img) => {
+            if (img === main) return;
+            const cur = String(img.currentSrc || img.src || '');
+            const r = img.getBoundingClientRect();
+            const area = (r.width || 0) * (r.height || 0);
+            if (isSbpBadgeUrl(cur) || imgLooksBroken(img) || (area > 0 && area < 2200)) {
+              img.src = sbpBadgeSrc();
+              img.removeAttribute('srcset');
+              img.setAttribute('data-alfa-sbp-badge', '1');
+            }
+          });
           el.querySelectorAll('[style*="background"]').forEach((box) => {
             const r = box.getBoundingClientRect();
             if (!r.width || r.width < 28) return;
             const bg = box.style && box.style.backgroundImage;
-            if (bg && /url\(/i.test(bg) && !/sbp|nspk|faster.?pay|сбп/i.test(bg)) {
+            if (bg && /url\(/i.test(bg) && !isSbpBadgeUrl(bg)) {
               box.style.backgroundImage = `url("${src}")`;
             }
           });
