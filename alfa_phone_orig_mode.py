@@ -9,6 +9,8 @@ from typing import Dict, List, Optional, Tuple
 
 import fitz
 
+from alfa_orig_mode import cap_trailing_nbsp
+
 logger = logging.getLogger(__name__)
 
 _NBSP = "\u00a0"
@@ -521,8 +523,6 @@ class AlfaPhoneOrigContext:
         if not op:
             return False
         op_s, op_e, kind, old_hx = op
-        # Pad a shorter exact payload, but never truncate a longer one.
-        # After «RUR» use U+0020, not NBSP — Proton ALFA_AMOUNT_TYPOGRAPHY_ANOMALY.
         t = new_text
         n_old = len(old_hx) // 4
         if len(t.rstrip(_NBSP)) > n_old:
@@ -532,13 +532,12 @@ class AlfaPhoneOrigContext:
                 n_old,
             )
             return False
-        pad_ch = " " if "RUR" in t.replace("\xa0", " ") else _NBSP
-        while len(t) < n_old:
-            t += pad_ch
+        t = cap_trailing_nbsp(t, key="amount" if "RUR" in t.replace("\xa0", " ") else "")
         hx = self.enc(t)
         if not hx:
             return False
-        # always write as <hex> Tj (simpler, Quartz already mixes)
+        # Write the semantic face only. Filling a longer donor slot with NBSP
+        # is TEXT_TRAILING_NBSP_PADDING / ALFA_AMOUNT_TYPOGRAPHY_ANOMALY.
         new_op = b"<" + hx + b"> Tj"
         self.stream[op_s:op_e] = new_op
         return True

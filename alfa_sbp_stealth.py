@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from time_msk import now_msk
 from typing import Dict, List, Optional
 
-from alfa_orig_mode import AlfaOrigContext
+from alfa_orig_mode import AlfaOrigContext, cap_trailing_nbsp
 
 logger = logging.getLogger(__name__)
 
@@ -807,7 +807,9 @@ def _fmt_amount(amount_raw: str, *, max_chars: int = 0, grouped: bool = True) ->
     # Keeping the trailing NBSP for the donor-aligner makes it land exactly once.
     body = f"{grouped}{_NBSP}RUR"
     if max_chars > 0 and len(body) < max_chars:
-        return body + (_NBSP * (max_chars - len(body)))
+        # At most one trailing NBSP after RUR (ALFA_AMOUNT_TYPOGRAPHY_ANOMALY).
+        extra = min(1, max_chars - len(body))
+        return body + (_NBSP * extra)
     return body
 
 
@@ -1996,7 +1998,7 @@ def _fit_prepared_cs(prep: Dict[str, str]) -> Dict[str, str]:
                 # Keep classic ridge first, but allow wider extra-op search for
                 # bank/date clusters where Deacon rejects the default CS bucket.
                 found = None
-                for cand in (1, 2, 3, 4):
+                for cand in (1,):
                     if ok(trial, cand):
                         found = cand
                         break
@@ -2004,7 +2006,10 @@ def _fit_prepared_cs(prep: Dict[str, str]) -> Dict[str, str]:
                     continue
                 extra_need = found
             if extra_need:
-                trial["operation_num"] = (trial.get("operation_num") or "") + (_NBSP * extra_need)
+                trial["operation_num"] = cap_trailing_nbsp(
+                    (trial.get("operation_num") or "") + (_NBSP * extra_need),
+                    key="operation_num",
+                )
             # Prefer orig grouped amount + extra op CID over ungrouped
             # «8140» (typography-bare) when leaving clone CS 5111.
             score = (
@@ -2022,9 +2027,11 @@ def _fit_prepared_cs(prep: Dict[str, str]) -> Dict[str, str]:
         if _deacon_cs_penalty(bank_face, pred0):
             # Last CS nudge axis: trailing NBSP in message (face-safe).
             # This shifts decoded CS by +4 per NBSP without touching user fields.
-            for bump in (1, 2, 3, 4, 5, 6):
+            for bump in (1, 2):
                 trial = dict(best)
-                trial["message"] = (trial.get("message") or "") + (_NBSP * bump)
+                trial["message"] = cap_trailing_nbsp(
+                    (trial.get("message") or "") + (_NBSP * bump), key="message",
+                )
                 pred = _pred_sbp_cs(trial)
                 if _deacon_cs_penalty(bank_face, pred):
                     continue
@@ -2090,7 +2097,7 @@ def _oracle_sbp_shell_ok(path: str) -> bool:
 
 
 def _op_trailing_nbsp_ok(ctx: AlfaOrigContext) -> bool:
-    """Orig op id ends with one NBSP. CS-bump extras ≥3 are a Deacon tell."""
+    """Orig op id ends with one NBSP. ≥3 trailing NBSP is G-SEM-NBSP-001 FAKE."""
     got = ctx.extract_at(*SBP_COORDS["operation_num"]) or ""
     n = 0
     for ch in reversed(got):
@@ -2098,7 +2105,7 @@ def _op_trailing_nbsp_ok(ctx: AlfaOrigContext) -> bool:
             n += 1
         else:
             break
-    return 1 <= n <= 3
+    return 1 <= n <= 2
 
 
 def _date_formed_ok(ctx: AlfaOrigContext) -> bool:

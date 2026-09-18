@@ -18,6 +18,9 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 from alfa_orig_mode import (
     AlfaOrigContext,
     _TM_RE,
+    cap_trailing_nbsp,
+    max_ok_trailing_nbsp,
+    trailing_nbsp_count,
 )
 from alfa_oracle_master import (
     ensure_master,
@@ -248,74 +251,17 @@ def _ensure_hmtx_uniq_floor(
     parent_vocab: Optional[Iterable[int]] = None,
     upem: int = 2048,
 ) -> List[Tuple[int, int]]:
-    """Split duplicate unused advances until unique positive AWs ≥ floor.
+    """Keep source Tahoma advances on every glyph that still has a contour.
 
-    Painted CIDs keep their source Tahoma advance (layout). New AWs prefer
-    widths already present on parent Tahoma so the vocabulary is restored,
-    not invented. Same `_pdf_w` first so /W tokens stay stable.
+    Proton ALFA_ORACLE_HMTX_TAHOMA_ADVANCE_CONFLICT: unused subset glyphs
+    still carry Tahoma outlines, so splitting duplicate AWs (1229≠1230)
+    is HARD. Unique-advance floor is advisory against that HARD — do not
+    mutate hmtx here.
     """
+    del painted, parent_vocab, upem
     if floor <= 0:
         return metrics
-    pos = {int(aw) for aw, _lsb in metrics if int(aw) > 0}
-    if len(pos) >= floor:
-        return metrics
-    from collections import Counter
-
-    counts = Counter(int(aw) for aw, _lsb in metrics if int(aw) > 0)
-    out = [(int(aw), int(lsb)) for aw, lsb in metrics]
-    unused = [
-        i
-        for i in range(len(out))
-        if i not in painted and int(out[i][0]) > 0 and counts[int(out[i][0])] > 1
-    ]
-    taken = set(pos)
-    parent_pool: List[int] = []
-    seen_parent: Set[int] = set()
-    for aw in parent_vocab or ():
-        v = int(aw)
-        if v <= 0 or v in taken or v in seen_parent:
-            continue
-        seen_parent.add(v)
-        parent_pool.append(v)
-
-    def _pick(aw: int) -> Optional[int]:
-        want_w = _pdf_w(aw, upem)
-        for v in parent_pool:
-            if v not in taken and _pdf_w(v, upem) == want_w:
-                return v
-        for delta in range(1, 80):
-            for v in (aw + delta, aw - delta):
-                if v > 0 and v not in taken and _pdf_w(v, upem) == want_w:
-                    return v
-        for v in parent_pool:
-            if v not in taken:
-                return v
-        for delta in range(1, 500):
-            for v in (aw + delta, max(1, aw - delta)):
-                if v not in taken:
-                    return v
-        return None
-
-    for i in unused:
-        if len(taken) >= floor:
-            break
-        aw, lsb = out[i]
-        cand = _pick(aw)
-        if cand is None:
-            continue
-        counts[aw] -= 1
-        counts[cand] += 1
-        taken.add(cand)
-        out[i] = (cand, lsb)
-        parent_pool = [v for v in parent_pool if v != cand]
-    if len(taken) < floor:
-        logger.warning(
-            "Alfa SBP hmtx uniq still %d < %d (unused-dup=%d)",
-            len(taken), floor, len(unused),
-        )
-    else:
-        logger.info("Alfa SBP hmtx uniq → %d (floor %d)", len(taken), floor)
-    return out
+    return [(int(aw), int(lsb)) for aw, lsb in metrics]
 
 
 def _pack_oracle_raw(
@@ -1296,8 +1242,9 @@ def subset_cps_pinned(keyed: List[Tuple[Optional[str], str]]) -> List[int]:
 
 
 _CS_PAD_KEYS = frozenset({
-    "amount", "commission", "operation_num",
-    "date_time", "date_formed",
+    "operation_num",
+    "date_time",
+    "date_formed",
     # Card orig sender has a spare trailing NBSP vs a 16-char MIR mask.
     # Steal it so 5-digit amounts («87 900 RUR ») keep match_cs.
     "sender_card",
@@ -1452,11 +1399,37 @@ def _pad_faces_to_donor_cids(
         if need:
             return None
     out: List[str] = []
+    extras: List[int] = []
+    leftover = 0
     for i, face in enumerate(faces):
         n = targets[i] - len(face)
         if n < 0:
             return None
-        out.append(face + (_NBSP * n))
+        room = max(0, max_ok_trailing_nbsp(face, key=keys[i] or "") - trailing_nbsp_count(face))
+        use = min(n, room)
+        extras.append(use)
+        leftover += n - use
+    if leftover:
+        for i in eligible:
+            face = faces[i]
+            room = max(
+                0,
+                max_ok_trailing_nbsp(face, key=keys[i] or "")
+                - trailing_nbsp_count(face)
+                - extras[i],
+            )
+            if room <= 0:
+                continue
+            take = min(room, leftover)
+            extras[i] += take
+            leftover -= take
+            if leftover == 0:
+                break
+        if leftover:
+            # Matching donor CID count would need ≥3 trailing NBSP — FAKE tell.
+            return None
+    for i, face in enumerate(faces):
+        out.append(cap_trailing_nbsp(face + (_NBSP * extras[i]), key=keys[i] or ""))
     return out
 
 
@@ -1505,6 +1478,10 @@ def rewrite_stream(
                 for face, key, orig_n in zip(faces, keys, orig_cids)
             ]
         faces = _cap_receiver_one_nbsp(faces, keys)
+        faces = [
+            cap_trailing_nbsp(face, key=key or "")
+            for face, key in zip(faces, keys)
+        ]
     def _apply(face_list: List[str]) -> Optional[str]:
         edits: List[Tuple[int, int, bytes]] = []
         for (start, end, _old_hx, kind, _key, _face), face in zip(rows, face_list):
@@ -1547,10 +1524,12 @@ def rewrite_stream(
                 break
         keys = [row[4] for row in rows]
         extra = 0
-        while bump_at is not None and _sbp_cs_need_bump(len(stream)) and extra < 2:
+        while bump_at is not None and _sbp_cs_need_bump(len(stream)) and extra < 1:
             extra += 1
             bumped = _cap_receiver_one_nbsp(list(faces), keys)
-            bumped[bump_at] = bumped[bump_at] + (_NBSP * extra)
+            bumped[bump_at] = cap_trailing_nbsp(
+                bumped[bump_at] + (_NBSP * extra), key=bump_key or "operation_num",
+            )
             why = _apply(bumped)
             if why:
                 return why
@@ -1566,9 +1545,12 @@ def rewrite_stream(
                 )
                 if alt_at is None:
                     continue
-                for extra2 in range(1, 3):
+                for extra2 in range(1, 2):
                     bumped = _cap_receiver_one_nbsp(list(faces), keys)
-                    bumped[alt_at] = bumped[alt_at] + (_NBSP * extra2)
+                    bumped[alt_at] = cap_trailing_nbsp(
+                        bumped[alt_at] + (_NBSP * extra2),
+                        key=alt_key or "operation_num",
+                    )
                     why = _apply(bumped)
                     if why:
                         break
@@ -2465,8 +2447,11 @@ def emit_invariants(pdf: bytes, *, channel: str = "sbp") -> str:
         if chan == "sbp" and len(ff2) >= _ORACLE_SBP_HMTX_UNIQ_MIN_FF2:
             uniq = _hmtx_uniq_positive(tt["hmtx"].metrics.values())
             if uniq < _ORACLE_SBP_HMTX_UNIQ_FLOOR:
-                return (
-                    f"glyph mismatch hmtx-uniq:{uniq}<{_ORACLE_SBP_HMTX_UNIQ_FLOOR}"
+                # Advisory only: mutating unused Tahoma hmtx to hit 42 is
+                # ALFA_ORACLE_HMTX_TAHOMA_ADVANCE_CONFLICT HARD.
+                logger.info(
+                    "Alfa SBP hmtx uniq %d < %d — keep source Tahoma advances",
+                    uniq, _ORACLE_SBP_HMTX_UNIQ_FLOOR,
                 )
     finally:
         tt.close()

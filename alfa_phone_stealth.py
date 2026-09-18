@@ -352,6 +352,7 @@ def _fmt_amount(amount_raw: str, *, max_chars: int = 0) -> str:
     if max_chars > 0 and len(body) > max_chars:
         bare = f"{grouped}{_NBSP}RUR"
         if len(bare) <= max_chars:
+            # At most one trailing NBSP after RUR.
             return bare + (_NBSP if len(bare) < max_chars else "")
         return bare[:max_chars]
     return body

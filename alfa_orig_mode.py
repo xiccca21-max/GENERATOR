@@ -21,6 +21,36 @@ _TM_RE = re.compile(
 _TRAILING_NBSP_KEYS = frozenset({
     "receiver", "operation_num", "date_time",
 })
+# G-SEM-NBSP-001 / Deacon: originals keep 0–2 trailing NBSP. ≥3 is FAKE.
+_MAX_TRAILING_NBSP = 2
+
+
+def trailing_nbsp_count(text: str) -> int:
+    n = 0
+    for ch in reversed(text or ""):
+        if ch == _NBSP:
+            n += 1
+        else:
+            break
+    return n
+
+
+def max_ok_trailing_nbsp(text: str, *, key: str = "") -> int:
+    """RUR / FIO: exactly one trailing NBSP. Other slots: at most two."""
+    core = (text or "").rstrip(_NBSP)
+    if key in ("amount", "commission") or core.endswith("RUR"):
+        return 1
+    if key == "receiver":
+        return 1
+    return _MAX_TRAILING_NBSP
+
+
+def cap_trailing_nbsp(text: str, *, key: str = "") -> str:
+    t = text or ""
+    cap = max_ok_trailing_nbsp(t, key=key)
+    while trailing_nbsp_count(t) > cap:
+        t = t[:-1]
+    return t
 
 
 def _need_len(text: str, *, key: str = "") -> int:
@@ -657,8 +687,7 @@ class AlfaOrigContext:
         if not row:
             return False
         start, end, slot_chars, _old_t = row
-        nbsp = _NBSP
-        t = _slot_face_text(new_text, key=key)
+        t = cap_trailing_nbsp(_slot_face_text(new_text, key=key), key=key)
         if len(t) > slot_chars:
             logger.warning(
                 "Alfa replace too long at y=%s: need %d have %d (%s)",
@@ -666,7 +695,14 @@ class AlfaOrigContext:
             )
             return False
         if len(t) < slot_chars:
-            t = t + nbsp * (slot_chars - len(t))
+            # Never fill the donor slot with extra NBSP (G-SEM-NBSP-001 /
+            # ALFA_AMOUNT_TYPOGRAPHY_ANOMALY). Shrink the hex run instead.
+            if not self.shrink_slot_at(y, x, len(t)):
+                return False
+            row = self._slot_at(y, x)
+            if not row:
+                return False
+            start, end, slot_chars, _old_t = row
         ok, miss = self.can_render(t)
         if not ok:
             logger.warning("Alfa replace miss %s at y=%s: %s", miss, y, new_text[:30])

@@ -226,6 +226,11 @@ def uniquify_alfa_ff2_ot_valid(pdf: bytes) -> Optional[bytes]:
         return None
     pick = cands[int.from_bytes(secrets.token_bytes(2), "big") % len(cands)]
     name = go[pick]
+    glyf = ft["glyf"][name]
+    # Unused glyphs still carry Tahoma outlines. Changing hmtx is
+    # ALFA_ORACLE_HMTX_TAHOMA_ADVANCE_CONFLICT (1229≠1230).
+    if glyf is not None and (getattr(glyf, "numberOfContours", 0) or 0) != 0:
+        return None
     aw, lsb = ft["hmtx"].metrics[name]
     ft["hmtx"].metrics[name] = (int(aw) + 1, int(lsb))
     new_ff2 = _ot_recalc_checksum_adjustment(_save_oracle_ttf(ft, template))

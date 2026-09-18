@@ -358,6 +358,48 @@ class AlfaExactPayloadTests(unittest.TestCase):
         why = alfa_emit.emit_invariants(pdf, channel="phone")
         self.assertEqual(why, "")
 
+    def test_trailing_nbsp_caps(self) -> None:
+        from alfa_orig_mode import cap_trailing_nbsp, trailing_nbsp_count
+
+        nb = "\u00a0"
+        rur = f"8{nb}320{nb}RUR{nb}{nb}{nb}"
+        self.assertEqual(cap_trailing_nbsp(rur, key="amount"), f"8{nb}320{nb}RUR{nb}")
+        self.assertEqual(trailing_nbsp_count(cap_trailing_nbsp(rur, key="amount")), 1)
+        op = "C161408261735349" + nb * 3
+        self.assertEqual(trailing_nbsp_count(cap_trailing_nbsp(op, key="operation_num")), 2)
+        msg = "спасибо" + nb * 17
+        self.assertEqual(trailing_nbsp_count(cap_trailing_nbsp(msg, key="message")), 2)
+
+    def test_hmtx_uniq_floor_keeps_tahoma_advances(self) -> None:
+        metrics = [(1230, 0), (1112, 0), (1230, 0), (1112, 0)]
+        out = alfa_emit._ensure_hmtx_uniq_floor(metrics, painted=set(), floor=42)
+        self.assertEqual(out, [(1230, 0), (1112, 0), (1230, 0), (1112, 0)])
+
+    def test_card_amount_not_nbsp_padded_after_rur(self) -> None:
+        pdf = card.create_alfa_card_stealth(
+            {
+                "amount": "8320",
+                "sender_card": "220070******1123",
+                "receiver_card": "437772******8891",
+                "date_time": "12.06.2026 14:22:11",
+                "operation_num": "авто",
+            },
+            allow_repeat=True,
+            claim_minute=False,
+        )
+        self.assertIsNotNone(pdf)
+        ctx = AlfaOrigContext()
+        self.assertTrue(ctx.load_bytes(pdf))
+        amt = ctx.extract_at(*card.CARD_COORDS["amount"]) or ""
+        self.assertIn("RUR", amt)
+        n = 0
+        for ch in reversed(amt):
+            if ch == "\u00a0":
+                n += 1
+            else:
+                break
+        self.assertLessEqual(n, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
