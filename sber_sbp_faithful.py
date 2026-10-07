@@ -647,3 +647,212 @@ def _all_literal_cids(cs: bytes) -> List[int]:
         res += [raw[k] << 8 | raw[k + 1] for k in range(0, len(raw) - 1, 2)]
         i = j + 1
     return res
+
+
+# ───────────────────────────── карта (Jasper, не iOS-пересохранение) ─────────────────────────────
+_CARD_CENTER = 167.5
+_CARD_TITLE = "Перевод в другой банк по номеру карты"
+_CARD_SEP = (". " * 48) + "."
+
+
+def format_card_date(when: _dt.datetime) -> str:
+    """Как на чеке по карте: день без ведущего нуля, два пробела перед «МСК»."""
+    return "%d %s %d %02d:%02d:%02d  МСК" % (
+        when.day, _MONTHS[when.month - 1], when.year, when.hour, when.minute, when.second)
+
+
+def _card_pixels() -> Dict[str, bytes]:
+    d = _load()
+    if "card_pixels" in d:
+        return d["card_pixels"]  # type: ignore[return-value]
+    raw = open(os.path.join(_DATA, "card_source.pdf"), "rb").read()
+    out: Dict[str, bytes] = {}
+    for n, key in ((9, "logo_mask"), (7, "logo"), (10, "foot_mask"), (8, "foot")):
+        m = re.search(rb"%d 0 obj\n" % n, raw)
+        sm = raw.find(b"stream\n", m.end())
+        ln = int(re.search(rb"/Length (\d+)", raw[m.end():sm]).group(1))
+        out[key] = zlib.decompress(raw[sm + 7:sm + 7 + ln])
+    d["card_pixels"] = out
+    return out
+
+
+def _jasper_text(x: float, y: float, size: float, color: bytes, text: str) -> bytes:
+    lit = cids_to_literal(text_to_cids(text))
+    return (
+        b"1 0 0 1 0 0 cm\n[] 0 d\n2 J\n1 0 0 1 0 0 cm\nBT\n"
+        b"1 0 0 1 " + _num(x).encode() + b" " + _num(y).encode() + b" Tm\n"
+        b"/F1 " + _num(size).encode() + b" Tf\n"
+        + color + b" rg\n(" + lit + b")Tj\n0 g\nET\n"
+    )
+
+
+def _build_card_content(values: Dict[str, str]) -> bytes:
+    gray = b"0.43922 0.43922 0.43922"
+    black = b"0 0 0"
+    dot = b"0.70196 0.70196 0.70196"
+    rows = [
+        (840.81, None, 13.0, gray, _CARD_TITLE),
+        (818.81, None, 13.0, gray, values["date"]),
+        (762.81, 32.0, 13.0, gray, "Куда"),
+        (740.93, 32.0, 15.0, black, values["dest"]),
+        (717.87, 17.15, 10.0, dot, _CARD_SEP),
+        (677.81, 32.0, 13.0, gray, "В банк"),
+        (655.93, 32.0, 15.0, black, values["bank"]),
+        (632.87, 33.15, 10.0, dot, _CARD_SEP),
+        (592.81, 32.0, 13.0, gray, "Страна"),
+        (570.93, 32.0, 15.0, black, values["country"]),
+        (547.87, 33.15, 10.0, dot, _CARD_SEP),
+        (507.81, 32.0, 13.0, gray, "Сколько"),
+        (485.93, 32.0, 15.0, black, values["amount"]),
+        (462.87, 33.15, 10.0, dot, _CARD_SEP),
+        (422.81, 32.0, 13.0, gray, "Комиссия"),
+        (400.93, 32.0, 15.0, black, values["fee"]),
+        (377.87, 33.15, 10.0, dot, _CARD_SEP),
+        (337.81, 32.0, 13.0, gray, "Списано"),
+        (315.93, 32.0, 15.0, black, values["charged"]),
+        (292.87, 33.15, 10.0, dot, _CARD_SEP),
+        (252.81, 32.0, 13.0, gray, "От кого"),
+        (230.93, 32.0, 15.0, black, values["sender"]),
+        (207.87, 33.15, 10.0, dot, _CARD_SEP),
+        (167.81, 32.0, 13.0, gray, "Откуда"),
+        (145.93, 32.0, 15.0, black, values["account"]),
+    ]
+    parts = [
+        b"q\nBT\n36 800 Td\nET\nQ\n2 J\nBT\n1 0 0 1 0 913 Tm\n/F1 10 Tf\n()Tj\nET\n",
+        b"q 143 0 0 22 88 859 cm /img1 Do Q\n",
+    ]
+    for y, x, size, color, text in rows:
+        if x is None:
+            x = round(_CARD_CENTER - text_width_pt(text, size) / 2.0, 2)
+        parts.append(_jasper_text(x, y, size, color, text))
+    parts.append(b"q 233 0 0 64.6 51 35.4 cm /img2 Do Q\n")
+    return b"".join(parts)
+
+
+def _itext_image(num: int, width: int, height: int, pixels: bytes, smask: Optional[int]) -> bytes:
+    comp = _deflate(pixels)
+    if smask is None:
+        head = (b"%d 0 obj\n<</ColorSpace/DeviceGray/Subtype/Image/Height %d"
+                b"/Filter/FlateDecode/Type/XObject/Width %d/Length %d/BitsPerComponent 8>>stream\n"
+                % (num, height, width, len(comp)))
+    else:
+        head = (b"%d 0 obj\n<</ColorSpace/DeviceRGB/Subtype/Image/Height %d"
+                b"/Filter/FlateDecode/Type/XObject/Width %d/SMask %d 0 R/Length %d/BitsPerComponent 8>>stream\n"
+                % (num, height, width, smask, len(comp)))
+    return head + comp + b"\nendstream\nendobj"
+
+
+def _flate_obj(num: int, payload: bytes, head_prefix: bytes = b"") -> bytes:
+    comp = _deflate(payload)
+    return (b"%d 0 obj\n<<" % num) + head_prefix + (
+        b"/Filter/FlateDecode/Length %d>>stream\n" % len(comp)
+    ) + comp + b"\nendstream\nendobj"
+
+
+def build_card(
+    *,
+    when_msk: _dt.datetime,
+    sender: str,
+    account: str,
+    dest: str,
+    bank: str,
+    country: str,
+    amount: str,
+    fee: str,
+    charged: str,
+    created_msk: Optional[_dt.datetime] = None,
+    subset_tag: Optional[str] = None,
+    file_id: Optional[Tuple[bytes, bytes]] = None,
+) -> bytes:
+    """Чек «по карте в другой банк» в контейнере Jasper/iText, как СБП.
+
+    Единственный имеющийся банковский файл пересохранён iOS, поэтому за образец
+    взяты его поля и картинки, а сборка — та же, что у исходящего СБП.
+    Строки пишутся как есть.
+    """
+    pix = _card_pixels()
+    values = {
+        "date": format_card_date(when_msk),
+        "sender": sender,
+        "account": account,
+        "dest": dest,
+        "bank": bank,
+        "country": country,
+        "amount": amount if amount.endswith("\u20bd") else amount + " \u20bd",
+        "fee": fee if fee.endswith("\u20bd") else fee + " \u20bd",
+        "charged": charged if charged.endswith("\u20bd") else charged + " \u20bd",
+    }
+    cs = _build_card_content(values)
+    used = sorted(set(_all_literal_cids(cs)))
+    font = build_font(used)
+    uni_by_cid = {c: u for c, u in _gid_uni_map().items() if c in set(used)}
+    w_arr = build_w_array(used)
+    tou = build_tounicode(used, uni_by_cid)
+    tag = subset_tag or _rand_tag()
+    fname = (tag + "+ArialMT").encode()
+    created = created_msk or (when_msk + _dt.timedelta(seconds=random.randint(61, 199)))
+    cd = created.strftime("%Y%m%d%H%M%S").encode()
+
+    new: Dict[int, bytes] = {
+        3: _itext_image(3, 143, 22, pix["logo_mask"], None),
+        4: _itext_image(4, 143, 22, pix["logo"], 3),
+        5: _itext_image(5, 220, 61, pix["foot_mask"], None),
+        6: _itext_image(6, 220, 61, pix["foot"], 5),
+        7: _flate_obj(7, cs),
+        1: (
+            b"1 0 obj\n<</Tabs/S/Group<</S/Transparency/Type/Group/CS/DeviceRGB>>"
+            b"/Contents 7 0 R/Type/Page/Resources<</ColorSpace<</CS/DeviceRGB>>"
+            b"/ProcSet [/PDF /Text /ImageB /ImageC /ImageI]/Font<</F1 2 0 R>>"
+            b"/XObject<</img2 6 0 R/img1 4 0 R/img0 3 0 R/img3 5 0 R>>>>"
+            b"/Parent 8 0 R/MediaBox[0 0 335 913]>>\nendobj"
+        ),
+        9: b"9 0 obj\n[1 0 R/XYZ 0 923 0]\nendobj",
+        10: _flate_obj(10, font, b"/Length1 %d" % len(font)),
+        11: (
+            b"11 0 obj\n<</Descent -210/CapHeight 716/StemV 80/Type/FontDescriptor"
+            b"/FontFile2 10 0 R/Flags 32/FontBBox[-664 -324 2000 1005]/FontName/"
+            + fname + b"/ItalicAngle 0/Ascent 728>>\nendobj"
+        ),
+        12: (
+            b"12 0 obj\n<</DW 1000/Subtype/CIDFontType2/CIDSystemInfo<</Supplement 0"
+            b"/Registry(Adobe)/Ordering(Identity)>>/Type/Font/BaseFont/"
+            + fname + b"/FontDescriptor 11 0 R/W " + w_arr
+            + b"/CIDToGIDMap/Identity>>\nendobj"
+        ),
+        13: _flate_obj(13, tou),
+        2: (
+            b"2 0 obj\n<</Subtype/Type0/Type/Font/BaseFont/" + fname
+            + b"/Encoding/Identity-H/DescendantFonts[12 0 R]/ToUnicode 13 0 R>>\nendobj"
+        ),
+        8: b"8 0 obj\n<</Kids[1 0 R]/Type/Pages/Count 1/ITXT(2.1.7)>>\nendobj",
+        14: b"14 0 obj\n<</Names[(JR_PAGE_ANCHOR_0_1) 9 0 R]>>\nendobj",
+        15: b"15 0 obj\n<</Dests 14 0 R>>\nendobj",
+        16: (
+            b"16 0 obj\n<</Names 15 0 R/Type/Catalog/Pages 8 0 R"
+            b"/ViewerPreferences<</PrintScaling/AppDefault>>>>\nendobj"
+        ),
+        17: (
+            b"17 0 obj\n<</ModDate(D:" + cd + b"+03'00')/Creator(JasperReports Library "
+            b"version 6.18.1-9d75d1969e774d4f179fb3be8401e98a0e6d1611)/CreationDate(D:"
+            + cd + b"+03'00')/Producer(iText 2.1.7 by 1T3XT)>>\nendobj"
+        ),
+    }
+    order = [3, 4, 5, 6, 7, 1, 9, 10, 11, 12, 13, 2, 8, 14, 15, 16, 17]
+    out = bytearray(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n")
+    offs: Dict[int, int] = {}
+    for n in order:
+        offs[n] = len(out)
+        body = new[n]
+        if not body.endswith(b"\n"):
+            body += b"\n"
+        out += body
+    xref_pos = len(out)
+    out += b"xref\n0 18\n0000000000 65535 f \n"
+    for n in range(1, 18):
+        out += b"%010d 00000 n \n" % offs[n]
+    a, b = file_id or (_rand_file_id(), _rand_file_id())
+    out += (
+        b"trailer\n<</Info 17 0 R/ID [<" + a + b"><" + b + b">]/Root 16 0 R/Size 18>>\n"
+        b"startxref\n" + str(xref_pos).encode() + b"\n%%EOF\n"
+    )
+    return bytes(out)
