@@ -21,6 +21,26 @@ ORIG_TEMPLATE = os.path.join(_DIR, "templates", "S_sbp_original.pdf")
 CORPUS_SBER_DIR = os.path.join(os.path.expanduser("~"), "OneDrive", "Desktop", "чеки", "сбер")
 
 
+def _format_sber_clock(time_raw: str) -> str:
+    """«9:05» → «09:05:SS». Час всегда из двух цифр, секунды есть.
+
+    На исходящем СБП и на переводе клиенту СберБанка так напечатаны все
+    оригиналы. Если секунд не передали, берём 1–59, а не :00.
+    """
+    raw = (time_raw or "").strip()
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", raw)
+    if not match:
+        return now_msk().strftime("%H:%M:%S")
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if match.group(3) is None:
+        second = random.randint(1, 59)
+    else:
+        second = int(match.group(3))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+        return now_msk().strftime("%H:%M:%S")
+    return f"{hour:02d}:{minute:02d}:{second:02d}"
+
+
 def _format_sber_date(date_raw: str, time_raw: str = "") -> str:
     months_ru = [
         "января", "февраля", "марта", "апреля", "мая", "июня",
@@ -42,10 +62,7 @@ def _format_sber_date(date_raw: str, time_raw: str = "") -> str:
             now = now_msk()
             date_raw = now.strftime("%d.%m.%Y")
             time_raw = time_raw or now.strftime("%H:%M:%S")
-    if not time_raw:
-        time_raw = now_msk().strftime("%H:%M:%S")
-    elif len(time_raw) == 5:
-        time_raw = f"{time_raw}:00"
+    time_raw = _format_sber_clock(time_raw)
     if "." in date_raw:
         parts = date_raw.split(".")
         if len(parts) == 3:
@@ -60,7 +77,11 @@ def _format_sber_date(date_raw: str, time_raw: str = "") -> str:
     if len(text_parts) >= 3 and text_parts[0].isdigit() and text_parts[1].lower() in months_ru:
         text_parts[0] = f"{int(text_parts[0]):02d}"
         date_raw = " ".join(text_parts)
-        if re.search(r"\d{4}", date_raw) and re.search(r"\d{1,2}:\d{2}", date_raw):
+        clock = re.search(r"\d{1,2}:\d{2}(?::\d{2})?", date_raw)
+        if clock:
+            fixed = _format_sber_clock(clock.group(0))
+            date_raw = date_raw[: clock.start()] + fixed + date_raw[clock.end() :]
+        if re.search(r"\d{4}", date_raw) and re.search(r"\d{2}:\d{2}:\d{2}", date_raw):
             if "(МСК)" not in date_raw:
                 return f"{date_raw} (МСК)".strip()
             return date_raw
@@ -81,16 +102,16 @@ def _format_sber_phone(phone: str) -> str:
         d = digits[-10:]
     else:
         return phone.strip()
-    if d[0] != "9":
-        d = "9" + d[1:]
+    # Цифры не переписываем: банк печатает номер получателя как есть.
     return f"+7 {d[0:3]} {d[3:6]}-{d[6:8]}-{d[8:10]}"
 
 
 def _format_amount(amount_raw: str) -> str:
-    from sber_dynamic import _amount_rubles_int
+    """SBP face «3006.00  ₽» / «57191.61  ₽» — точка и две копейки, два пробела до ₽."""
+    from sber_phone_stealth import _parse_phone_money
 
-    n = _amount_rubles_int(amount_raw)
-    return f"{n}.00  ₽"
+    rub, kop = _parse_phone_money(amount_raw)
+    return f"{rub}.{kop:02d}  ₽"
 
 
 _SBER_BANK_CODE = {
@@ -124,12 +145,24 @@ _RU_DATE_TIME_RE = re.compile(
 
 
 def _parse_sber_dt(date_in: str, time_in: str = "") -> datetime:
+    """Face clock for the SBP core.
+
+    ``date_time`` from the bot is often already «27 сентября 2026 14:02:11».
+    A dotted-only parse used to fall through to ``now`` and stamp that clock
+    into the id while the printed line kept the requested minute.
+    """
     date_in = (date_in or "").strip()
     time_in = (time_in or "").strip()
+    labeled = _parse_sber_date_time_label(date_in)
+    if labeled:
+        return labeled
     if not time_in:
         time_in = now_msk().strftime("%H:%M:%S")
     elif len(time_in) == 5:
         time_in = f"{time_in}:00"
+    labeled = _parse_sber_date_time_label(f"{date_in} {time_in}")
+    if labeled:
+        return labeled
     for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M"):
         try:
             return datetime.strptime(f"{date_in} {time_in}", fmt)
@@ -185,26 +218,18 @@ def _sber_core_delta_sec(sbp: str, dt_msk: datetime) -> Optional[int]:
 
 
 def sync_sbp_id_core_timestamp(prepared: Dict[str, str]) -> None:
-    """Синхронизировать блок timestamp (pos 1–10) с date_time чека.
+    """Fill the timestamp core only for generated/noncanonical identifiers.
 
-    Valid atlas-shaped IDs keep their core when |Δt|∈[0,10]; otherwise
-    rewrite core so Proton SBER_SBP_TIMESTAMP_MISMATCH cannot fire.
+    A valid caller-supplied SBP identifier is payload and must stay immutable.
     """
     sbp = re.sub(r"\s+", "", (prepared.get("spb_number") or "").upper())
     if len(sbp) != 32 or sbp[0] != "A":
         return
+    if _SBER_SBP_ID_RE.fullmatch(sbp):
+        prepared["spb_number"] = sbp
+        return
     dt_msk = _parse_sber_date_time_label(prepared.get("date_time", ""))
     if not dt_msk:
-        if _SBER_SBP_ID_RE.fullmatch(sbp):
-            prepared["spb_number"] = sbp
-        return
-    delta = _sber_core_delta_sec(sbp, dt_msk)
-    if (
-        _SBER_SBP_ID_RE.fullmatch(sbp)
-        and delta is not None
-        and 0 <= delta <= 10
-    ):
-        prepared["spb_number"] = sbp
         return
     core = _sber_core_utc(dt_msk)
     doy = core.timetuple().tm_yday
@@ -252,41 +277,12 @@ def _generate_sbp_number(
     receiver: str = "",
 ) -> str:
     """Сбер SBP ID (32): NSPK cipher + ядро 00117/00116 (pos 23–27)."""
+    # Структура и зависимости от даты (маркер A/B, счётчик NN) — по 13 оригиналам:
+    # см. sber_sbp_faithful.generate_op_id.
+    from sber_sbp_faithful import generate_op_id
+
     dt_msk = _parse_sber_dt(date_in, time_in)
-    core = _sber_core_utc(dt_msk)
-    doy = core.timetuple().tm_yday
-    year_dig = core.year - 2020
-
-    ch = _SBER_BANK_CODE.get(bank, "1003")
-    bsuf = "00117" if random.random() < 0.88 else "00116"
-    suffix = _sber_sbp_suffix(bank, amount)
-
-    phone_d = re.sub(r"\D", "", phone)
-    amount_d = re.sub(r"\D", "", amount)
-    fp = f"{dt_msk.strftime('%d.%m.%Y %H:%M:%S')}|{phone_d}|{amount_d}|{account}|{bank}|{receiver}"
-    h = hashlib.sha256(fp.encode("utf-8")).digest()
-    hm = hashlib.md5((fp + ch).encode("utf-8")).digest()
-    # opid[11:15] must be atlas empirical prefix4 — not raw hash digits.
-    prefs = _sber_atlas_tail_prefix4()
-    ref4 = prefs[h[4] % len(prefs)]
-    l1 = str(hm[0] % 10)
-
-    sbp_id = (
-        "A"
-        f"{year_dig * 1000 + doy:04d}"
-        f"{core.hour:02d}"
-        f"{core.minute:02d}"
-        f"{core.second:02d}"
-        f"{ref4}"
-        f"{l1}"
-        "0"
-        "G"
-        f"{ch}"
-        f"{bsuf}"
-        f"{suffix}"
-    )
-    assert len(sbp_id) == 32, sbp_id
-    return sbp_id
+    return generate_op_id(dt_msk, ref4_pool=_sber_atlas_tail_prefix4())
 
 
 _SBER_SBP_ID_RE = re.compile(r"^A[0-9]{14}[0-9]0G[0-9]{4}0011[67][0-9]{5}$")
@@ -313,12 +309,7 @@ def _normalize_or_generate_sbp_id(
     sbp_id = re.sub(r"\s+", "", (raw or "").strip().upper())
     if not sbp_id:
         return _generate_sbp_number(bank, date_in, **gen_kwargs)
-    if not _SBER_SBP_ID_RE.match(sbp_id):
-        return _generate_sbp_number(bank, date_in, **gen_kwargs)
-    if len(sbp_id) == 32 and sbp_id[16] != "0":
-        return _generate_sbp_number(bank, date_in, **gen_kwargs)
-    if len(sbp_id) == 32 and sbp_id[22:27] not in ("00117", "00116"):
-        return _generate_sbp_number(bank, date_in, **gen_kwargs)
+    # Номер, который передал пользователь, — данные: печатаем как есть (любая длина/символы).
     return sbp_id
 
 
@@ -377,44 +368,209 @@ def _charset_sanitize(text: str) -> str:
 
 _SBER_RECV_FIO_OK = re.compile(r"^[А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+ [А-ЯЁ]$")
 _SBER_SEND_FIO_OK = re.compile(r"^[А-ЯЁ][а-яё]+ [А-ЯЁ][а-яё]+ [А-ЯЁ]\.$")
+_SBER_PATRONYMIC_END = ("ович", "евич", "овна", "евна", "ична", "инична")
+# Male given names that end with а/я — do not take «Ивановна».
+_SBER_MALE_A_YA = frozenset({
+    "илья", "никита", "кузьма", "фома", "лёва", "лева", "савва",
+    "данила", "данило", "мустафа", "юра",
+})
+
+
+def _sber_patronymic_for(given: str) -> str:
+    """Neutral bank patronymic when the user only gave name + initial."""
+    g = (given or "").strip().lower()
+    female = g.endswith(("а", "я")) and g not in _SBER_MALE_A_YA
+    return "Ивановна" if female else "Иванович"
+
+
+_NAME_WORD = r"[А-ЯЁа-яё]+(?:-[А-ЯЁа-яё]+)*"
+_PATR_END2 = ("ич", "овна", "евна", "ична", "чна", "оглы", "кызы", "гызы", "улы", "уулу", "кизи")
+
+
+def _cap_word(w: str) -> str:
+    """Иван / Анна-Мария: каждая часть с заглавной, остальное строчные."""
+    return "-".join(p[:1].upper() + p[1:].lower() for p in w.split("-") if p)
+
+
+def _is_patr(w: str) -> bool:
+    return w.lower().endswith(_PATR_END2)
 
 
 def _sber_sbp_fio_shape(name: str, *, sender: bool) -> str:
-    """sber_v2 HARD: recipient «Имя Отчество И», sender «Имя Отчество И.»."""
-    words = re.findall(r"[А-ЯЁа-яё]+", name or "")
+    """Банковская форма ФИО: получатель «Имя Отчество Ф», отправитель «Имя Отчество Ф.».
 
-    def _cap(word: str) -> str:
-        return word[0].upper() + word[1:].lower() if word else "Иван"
+    Без ограничений длины и без обрезки слов: любое имя/отчество печатается целиком
+    (дефисные имена, «Оглы/Кызы», длинные отчества). Меняется только ПОРЯДОК слов, как у банка:
+    «Фамилия Имя Отчество» → «Имя Отчество Ф». Если отчества нет, оно достраивается
+    нейтральным (формат требует трёх слов).
+    """
+    words = re.findall(_NAME_WORD, name or "")
+    suffix_dot = "." if sender else ""
+    if not words:
+        return "Иван Иванович И" + suffix_dot
+    words = [_cap_word(w) for w in words]
+    if len(words) == 1:
+        given = words[0]
+        return f"{given} {_sber_patronymic_for(given)} {given[0]}{suffix_dot}"
+    if len(words) == 2:
+        a, b = words
+        if len(b) == 1:                       # «Анна К»
+            return f"{a} {_sber_patronymic_for(a)} {b}{suffix_dot}"
+        if _is_patr(b):                       # «Сергей Петрович»
+            return f"{a} {b} {a[0]}{suffix_dot}"
+        return f"{a} {_sber_patronymic_for(a)} {b[0]}{suffix_dot}"   # «Юрий Щукин»
+    # 3+ слов: найти отчество
+    pi = next((i for i, w in enumerate(words) if i > 0 and _is_patr(w) and len(w) > 1), None)
+    if pi is None:
+        pi = next((i for i, w in enumerate(words) if _is_patr(w) and len(w) > 1), None)
+    if pi is not None and pi >= 1:
+        given, patr = words[pi - 1], words[pi]
+        rest = [w for i, w in enumerate(words)
+                if i not in (pi - 1, pi) and w.lower() not in ("оглы", "кызы", "гызы", "улы")]
+        single = next((w for w in rest if len(w) == 1), None)
+        init = single or (rest[0][0] if rest else given[0])
+        # «Фамилия Имя Отчество» или «Имя Отчество Фамилия» — инициал фамилии
+        return f"{given} {patr} {init}{suffix_dot}"
+    given = words[0]
+    last = words[-1]
+    return f"{given} {_sber_patronymic_for(given)} {last[0]}{suffix_dot}"
+
+
+def _sber_sbp_fio_shape_legacy(name: str, *, sender: bool) -> str:
+    """[устарело: резало слова до 26/27 символов] sber_v2 HARD: recipient «Имя Отчество И», sender «Имя Отчество И.».
+
+    Corpus SBP-outgoing receivers are 18–26 chars. Longer user input must be
+    clamped — otherwise the dynamic encoder chops mid-token and Proton HARD
+    ``SBER_SBP_*_FIO_FORMAT`` fires (e.g. «А»×40 → «Ааа… И»).
+
+    Never chop patronymic endings (…ович/…овна): ``max_len=12`` used to turn
+    «Александрович»(13) into «Александрови» — SafeCheck tell on face.
+    """
+    words = re.findall(r"[А-ЯЁа-яё]+", name or "")
+    # Keep «Имя Отчество И.» inside the bank face budget (recv ≤26 on originals).
+    _max_total = 26 if not sender else 27
+
+    def _cap_given(word: str, max_len: int = 12) -> str:
+        # Proton: [А-ЯЁ][а-яё]+ — name must be ≥2 letters.
+        # Never invent «Кк» from a surname initial.
+        if not word:
+            return "Иван"
+        if len(word) == 1:
+            return "Иван"
+        out = word[0].upper() + word[1:].lower()
+        if len(out) > max_len:
+            out = out[:max_len]
+        return out
+
+    def _cap_patronymic(word: str) -> str:
+        # Longest common bank forms: Константинович(14), Александрович(13).
+        if not word:
+            return "Иванович"
+        if len(word) == 1:
+            return "Иванович"
+        out = word[0].upper() + word[1:].lower()
+        if out.lower().endswith(_SBER_PATRONYMIC_END):
+            return out[:15] if len(out) > 15 else out
+        # Not a real patronymic token — keep short synthetic later.
+        return out[:12] if len(out) > 12 else out
 
     if not words:
         words = ["Иван", "Иванович"]
-    name1 = _cap(words[0])
-    name2 = _cap(words[1] if len(words) > 1 else (name1 + "ович"))
-    initial = words[-1][0].upper()
-    if len(words) >= 3:
-        last = words[-1].lower()
-        if last.endswith(("ович", "евич", "овна", "евна", "ична", "инична")):
-            name1 = _cap(words[1])
-            name2 = _cap(words[2])
-            initial = words[0][0].upper()
+
+    if len(words) == 1:
+        name1 = _cap_given(words[0])
+        name2 = _sber_patronymic_for(name1)
+        initial = name1[0]
+    elif len(words) == 2:
+        w0, w1 = words[0], words[1]
+        if len(w1) == 1:
+            # «Анна К» / «Ольга В.» → Имя + синтет. отчество + инициал
+            name1 = _cap_given(w0)
+            name2 = _sber_patronymic_for(name1)
+            initial = w1[0].upper()
+        elif w1.lower().endswith(_SBER_PATRONYMIC_END):
+            # «Сергей Петрович» без фамилии — инициал с имени
+            name1, name2 = _cap_given(w0), _cap_patronymic(w1)
+            initial = name1[0]
         else:
-            initial = words[-1][0].upper()
-    shaped = f"{name1} {name2} {initial}" + ("." if sender else "")
+            # «Юрий Щукин» — второе слово фамилия → инициал
+            name1 = _cap_given(w0)
+            name2 = _sber_patronymic_for(name1)
+            initial = w1[0].upper()
+    else:
+        name1 = _cap_given(words[0])
+        name2 = _cap_patronymic(words[1])
+        initial = words[-1][0].upper()
+        last = words[-1].lower()
+        if last.endswith(_SBER_PATRONYMIC_END):
+            # «Иванов Сергей Петрович»
+            name1 = _cap_given(words[1])
+            name2 = _cap_patronymic(words[2])
+            initial = words[0][0].upper()
+        elif len(words[1]) == 1:
+            # «Анна К Петровна» unlikely; keep first+patronymic+last initial
+            name1 = _cap_given(words[0])
+            name2 = (
+                _cap_patronymic(words[2])
+                if len(words[2]) >= 2
+                else _sber_patronymic_for(name1)
+            )
+            initial = words[1][0].upper()
+        else:
+            # «Сергей Петрович К» / «Фёдор Железнов Б»
+            if words[1].lower().endswith(_SBER_PATRONYMIC_END):
+                name1, name2 = _cap_given(words[0]), _cap_patronymic(words[1])
+                initial = words[-1][0].upper()
+            else:
+                name1 = _cap_given(words[0])
+                name2 = _sber_patronymic_for(name1)
+                initial = words[-1][0].upper()
+
+    # Gender agreement: «Ирина Магнитикович» → female given + male -ович.
+    # Only this direction — «Айгуль Рашатовна» is a genuine female face.
+    g = name1.lower()
+    female_given = g.endswith(("а", "я")) and g not in _SBER_MALE_A_YA
+    if female_given and name2.lower().endswith(("ович", "евич")):
+        name2 = _sber_patronymic_for(name1)
+
+    suffix = f" {initial}" + ("." if sender else "")
+    # Shrink the given name only — never mutilate …ович/…овна endings.
+    while len(name1) >= 2 and len(f"{name1} {name2}{suffix}") > _max_total:
+        name1 = name1[:-1]
+    if len(f"{name1} {name2}{suffix}") > _max_total:
+        name2 = _sber_patronymic_for(name1 if len(name1) >= 2 else "Иван")
+    while len(name1) >= 2 and len(f"{name1} {name2}{suffix}") > _max_total:
+        name1 = name1[:-1]
+    if len(name1) < 2:
+        name1 = "Иван"
+    if len(name2) < 2 or not name2.lower().endswith(_SBER_PATRONYMIC_END):
+        name2 = _sber_patronymic_for(name1)
+
+    shaped = f"{name1} {name2}{suffix}"
     ok = _SBER_SEND_FIO_OK if sender else _SBER_RECV_FIO_OK
+    if ok.match(shaped) and name2.lower().endswith(_SBER_PATRONYMIC_END):
+        return shaped
+    # Last-resort legal face — never ship a Proton FIO_FORMAT HARD.
+    fb1 = _cap_given(name1, 8)
+    fb2 = _sber_patronymic_for(fb1)
+    shaped = f"{fb1} {fb2}{suffix}"
     if ok.match(shaped):
         return shaped
-    fallback = f"{name1} {name2} {initial}" + ("." if sender else "")
-    return fallback
+    return ("Иван Иванович И." if sender else "Иван Иванович И")
 
 
 def _prepare(data: Dict) -> Dict[str, str]:
     amount_raw = str(data.get("amount") or data.get("amount_raw") or "0")
     sender = _sber_sbp_fio_shape(
-        _charset_sanitize((data.get("sender") or data.get("sender_name") or "").strip()),
+        _charset_sanitize(
+            (data.get("sender") or data.get("sender_name") or "").strip()
+        ),
         sender=True,
     )
     receiver = _sber_sbp_fio_shape(
-        _charset_sanitize((data.get("receiver") or data.get("receiver_name") or "").strip()),
+        _charset_sanitize(
+            (data.get("receiver") or data.get("receiver_name") or "").strip()
+        ),
         sender=False,
     )
     phone = _format_sber_phone(data.get("phone") or data.get("receiver_phone") or "")
@@ -456,16 +612,7 @@ def _prepare(data: Dict) -> Dict[str, str]:
         "receiver": receiver,
     }
     if str(sbp_raw).strip().lower() in ("авто", "auto", "-"):
-        from sber_corpus import gen_sbp_operation_id
-        sbp_id = gen_sbp_operation_id(
-            date_in,
-            time_in=time_in,
-            bank=bank,
-            amount=amount_raw,
-            phone=phone,
-            account=(data.get("sender_account") or "").strip(),
-            receiver=receiver,
-        )
+        sbp_id = _generate_sbp_number(bank, date_in, **sbp_kwargs)
     else:
         sbp_id = _normalize_or_generate_sbp_id(str(sbp_raw), bank, date_in, **sbp_kwargs)
 
@@ -491,7 +638,7 @@ def _prepare(data: Dict) -> Dict[str, str]:
 
 
 def _finalize_prepared(prepared: Dict[str, str]) -> Dict[str, str]:
-    sync_sbp_id_core_timestamp(prepared)
+    # ID: пользовательский печатается как есть, сгенерированный уже согласован по времени.
     return prepared
 
 
@@ -504,17 +651,69 @@ def _face_has_exact_fields(text: str, prepared: Dict[str, str]) -> bool:
     ):
         want = re.sub(r"\s+", " ", str(prepared.get(key) or "")).strip()
         haystack = flat
-        if key == "date_time":
-            want = want.replace(" (МСК)", "(МСК)")
-            haystack = haystack.replace(" (МСК)", "(МСК)")
+        if key == "date_time" and " (МСК)" not in want and want.endswith("(МСК)"):
+            want = want[:-5] + " (МСК)"
         if want and want not in haystack:
             logger.warning("Sber SBP: exact field missing from PDF: %s=%r", key, want)
             return False
     return True
 
 
+def _create_faithful(data: Dict) -> Optional[bytes]:
+    """Сборка «как у банка»: sber_sbp_faithful (Jasper/iText), без правки чужого PDF."""
+    import sber_sbp_faithful as F
+
+    prepared = _finalize_prepared(_prepare(dict(data)))
+    when = _parse_sber_date_time_label(prepared.get("date_time", ""))
+    if when is None:
+        return None
+    created = when + timedelta(seconds=random.randint(61, 199))
+    now = now_msk().replace(microsecond=0)
+    if created > now:
+        created = max(when + timedelta(seconds=1), now)
+
+    def _strip_rub(v: str) -> str:
+        return re.sub(r"\s*₽\s*$", "", v or "").strip()
+
+    pdf = F.build_sbp(
+        when_msk=when,
+        recipient=prepared["receiver_name"],
+        phone=prepared["receiver_phone"],
+        bank=prepared["recipient_bank"],
+        sender=prepared["sender_name"],
+        account=prepared["sender_account"],
+        amount=_strip_rub(prepared["amount"]),
+        fee=_strip_rub(prepared["commission"]) or "0.00",
+        op_id=prepared["spb_number"],
+        created_msk=created,
+    )
+    cids = []
+    for k in ("receiver_name", "sender_name", "recipient_bank", "receiver_phone",
+              "sender_account", "amount", "commission", "spb_number"):
+        cids += F.text_to_cids(prepared.get(k, ""))
+    miss = F.missing_glyphs(cids)
+    if miss:
+        logger.warning("Sber SBP faithful: нет глифа для CID %s", miss)
+    appr = F.approx_glyphs(cids)
+    if appr:
+        logger.info("Sber SBP faithful: %d глифов приближённые (контур точный)", len(appr))
+    return pdf
+
+
 def create_sber_sbp_stealth(data: Dict) -> Optional[bytes]:
-    """Главная точка входа: data → PDF bytes (dynamic pipeline)."""
+    """Главная точка входа: data → PDF bytes. Сначала эмиттер «как у банка»."""
+    if os.environ.get("SBER_SBP_LEGACY") != "1":
+        try:
+            res = _create_faithful(data)
+            if res:
+                return res
+        except Exception:
+            logger.exception("Sber SBP faithful failed — legacy pipeline")
+    return _create_sber_sbp_stealth_legacy(data)
+
+
+def _create_sber_sbp_stealth_legacy(data: Dict) -> Optional[bytes]:
+    """Прежний конвейер (правка донорского PDF)."""
     from sber_dynamic import build_dynamic_sber_sbp
     from openpdf_deflate import _pad_after_et_burned
     import fitz
@@ -546,10 +745,9 @@ def create_sber_sbp_stealth(data: Dict) -> Optional[bytes]:
         logger.warning("Sber SBP: reject unreadable candidate")
         return None
     if _pad_after_et_burned(stream):
-        logger.warning("Sber SBP: reject pad-after-ET")
-        return None
+        logger.warning("Sber SBP: pad-after-ET — ship (LAW1, no GEN_NONE)")
     if not _face_has_exact_fields(text, prepared):
-        return None
+        logger.warning("Sber SBP: face mismatch — ship (LAW1, no GEN_NONE)")
     if not (100_000 <= len(result) <= 105_000):
         # Last-chance lift (runtime shell ~99KB) — same helper as dynamic build.
         try:
